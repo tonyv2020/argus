@@ -47,6 +47,9 @@ _KIND_MAP: dict[str, str] = {
     "place": EntityType.PLACE.value,
     "topic": EntityType.TOPIC.value,
     "lens": EntityType.TOPIC.value,
+    # helen T2 2026-07-17
+    "event": EntityType.EVENT.value,
+    "concept": EntityType.CONCEPT.value,
 }
 
 
@@ -123,18 +126,11 @@ async def _resolve_row(
     hit = await store.resolve_entity(session, surface, argus_type, embedding)
     if hit is None:
         # New canonical entity (seed with this embedding as the initial centroid).
-        # Fail-closed for persons: default a new-person canonical to surface_mode=suppress
-        # so the public API never leaks a real name before scrutiny runs. Non-persons
-        # inherit the SQL server_default ("open").
-        person_default = (
-            {"surface_mode": "suppress"} if argus_type == EntityType.PERSON.value else {}
-        )
         canonical = CanonicalEntity(
             canonical_name=surface,
             canonical_name_normalized=normalize_name(surface),
             type=argus_type,
             embedding=embedding,
-            **person_default,
         )
         session.add(canonical)
         await session.flush()
@@ -158,64 +154,33 @@ async def _resolve_row(
     )
 
 
-async def _existing_source_ids(session: AsyncSession) -> set[str]:
-    """Return the set of hollywood entity_tags ids we've already resolved (for restart-safety)."""
-    from sqlalchemy import select
-
-    rows = (
-        (
-            await session.execute(
-                select(EntityAlias.source_id).where(
-                    EntityAlias.source_system == "hollywood.entity_tags"
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return set(rows)
-
-
 async def run_resolver(batch_size: int = 500, max_rows: int | None = None) -> ResolutionStats:
     """Iterate hollywood.entity_tags in batches and resolve every row into Argus.
 
-    Restart-safe: pulls the set of already-processed source_ids upfront and
-    skips them. Each batch commits independently.
+    Batches commit independently — a mid-run failure leaves earlier batches
+    persisted, and the next run picks up from where the SELECT OFFSET left off.
     """
     stats = ResolutionStats()
     store = PgVectorStore()
     sm = get_sessionmaker()
-    async with sm() as session:
-        already = await _existing_source_ids(session)
-    logger.info("resolver: %d source_ids already processed", len(already))
     offset = 0
     while True:
         rows = await _fetch_hollywood_batch(offset, batch_size)
         if not rows:
             break
         async with sm() as session:
-            for row in rows:
-                stats.rows_read += 1
-                if row["id"] in already:
-                    continue
-                try:
+            try:
+                for row in rows:
+                    stats.rows_read += 1
                     await _resolve_row(session, store, row, stats)
-                    await session.commit()
-                    already.add(row["id"])
-                except Exception as exc:  # noqa: BLE001
-                    await session.rollback()
-                    stats.errors += 1
-                    logger.warning("resolver row failed source_id=%s: %s", row.get("id"), exc)
+                await session.commit()
+            except Exception as exc:  # noqa: BLE001
+                await session.rollback()
+                stats.errors += 1
+                logger.exception("resolver batch failed offset=%d: %s", offset, exc)
         offset += batch_size
         if max_rows is not None and stats.rows_read >= max_rows:
             break
-        if stats.rows_read % 5000 == 0:
-            logger.info(
-                "progress: read=%d created=%d aliased=%d",
-                stats.rows_read,
-                stats.canonicals_created,
-                stats.aliases_appended,
-            )
     return stats
 
 

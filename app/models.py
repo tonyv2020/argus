@@ -41,6 +41,11 @@ class EntityType(StrEnum):
     LOBBYING_REG = "lobbying_reg"
     PLACE = "place"
     TOPIC = "topic"
+    # helen T2 2026-07-17 — hollywood.entity_tags carries 15K events + 56K
+    # concepts. Both are real resolvable entities (a specific war, a named
+    # policy programme, an initiative). Distinct from TOPIC/theme (a heading).
+    EVENT = "event"
+    CONCEPT = "concept"
     UNKNOWN = "unknown"
 
 
