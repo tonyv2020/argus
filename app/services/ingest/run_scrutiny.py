@@ -107,10 +107,18 @@ async def run_scrutiny_sweep(
         return stats
 
     async with sm() as session:
-        # Re-classify persons that either (a) haven't been through scrutiny
-        # yet (surface_mode='open' from server_default OR 'suppress' from
-        # the fail-closed create-time default with no audit row) or (b) got
-        # a stale verdict we now want to overturn (helen T5 recalibration).
+        # Candidate pool = every person canonical WITHOUT a current LLM audit
+        # row (helen fail-open-fix 2026-07-17). Includes suppress persons too so
+        # the recalibrated prompt can promote real public figures — the sweep
+        # is idempotent (audit row is written on every verdict, so a person
+        # is only classified once per LLM generation).
+        #
+        # CRITICAL DISCIPLINE: THIS SWEEP MUST NEVER RESET surface_mode TO
+        # `open` FOR ANY REASON. The fail-closed default (SUPPRESS at insert
+        # time + SUPPRESS on fallback verdict) is what prevents real-name leak.
+        # An operator recalibration MUST reset to SUPPRESS (not open) before
+        # re-sweeping — the sweep will promote to open on affirmative PUBLIC
+        # LLM verdicts.
         from app.services.scrutiny import ScrutinyDecisionLog
 
         candidates = (
@@ -124,8 +132,6 @@ async def run_scrutiny_sweep(
             .scalars()
             .all()
         )
-        # Skip persons who already have an audit row from the current LLM
-        # generation — those are stable. Recompute for the unadjudicated ones.
         adjudicated_ids = set(
             (
                 await session.execute(
