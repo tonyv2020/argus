@@ -44,6 +44,21 @@ class EntityType(StrEnum):
     UNKNOWN = "unknown"
 
 
+class SurfaceMode(StrEnum):
+    """How the public API renders this canonical (Tony 2026-07-17 refinement).
+
+    Private people get a REAL unique node with real edges (the graph is still
+    correct + supports real analysis) but the public API returns the stable
+    non-identifying `public_alias` instead of `canonical_name`. Two distinct
+    private people are TWO distinct canonicals — never collapsed to one generic
+    "private donor" placeholder.
+    """
+
+    OPEN = "open"  # organizations, agencies, public people — real name shown
+    ALIAS = "alias"  # private people — return public_alias, hide real name
+    SUPPRESS = "suppress"  # not surfaced at all
+
+
 class EdgeRelation(StrEnum):
     """Relationship type on a canonical edge (design §4 table)."""
 
@@ -83,6 +98,14 @@ class CanonicalEntity(Base):
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     # 1024-dim to match hollywood.entity_tags.tag_embedding.
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1024), nullable=True)
+    # Tony 2026-07-17: private-person handling. `surface_mode` = OPEN by default
+    # (organizations, public people). Scrutiny may set it to ALIAS (private
+    # person — public API returns `public_alias`, never the real name) or
+    # SUPPRESS (never surfaced). `public_alias` is a stable non-identifying
+    # label like "Private donor #a1b2c3d4" — computed from the canonical id so
+    # it's distinct + stable per real person.
+    surface_mode: Mapped[str] = mapped_column(String(16), nullable=False, server_default="open")
+    public_alias: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

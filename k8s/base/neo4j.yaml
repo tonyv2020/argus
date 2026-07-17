@@ -28,12 +28,17 @@ spec:
       labels:
         app: neo4j
     spec:
+      # Disable service-link injection — k8s otherwise injects NEO4J_PORT_7687_TCP_PORT
+      # and neo4j 5 mis-parses that as a config setting ("Unrecognized setting
+      # PORT.7687.TCP.PORT"), crash-looping the pod (helen 2026-07-17).
+      enableServiceLinks: false
       containers:
         - name: neo4j
           image: neo4j:5-community
           env:
+            # neo4j 5 requires the password to be >=8 chars (helen 2026-07-17).
             - name: NEO4J_AUTH
-              value: neo4j/argus
+              value: neo4j/argus_dev_pw
             - name: NEO4J_server_memory_pagecache_size
               value: 512m
             - name: NEO4J_server_memory_heap_max__size
