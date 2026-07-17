@@ -27,12 +27,35 @@
   aside h2 { font-size:.85rem; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:1rem 0 .4rem; }
   aside .entity-name { font-size:1.3rem; font-weight:600; margin:0 0 .3rem; }
   aside .type { font-size:.8rem; color:var(--accent); text-transform:uppercase; letter-spacing:.06em; }
+  aside .prominence { color:var(--muted); font-size:.72rem; margin-top:.15rem; }
+  aside .prominence .num { color:var(--fg); font-weight:600; }
   aside .share { display:inline-block; margin-top:.4rem; font-size:.72rem; color:var(--muted); }
   aside .share a { color:var(--accent); }
   ul { list-style:none; padding:0; margin:0; }
-  li.edge { padding:.5rem 0; border-bottom:1px solid #22303c; font-size:.88rem; }
-  li.edge .rel { color:var(--accent); font-weight:600; text-transform:uppercase; letter-spacing:.04em; font-size:.7rem; }
-  li.edge .cite { display:block; font-size:.7rem; color:var(--muted); margin-top:.25rem; }
+  li.article { padding:.4rem 0; border-bottom:1px solid #22303c; font-size:.82rem; }
+  li.article a { color:var(--accent); text-decoration:none; }
+  li.article a:hover { text-decoration:underline; }
+  li.article .ref { display:block; font-size:.65rem; color:var(--muted); margin-top:.15rem; }
+  .connection-group { margin-bottom: .8rem; }
+  .connection-group .rel-head { font-size:.72rem; color:var(--accent); text-transform:uppercase; letter-spacing:.06em; font-weight:600; margin: .5rem 0 .2rem; }
+  li.neighbor { padding:.35rem 0; border-bottom:1px dashed #22303c; font-size:.82rem; display:flex; align-items:center; gap:.3rem; cursor:pointer; }
+  li.neighbor:last-child { border-bottom:none; }
+  li.neighbor:hover { color:var(--accent); }
+  li.neighbor .swatch { width:6px; height:6px; border-radius:2px; flex-shrink:0; }
+  li.neighbor .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  li.neighbor .cite-count { color:var(--muted); font-size:.7rem; font-variant-numeric:tabular-nums; }
+  /* Hover peek — small floating card over the graph */
+  #peek {
+    position: absolute; z-index: 20;
+    background: rgba(15,20,28,.96); border: 1px solid #22303c;
+    border-radius: 6px; padding: .4rem .55rem;
+    font-size: .78rem; color: var(--fg); pointer-events: none;
+    box-shadow: 0 6px 24px rgba(0,0,0,.5); backdrop-filter: blur(4px);
+    display: none; max-width: 260px;
+  }
+  #peek.show { display: block; }
+  #peek .type { color: var(--accent); font-size: .65rem; text-transform: uppercase; letter-spacing: .06em; }
+  #peek .deg { color: var(--muted); font-size: .68rem; margin-top: .15rem; }
   #graph-wrap { position: relative; width: 100%; height: 100%; }
   #cy { width: 100%; height: 100%; background: #0a0d13; }
   #filters {
@@ -78,6 +101,7 @@
   <div id="graph-wrap">
     <div id="cy"></div>
     <div id="filters"></div>
+    <div id="peek"></div>
   </div>
 </main>
 <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
@@ -176,29 +200,56 @@ function computeFilteredGraph(graph) {
   return { nodes, edges, totalNodes, totalEdges };
 }
 
-function renderPanel(entity, graph) {
+function renderPanel(entity) {
+  // Helen 2026-07-17: real dossier from the enriched /api/entities/{id}.
   const panel = document.getElementById('panel');
-  const edges = graph.edges.filter(e => e.data.source === entity.id || e.data.target === entity.id);
-  const rel = (e) => e.data.label.replace(/_/g,' ');
-  const other = (e) => e.data.source === entity.id ? e.data.target : e.data.source;
-  const nodeIdToLabel = Object.fromEntries(graph.nodes.map(n => [n.data.id, n.data.label]));
   const surfaceTag = entity.surface_mode && entity.surface_mode !== 'open' ? ` · ${entity.surface_mode}` : '';
+  const prom = entity.prominence || {};
+  const articles = Array.isArray(entity.articles) ? entity.articles : [];
+  const connections = entity.connections || {};
+  // Render each relation's neighbours, sorted by citation_count desc (already done server-side).
+  const relKeys = Object.keys(connections).sort((a, b) => connections[b].length - connections[a].length);
+  const relBlocks = relKeys.map(rel => {
+    const items = connections[rel];
+    return `
+      <div class="connection-group">
+        <div class="rel-head">${rel.replace(/_/g,' ')} · ${items.length}</div>
+        <ul>
+          ${items.map(n => `
+            <li class="neighbor" data-id="${n.id}">
+              <span class="swatch" style="background:${NODE_TYPE_COLOR[n.type] || NODE_TYPE_COLOR.unknown}"></span>
+              <span class="name" title="${n.label}">${n.label}</span>
+              <span class="cite-count">${n.citation_count || 0}</span>
+            </li>
+          `).join('')}
+        </ul>
+      </div>
+    `;
+  }).join('');
   panel.innerHTML = `
     <p class="type">${entity.type}${surfaceTag}</p>
     <p class="entity-name">${entity.label}</p>
+    <p class="prominence">
+      <span class="num">${prom.degree || 0}</span> connections ·
+      <span class="num">${prom.articles || 0}</span> cited articles
+    </p>
     <span class="share">shareable: <a href="/entity/${entity.id}">/entity/${entity.id.slice(0,8)}…</a></span>
-    <h2>Cited connections</h2>
-    ${edges.length === 0 ? '<div class="empty">No cited connections yet.</div>' : ''}
-    <ul>
-      ${edges.map(e => `
-        <li class="edge">
-          <span class="rel">${rel(e)}</span>
-          → ${nodeIdToLabel[other(e)] || other(e).slice(0,8)}
-          ${e.data.weight ? `<span class="cite">weight: ${Number(e.data.weight).toLocaleString()}</span>` : ''}
+    <h2>In the news</h2>
+    ${articles.length === 0
+      ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No Tony Times articles cite this entity yet.</div>'
+      : `<ul>${articles.slice(0,25).map(a => `
+        <li class="article">
+          <a href="${a.url}" target="_blank" rel="noopener">${a.ref || a.url}</a>
+          ${a.ref && !a.url.endsWith(a.ref) ? '' : ''}
         </li>
-      `).join('')}
-    </ul>
+      `).join('')}${articles.length > 25 ? `<li class="article" style="color:var(--muted);border:none;">+${articles.length - 25} more…</li>` : ''}</ul>`}
+    <h2>Connections</h2>
+    ${relKeys.length === 0 ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No connections surfaced yet.</div>' : relBlocks}
   `;
+  // Wire neighbour click → navigate.
+  panel.querySelectorAll('li.neighbor').forEach(el => {
+    el.addEventListener('click', () => navigate(el.dataset.id));
+  });
 }
 
 function renderNotFound(q) {
@@ -329,6 +380,28 @@ function renderGraph(entity, graph) {
       : { name: 'cose', animate: false, nodeRepulsion: 8000, idealEdgeLength: 120 },
   });
   cy.on('tap', 'node', (evt) => navigate(evt.target.id()));
+
+  // Hover peek — floating card with label + type + degree.
+  const peek = document.getElementById('peek');
+  cy.on('mouseover', 'node', (evt) => {
+    const n = evt.target;
+    peek.innerHTML = `
+      <div>${n.data('label')}</div>
+      <div class="type">${n.data('type')}</div>
+      <div class="deg">${n.data('degree') || 0} connections in view</div>
+    `;
+    peek.classList.add('show');
+  });
+  cy.on('mousemove', 'node', (evt) => {
+    const wrap = document.getElementById('graph-wrap').getBoundingClientRect();
+    const x = evt.originalEvent.clientX - wrap.left + 12;
+    const y = evt.originalEvent.clientY - wrap.top + 12;
+    peek.style.left = `${x}px`;
+    peek.style.top = `${y}px`;
+  });
+  cy.on('mouseout', 'node', () => {
+    peek.classList.remove('show');
+  });
 }
 
 async function navigate(id, push = true) {
@@ -337,7 +410,7 @@ async function navigate(id, push = true) {
     if (push && window.location.pathname !== `/entity/${id}`) {
       history.pushState({id}, '', `/entity/${id}`);
     }
-    renderPanel(e, g);
+    renderPanel(e);
     renderGraph(e, g);
     return true;
   }

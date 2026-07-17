@@ -432,7 +432,24 @@ async def search(
 
 @app.get("/api/entities/{canonical_id}")
 async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> dict:
-    """Return the canonical entity's summary — private-person nodes return alias, not real name."""
+    """Return the canonical entity's dossier — sourced articles + connections-by-relation.
+
+    Helen 2026-07-17 dossier: instead of the bare id/label/type/surface_mode, the
+    left panel now gets a real dossier back:
+
+      * `label`, `type`, `surface_mode`, `prominence` (degree + article count).
+      * `articles`: the deduplicated Tony Times permalinks that support edges
+        touching this entity (SourceCitation.kind = article_permalink), each
+        with its `citation_ref` (permalink slug or kind:id fallback).
+      * `connections`: dict keyed by relation → sorted list of neighbours with
+        `id`, `label`, `type`, `citation_count`. Neighbours with `label = None`
+        (surface_mode = suppress) are elided. Aliased neighbours surface their
+        `public_alias`, never the real name.
+    """
+    from sqlalchemy import func
+
+    from app.models import CanonicalEdge, SourceCitation
+
     ent = (
         await db.execute(select(CanonicalEntity).where(CanonicalEntity.id == canonical_id))
     ).scalar_one_or_none()
@@ -441,11 +458,109 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
     label = _public_label(ent)
     if label is None:
         raise HTTPException(status_code=404, detail="entity not surfaceable")
+
+    edges = (
+        (
+            await db.execute(
+                select(CanonicalEdge).where(
+                    (CanonicalEdge.source_id == canonical_id)
+                    | (CanonicalEdge.target_id == canonical_id)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Articles supporting any incident edge, deduped by citation_url.
+    articles: list[dict] = []
+    if edges:
+        edge_ids = [e.id for e in edges]
+        cites = (
+            (
+                await db.execute(
+                    select(SourceCitation)
+                    .where(SourceCitation.edge_id.in_(edge_ids))
+                    .where(SourceCitation.kind == "article_permalink")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        seen: set[str] = set()
+        for c in cites:
+            if c.citation_url in seen:
+                continue
+            seen.add(c.citation_url)
+            articles.append(
+                {
+                    "url": c.citation_url,
+                    "ref": c.citation_ref,
+                }
+            )
+
+    # Connections-by-relation. For each neighbour we compute an edge-scoped
+    # citation_count so callers can rank most-sourced first.
+    connections: dict[str, list[dict]] = {}
+    if edges:
+        # Bulk-pull neighbour entities + per-edge citation counts.
+        neighbour_ids = list(
+            {(e.source_id if e.target_id == canonical_id else e.target_id) for e in edges}
+        )
+        neighbours = {
+            n.id: n
+            for n in (
+                await db.execute(
+                    select(CanonicalEntity).where(CanonicalEntity.id.in_(neighbour_ids))
+                )
+            )
+            .scalars()
+            .all()
+        }
+        edge_cite_counts = dict(
+            (
+                await db.execute(
+                    select(SourceCitation.edge_id, func.count(SourceCitation.id))
+                    .where(SourceCitation.edge_id.in_([e.id for e in edges]))
+                    .group_by(SourceCitation.edge_id)
+                )
+            ).all()
+        )
+        for e in edges:
+            neighbour_id = e.source_id if e.target_id == canonical_id else e.target_id
+            neighbour = neighbours.get(neighbour_id)
+            if neighbour is None:
+                continue
+            nlabel = _public_label(neighbour)
+            if nlabel is None:
+                # Suppressed neighbour — do not surface even the connection.
+                continue
+            connections.setdefault(e.relation, []).append(
+                {
+                    "id": neighbour.id,
+                    "label": nlabel,
+                    "type": neighbour.type,
+                    "surface_mode": neighbour.surface_mode,
+                    "citation_count": int(edge_cite_counts.get(e.id, 0)),
+                    "weight": e.weight,
+                }
+            )
+        for rel in connections:
+            connections[rel].sort(
+                key=lambda x: (-x["citation_count"], -(x["weight"] or 0), x["label"].lower())
+            )
+
     return {
         "id": ent.id,
         "label": label,
         "type": ent.type,
         "surface_mode": ent.surface_mode,
+        "prominence": {
+            "degree": len(edges),
+            "articles": len(articles),
+        },
+        "articles": articles,
+        "connections": connections,
     }
 
 
