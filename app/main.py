@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
-from app.models import CanonicalEntity, SurfaceMode
+from app.models import CanonicalEntity, EntityAlias, SurfaceMode
 from app.services.graph.base import CytoscapeGraph, empty_graph
 from app.services.graph.pgvector_store import PgVectorStore
 
@@ -55,6 +55,106 @@ async def root() -> FileResponse:
     if not index.exists():
         raise HTTPException(status_code=404, detail="ui not built")
     return FileResponse(str(index))
+
+
+@app.get("/entity/{canonical_id}")
+async def entity_deep_link(canonical_id: str) -> FileResponse:
+    """Serve the SPA for a shareable /entity/<id> URL — client-side JS reads the id."""
+    del canonical_id  # id is consumed client-side
+    index = _STATIC_DIR / "index.html"
+    if not index.exists():
+        raise HTTPException(status_code=404, detail="ui not built")
+    return FileResponse(str(index))
+
+
+@app.get("/api/search")
+async def search(
+    q: str = Query(..., min_length=1, max_length=120),
+    limit: int = Query(20, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Search canonical entities by name / alias — scrutiny-respecting.
+
+    Rules (helen 2026-07-17):
+      * suppressed entities are never returned.
+      * alias-mode entities match on `public_alias` ONLY (never on `canonical_name`
+        or on any of their EntityAlias.surface_name rows — those are the real
+        name(s) of a real private person).
+      * open entities match on canonical_name + EntityAlias.surface_name (real
+        name is the label already, so aliasing on real-name is a fair search).
+      * Returns `{results: [{id, label, type, surface_mode}], q, matched: N}`
+        so the SPA can render "no entity found for X" gracefully.
+    """
+    q_norm = q.strip()
+    if not q_norm:
+        return {"q": q, "results": [], "matched": 0}
+    like = f"%{q_norm.lower()}%"
+
+    # 1. open entities by canonical_name (case-insensitive).
+    open_by_name = (
+        (
+            await db.execute(
+                select(CanonicalEntity)
+                .where(CanonicalEntity.surface_mode == SurfaceMode.OPEN.value)
+                .where(CanonicalEntity.canonical_name_normalized.ilike(like))
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # 2. open entities via an alias's surface_name (real name; safe to expose).
+    open_by_alias = (
+        (
+            await db.execute(
+                select(CanonicalEntity)
+                .join(EntityAlias, EntityAlias.canonical_id == CanonicalEntity.id)
+                .where(CanonicalEntity.surface_mode == SurfaceMode.OPEN.value)
+                .where(EntityAlias.surface_name_normalized.ilike(like))
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # 3. alias-mode entities matching on `public_alias` ONLY. Real-name aliases
+    #    are NEVER matched — that would leak the identity via a hit.
+    aliased = (
+        (
+            await db.execute(
+                select(CanonicalEntity)
+                .where(CanonicalEntity.surface_mode == SurfaceMode.ALIAS.value)
+                .where(CanonicalEntity.public_alias.ilike(like))
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Dedup, cap, and render with public labels only.
+    seen: set[str] = set()
+    out: list[dict] = []
+    for e in list(open_by_name) + list(open_by_alias) + list(aliased):
+        if e.id in seen:
+            continue
+        seen.add(e.id)
+        label = _public_label(e)
+        if label is None:
+            continue
+        out.append(
+            {
+                "id": e.id,
+                "label": label,
+                "type": e.type,
+                "surface_mode": e.surface_mode,
+            }
+        )
+        if len(out) >= limit:
+            break
+    return {"q": q, "matched": len(out), "results": out}
 
 
 @app.get("/api/entities/{canonical_id}")

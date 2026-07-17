@@ -5,45 +5,63 @@
 <title>Argus — Ontology Navigator</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-  :root { --bg:#0f1218; --fg:#e6edf3; --muted:#8b9fb5; --accent:#7ab8ff; --edge:#3a5b7f; }
+  :root { --bg:#0f1218; --fg:#e6edf3; --muted:#8b9fb5; --accent:#7ab8ff; --edge:#3a5b7f; --panel:#161b22; }
   html,body { margin:0; padding:0; height:100%; background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-  header { padding:.75rem 1rem; border-bottom:1px solid #22303c; display:flex; align-items:center; gap:1rem; }
-  header h1 { margin:0; font-size:1.1rem; font-weight:600; letter-spacing:.03em; }
-  header .tag { font-size:.75rem; color:var(--muted); }
-  main { display:grid; grid-template-columns: 320px 1fr; height:calc(100vh - 3rem); }
+  header { padding:.6rem 1rem; border-bottom:1px solid #22303c; display:flex; align-items:center; gap:1rem; position:relative; z-index: 30; }
+  header h1 { margin:0; font-size:1.1rem; font-weight:600; letter-spacing:.03em; cursor:pointer; }
+  header .tag { font-size:.72rem; color:var(--muted); }
+  header .search-wrap { position:relative; flex:1; max-width: 420px; margin-left: auto; }
+  header input[type=search] { width:100%; padding:.5rem .7rem; border-radius:6px; background:#0a0d13; color:var(--fg); border:1px solid #22303c; font-size:.9rem; }
+  header input[type=search]:focus { outline:none; border-color:var(--accent); }
+  #results { position:absolute; top:calc(100% + 6px); left:0; right:0; background:var(--panel); border:1px solid #22303c; border-radius:6px; max-height: 60vh; overflow:auto; display:none; box-shadow: 0 8px 32px rgba(0,0,0,.5); }
+  #results.show { display:block; }
+  #results .item { padding:.55rem .8rem; border-bottom:1px solid #22303c; cursor:pointer; font-size:.9rem; }
+  #results .item:last-child { border-bottom:none; }
+  #results .item:hover { background:#1c2530; }
+  #results .item .type { color:var(--accent); font-size:.7rem; text-transform:uppercase; letter-spacing:.06em; margin-left:.5rem; }
+  #results .item .mode { color:var(--muted); font-size:.68rem; margin-left:.4rem; }
+  #results .empty { padding:1rem .8rem; color:var(--muted); font-size:.85rem; }
+  #results .empty strong { color:var(--fg); }
+  main { display:grid; grid-template-columns: 320px 1fr; height:calc(100vh - 3.1rem); }
   aside { border-right:1px solid #22303c; padding:1rem; overflow:auto; }
-  aside h2 { font-size:.9rem; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:1rem 0 .4rem; }
+  aside h2 { font-size:.85rem; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:1rem 0 .4rem; }
   aside .entity-name { font-size:1.3rem; font-weight:600; margin:0 0 .3rem; }
   aside .type { font-size:.8rem; color:var(--accent); text-transform:uppercase; letter-spacing:.06em; }
+  aside .share { display:inline-block; margin-top:.4rem; font-size:.72rem; color:var(--muted); }
+  aside .share a { color:var(--accent); }
   ul { list-style:none; padding:0; margin:0; }
-  li.edge { padding:.5rem 0; border-bottom:1px solid #22303c; font-size:.9rem; }
-  li.edge .rel { color:var(--accent); font-weight:600; text-transform:uppercase; letter-spacing:.04em; font-size:.72rem; }
+  li.edge { padding:.5rem 0; border-bottom:1px solid #22303c; font-size:.88rem; }
+  li.edge .rel { color:var(--accent); font-weight:600; text-transform:uppercase; letter-spacing:.04em; font-size:.7rem; }
   li.edge .cite { display:block; font-size:.7rem; color:var(--muted); margin-top:.25rem; }
-  li.edge a { color:var(--accent); text-decoration:none; }
-  li.edge a:hover { text-decoration:underline; }
   #cy { width:100%; height:100%; background:#0a0d13; }
   .empty { color:var(--muted); padding:2rem; text-align:center; }
+  .not-found { padding:2rem 1rem; }
+  .not-found h3 { margin: 0 0 .4rem; font-size:1rem; color:var(--fg); }
+  .not-found p { margin: 0; color:var(--muted); font-size:.85rem; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Argus</h1>
+  <h1 id="home">Argus</h1>
   <span class="tag">ontology navigator · every edge cited</span>
+  <div class="search-wrap">
+    <input id="q" type="search" placeholder="Search entities (e.g. GEO Group, ICE, Trump)…" autocomplete="off" />
+    <div id="results"></div>
+  </div>
 </header>
 <main>
-  <aside id="panel">
-    <div class="empty">Loading GEO Group profile…</div>
-  </aside>
+  <aside id="panel"><div class="empty">Loading…</div></aside>
   <div id="cy"></div>
 </main>
 <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
 <script>
-// Static anchor for the MVP — GEO Group's canonical id, seeded in P0.
+// Default anchor for the profile page — GEO Group's canonical id (seeded in P0).
 const GEO_GROUP_ID = 'b393bc4c-bacc-4556-9589-b6446854608e';
 
-async function fetchGraph(id, hops=1) {
-  const r = await fetch(`/api/entities/${id}/subgraph?hops=${hops}`);
-  return r.json();
+function idFromPath() {
+  // /entity/<id>  →  <id>; anything else → null (fall back to GEO_GROUP_ID).
+  const m = window.location.pathname.match(/^\/entity\/([0-9a-f-]{36})/i);
+  return m ? m[1] : null;
 }
 
 async function fetchEntity(id) {
@@ -52,27 +70,49 @@ async function fetchEntity(id) {
   return r.json();
 }
 
+async function fetchGraph(id, hops=1) {
+  const r = await fetch(`/api/entities/${id}/subgraph?hops=${hops}`);
+  return r.json();
+}
+
+async function fetchSearch(q) {
+  const r = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=20`);
+  return r.json();
+}
+
 function renderPanel(entity, graph) {
   const panel = document.getElementById('panel');
-  if (!entity) { panel.innerHTML = '<div class="empty">Entity not surfaceable.</div>'; return; }
   const edges = graph.edges.filter(e => e.data.source === entity.id || e.data.target === entity.id);
   const rel = (e) => e.data.label.replace(/_/g,' ');
   const other = (e) => e.data.source === entity.id ? e.data.target : e.data.source;
   const nodeIdToLabel = Object.fromEntries(graph.nodes.map(n => [n.data.id, n.data.label]));
+  const surfaceTag = entity.surface_mode && entity.surface_mode !== 'open' ? ` · ${entity.surface_mode}` : '';
   panel.innerHTML = `
-    <p class="type">${entity.type}${entity.surface_mode && entity.surface_mode !== 'open' ? ' · ' + entity.surface_mode : ''}</p>
+    <p class="type">${entity.type}${surfaceTag}</p>
     <p class="entity-name">${entity.label}</p>
+    <span class="share">shareable: <a href="/entity/${entity.id}">/entity/${entity.id.slice(0,8)}…</a></span>
     <h2>Cited connections</h2>
+    ${edges.length === 0 ? '<div class="empty">No cited connections yet.</div>' : ''}
     <ul>
       ${edges.map(e => `
         <li class="edge">
           <span class="rel">${rel(e)}</span>
-          → ${nodeIdToLabel[other(e)] || other(e)}
+          → ${nodeIdToLabel[other(e)] || other(e).slice(0,8)}
           ${e.data.weight ? `<span class="cite">weight: ${Number(e.data.weight).toLocaleString()}</span>` : ''}
         </li>
       `).join('')}
     </ul>
   `;
+}
+
+function renderNotFound(q) {
+  document.getElementById('panel').innerHTML = `
+    <div class="not-found">
+      <h3>No matching entity for “${q}”</h3>
+      <p>Argus is a graph of <em>entities</em> — organizations, PACs, agencies, candidates, and people that appear in citation-sourced records. Topics (like “civil war” or “detention”) are not entities in this graph; search for a company, agency, or public figure instead. E.g. <a href="/entity/${GEO_GROUP_ID}">GEO Group</a>.</p>
+    </div>
+  `;
+  document.getElementById('cy').innerHTML = '';
 }
 
 function renderGraph(entity, graph) {
@@ -93,17 +133,83 @@ function renderGraph(entity, graph) {
     ],
     layout: { name: 'cose', animate: false, nodeRepulsion: 8000, idealEdgeLength: 100 }
   });
-  cy.on('tap', 'node', async (evt) => {
-    const id = evt.target.id();
-    const [e, g] = await Promise.all([fetchEntity(id), fetchGraph(id, 1)]);
-    if (e) { renderPanel(e, g); }
-  });
+  cy.on('tap', 'node', (evt) => navigate(evt.target.id()));
 }
 
+async function navigate(id, push=true) {
+  const [e, g] = await Promise.all([fetchEntity(id), fetchGraph(id, 1)]);
+  if (e) {
+    if (push && window.location.pathname !== `/entity/${id}`) {
+      history.pushState({id}, '', `/entity/${id}`);
+    }
+    renderPanel(e, g);
+    renderGraph(e, g);
+    return true;
+  }
+  return false;
+}
+
+// --- search UX ---
+let searchTimer = null;
+const q = document.getElementById('q');
+const results = document.getElementById('results');
+
+q.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  const val = q.value.trim();
+  if (!val) { results.classList.remove('show'); results.innerHTML=''; return; }
+  searchTimer = setTimeout(async () => {
+    const data = await fetchSearch(val);
+    if (data.matched === 0) {
+      results.innerHTML = `<div class="empty">No entity found for <strong>${val}</strong>. Argus indexes entities (people, orgs, PACs, agencies) — topics like “civil war” are not entities here.</div>`;
+    } else {
+      results.innerHTML = data.results.map(r => `
+        <div class="item" data-id="${r.id}">
+          ${r.label}<span class="type">${r.type}</span>${r.surface_mode !== 'open' ? `<span class="mode">${r.surface_mode}</span>` : ''}
+        </div>
+      `).join('');
+    }
+    results.classList.add('show');
+  }, 200);
+});
+
+results.addEventListener('click', async (ev) => {
+  const item = ev.target.closest('.item');
+  if (!item) return;
+  results.classList.remove('show'); q.value = '';
+  await navigate(item.dataset.id);
+});
+
+q.addEventListener('keydown', async (ev) => {
+  if (ev.key === 'Escape') { results.classList.remove('show'); }
+  if (ev.key === 'Enter') {
+    // If exactly one result, navigate. Otherwise trigger no-entity treatment.
+    const items = results.querySelectorAll('.item');
+    if (items.length === 1) {
+      results.classList.remove('show');
+      await navigate(items[0].dataset.id);
+      q.value = '';
+    } else if (items.length === 0) {
+      renderNotFound(q.value);
+      results.classList.remove('show');
+    }
+  }
+});
+
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest('.search-wrap')) results.classList.remove('show');
+});
+document.getElementById('home').addEventListener('click', () => navigate(GEO_GROUP_ID));
+
+window.addEventListener('popstate', () => {
+  const id = idFromPath() || GEO_GROUP_ID;
+  navigate(id, false);
+});
+
 (async () => {
-  const [entity, graph] = await Promise.all([fetchEntity(GEO_GROUP_ID), fetchGraph(GEO_GROUP_ID, 1)]);
-  renderPanel(entity, graph);
-  renderGraph(entity, graph);
+  const id = idFromPath() || GEO_GROUP_ID;
+  const ok = await navigate(id, false);
+  if (!ok) renderNotFound(id);
 })();
 </script>
 </body>
