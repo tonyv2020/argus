@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Argus — Ontology Navigator</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { --bg:#0f1218; --fg:#e6edf3; --muted:#8b9fb5; --accent:#7ab8ff; --edge:#3a5b7f; }
+  html,body { margin:0; padding:0; height:100%; background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  header { padding:.75rem 1rem; border-bottom:1px solid #22303c; display:flex; align-items:center; gap:1rem; }
+  header h1 { margin:0; font-size:1.1rem; font-weight:600; letter-spacing:.03em; }
+  header .tag { font-size:.75rem; color:var(--muted); }
+  main { display:grid; grid-template-columns: 320px 1fr; height:calc(100vh - 3rem); }
+  aside { border-right:1px solid #22303c; padding:1rem; overflow:auto; }
+  aside h2 { font-size:.9rem; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:1rem 0 .4rem; }
+  aside .entity-name { font-size:1.3rem; font-weight:600; margin:0 0 .3rem; }
+  aside .type { font-size:.8rem; color:var(--accent); text-transform:uppercase; letter-spacing:.06em; }
+  ul { list-style:none; padding:0; margin:0; }
+  li.edge { padding:.5rem 0; border-bottom:1px solid #22303c; font-size:.9rem; }
+  li.edge .rel { color:var(--accent); font-weight:600; text-transform:uppercase; letter-spacing:.04em; font-size:.72rem; }
+  li.edge .cite { display:block; font-size:.7rem; color:var(--muted); margin-top:.25rem; }
+  li.edge a { color:var(--accent); text-decoration:none; }
+  li.edge a:hover { text-decoration:underline; }
+  #cy { width:100%; height:100%; background:#0a0d13; }
+  .empty { color:var(--muted); padding:2rem; text-align:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Argus</h1>
+  <span class="tag">ontology navigator · every edge cited</span>
+</header>
+<main>
+  <aside id="panel">
+    <div class="empty">Loading GEO Group profile…</div>
+  </aside>
+  <div id="cy"></div>
+</main>
+<script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+<script>
+// Static anchor for the MVP — GEO Group's canonical id, seeded in P0.
+const GEO_GROUP_ID = 'b393bc4c-bacc-4556-9589-b6446854608e';
+
+async function fetchGraph(id, hops=1) {
+  const r = await fetch(`/api/entities/${id}/subgraph?hops=${hops}`);
+  return r.json();
+}
+
+async function fetchEntity(id) {
+  const r = await fetch(`/api/entities/${id}`);
+  if (!r.ok) return null;
+  return r.json();
+}
+
+function renderPanel(entity, graph) {
+  const panel = document.getElementById('panel');
+  if (!entity) { panel.innerHTML = '<div class="empty">Entity not surfaceable.</div>'; return; }
+  const edges = graph.edges.filter(e => e.data.source === entity.id || e.data.target === entity.id);
+  const rel = (e) => e.data.label.replace(/_/g,' ');
+  const other = (e) => e.data.source === entity.id ? e.data.target : e.data.source;
+  const nodeIdToLabel = Object.fromEntries(graph.nodes.map(n => [n.data.id, n.data.label]));
+  panel.innerHTML = `
+    <p class="type">${entity.type}${entity.surface_mode && entity.surface_mode !== 'open' ? ' · ' + entity.surface_mode : ''}</p>
+    <p class="entity-name">${entity.label}</p>
+    <h2>Cited connections</h2>
+    <ul>
+      ${edges.map(e => `
+        <li class="edge">
+          <span class="rel">${rel(e)}</span>
+          → ${nodeIdToLabel[other(e)] || other(e)}
+          ${e.data.weight ? `<span class="cite">weight: ${Number(e.data.weight).toLocaleString()}</span>` : ''}
+        </li>
+      `).join('')}
+    </ul>
+  `;
+}
+
+function renderGraph(entity, graph) {
+  const cy = cytoscape({
+    container: document.getElementById('cy'),
+    elements: [
+      ...graph.nodes.map(n => ({ data: { id: n.data.id, label: n.data.label, type: n.data.type } })),
+      ...graph.edges.map(e => ({ data: { id: e.data.id, source: e.data.source, target: e.data.target, label: e.data.label.replace(/_/g,' ') } }))
+    ],
+    style: [
+      { selector: 'node', style: { 'background-color':'#3a5b7f', 'label':'data(label)', 'color':'#e6edf3', 'font-size':10, 'text-valign':'center', 'text-halign':'center', 'width':30, 'height':30 } },
+      { selector: `node[id = "${entity.id}"]`, style: { 'background-color':'#7ab8ff', 'width':60, 'height':60, 'font-weight':'bold' } },
+      { selector: 'node[type = "person"]', style: { 'background-color':'#c084fc' } },
+      { selector: 'node[type = "candidate"]', style: { 'background-color':'#eab308' } },
+      { selector: 'node[type = "pac"]', style: { 'background-color':'#22c55e' } },
+      { selector: 'node[type = "agency"]', style: { 'background-color':'#ef4444' } },
+      { selector: 'edge', style: { 'width':1.5, 'line-color':'#3a5b7f', 'target-arrow-color':'#3a5b7f', 'target-arrow-shape':'triangle', 'curve-style':'bezier', 'label':'data(label)', 'font-size':7, 'color':'#8b9fb5', 'text-rotation':'autorotate' } },
+    ],
+    layout: { name: 'cose', animate: false, nodeRepulsion: 8000, idealEdgeLength: 100 }
+  });
+  cy.on('tap', 'node', async (evt) => {
+    const id = evt.target.id();
+    const [e, g] = await Promise.all([fetchEntity(id), fetchGraph(id, 1)]);
+    if (e) { renderPanel(e, g); }
+  });
+}
+
+(async () => {
+  const [entity, graph] = await Promise.all([fetchEntity(GEO_GROUP_ID), fetchGraph(GEO_GROUP_ID, 1)]);
+  renderPanel(entity, graph);
+  renderGraph(entity, graph);
+})();
+</script>
+</body>
+</html>

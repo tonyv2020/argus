@@ -123,11 +123,18 @@ async def _resolve_row(
     hit = await store.resolve_entity(session, surface, argus_type, embedding)
     if hit is None:
         # New canonical entity (seed with this embedding as the initial centroid).
+        # Fail-closed for persons: default a new-person canonical to surface_mode=suppress
+        # so the public API never leaks a real name before scrutiny runs. Non-persons
+        # inherit the SQL server_default ("open").
+        person_default = (
+            {"surface_mode": "suppress"} if argus_type == EntityType.PERSON.value else {}
+        )
         canonical = CanonicalEntity(
             canonical_name=surface,
             canonical_name_normalized=normalize_name(surface),
             type=argus_type,
             embedding=embedding,
+            **person_default,
         )
         session.add(canonical)
         await session.flush()
