@@ -234,15 +234,20 @@ function renderPanel(entity) {
       <span class="num">${prom.articles || 0}</span> cited articles
     </p>
     <span class="share">shareable: <a href="/entity/${entity.id}">/entity/${entity.id.slice(0,8)}…</a></span>
-    <h2>In the news</h2>
-    ${articles.length === 0
-      ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No Tony Times articles cite this entity yet.</div>'
-      : `<ul>${articles.slice(0,25).map(a => `
-        <li class="article">
-          <a href="${a.url}" target="_blank" rel="noopener">${a.ref || a.url}</a>
-          ${a.ref && !a.url.endsWith(a.ref) ? '' : ''}
-        </li>
-      `).join('')}${articles.length > 25 ? `<li class="article" style="color:var(--muted);border:none;">+${articles.length - 25} more…</li>` : ''}</ul>`}
+    ${entity.surface_mode === 'alias'
+      ? `<h2>In the news</h2>
+         <div class="empty" style="padding:.5rem 0;font-size:.8rem;">
+           <strong>${prom.articles || 0}</strong> cited article${(prom.articles === 1) ? '' : 's'} — source URLs are hidden to protect this private individual's identity.
+         </div>`
+      : `<h2>In the news</h2>
+         ${articles.length === 0
+           ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No Tony Times articles cite this entity yet.</div>'
+           : `<ul>${articles.slice(0,25).map(a => `
+             <li class="article">
+               <a href="${a.url}" target="_blank" rel="noopener">${a.ref || a.url}</a>
+             </li>
+           `).join('')}${articles.length > 25 ? `<li class="article" style="color:var(--muted);border:none;">+${articles.length - 25} more…</li>` : ''}</ul>`}
+      `}
     <h2>Connections</h2>
     ${relKeys.length === 0 ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No connections surfaced yet.</div>' : relBlocks}
   `;

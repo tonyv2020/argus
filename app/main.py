@@ -459,6 +459,13 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
     if label is None:
         raise HTTPException(status_code=404, detail="entity not surfaceable")
 
+    # Helen 2026-07-17 privacy regression fix: for surface_mode != open we NEVER
+    # return article URLs. A permalink to a source article is a deanonymization
+    # channel — the article body carries the real name a private-person canonical
+    # is aliased to hide. Alias-mode dossiers return only aggregate counts +
+    # non-naming connection topology.
+    is_open = ent.surface_mode == SurfaceMode.OPEN.value
+
     edges = (
         (
             await db.execute(
@@ -473,7 +480,9 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
     )
 
     # Articles supporting any incident edge, deduped by citation_url.
+    # SUPPRESS is already 404'd above; ALIAS returns article COUNTS only (no URLs).
     articles: list[dict] = []
+    article_count = 0
     if edges:
         edge_ids = [e.id for e in edges]
         cites = (
@@ -492,12 +501,14 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
             if c.citation_url in seen:
                 continue
             seen.add(c.citation_url)
-            articles.append(
-                {
-                    "url": c.citation_url,
-                    "ref": c.citation_ref,
-                }
-            )
+            article_count += 1
+            if is_open:
+                articles.append(
+                    {
+                        "url": c.citation_url,
+                        "ref": c.citation_ref,
+                    }
+                )
 
     # Connections-by-relation. For each neighbour we compute an edge-scoped
     # citation_count so callers can rank most-sourced first.
@@ -557,8 +568,11 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
         "surface_mode": ent.surface_mode,
         "prominence": {
             "degree": len(edges),
-            "articles": len(articles),
+            "articles": article_count,
         },
+        # ALIAS-mode dossiers return an EMPTY articles list — article urls
+        # would deanonymize the private person. The count still surfaces via
+        # `prominence.articles`.
         "articles": articles,
         "connections": connections,
     }
