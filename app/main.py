@@ -82,7 +82,14 @@ async def entity_deep_link(canonical_id: str) -> FileResponse:
 
 
 async def _resolve_one(db: AsyncSession, tag: str) -> dict:
-    """Core /api/resolve logic — reused by GET and by the batch POST."""
+    """Core /api/resolve logic — reused by GET and by the batch POST.
+
+    Helen T4 2026-07-17: when an argus canonical doesn't exist for the tag but
+    hollywood.entity_tags has it as `kind_hint=event|concept`, we do an
+    on-demand upsert into argus rather than returning "not an entity". This
+    fixes the resolver-lag edge case where "civil war" (an event) hadn't yet
+    been processed and was misreported as a topic.
+    """
     from app.services.graph.base import normalize_name
 
     norm = normalize_name(tag)
@@ -116,6 +123,11 @@ async def _resolve_one(db: AsyncSession, tag: str) -> dict:
             )
         ).scalar_one_or_none()
 
+    # T4 lag-fill: if argus has nothing yet, look upstream at hollywood.entity_tags
+    # for an event/concept-typed match and materialize a canonical on demand.
+    if match is None:
+        match = await _lag_fill_from_hollywood(db, norm)
+
     if match is None:
         return {"resolved": False, "reason": "not an entity (topic/theme)"}
     label = _public_label(match)
@@ -129,6 +141,73 @@ async def _resolve_one(db: AsyncSession, tag: str) -> dict:
         "surface_mode": match.surface_mode,
         "path": f"/entity/{match.id}",
     }
+
+
+_LAG_FILL_KINDS = ("event", "concept")
+
+
+async def _lag_fill_from_hollywood(db: AsyncSession, tag_normalized: str) -> CanonicalEntity | None:
+    """On-demand upsert of an event/concept canonical from hollywood.entity_tags.
+
+    Only fills entities the resolver would eventually create anyway — respecting
+    the same `kind_hint → EntityType` mapping used by the batched resolver. Never
+    materialises person/org/candidate types on demand (those need embedding
+    resolution to avoid false-merges) — only event + concept, which are safe
+    since they're free-text and don't collide identity-wise.
+    """
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.config import settings
+    from app.models import EntityType
+
+    engine = create_async_engine(settings.hollywood_database_url, pool_pre_ping=True)
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT id::text AS id, tag, kind_hint "
+                    "FROM entity_tags "
+                    "WHERE tag_normalized = :n AND kind_hint IN ('event','concept') "
+                    "LIMIT 1"
+                ),
+                {"n": tag_normalized},
+            )
+            row = result.mappings().first()
+    finally:
+        await engine.dispose()
+        del create_engine  # imported for symmetry with the resolver; not used here.
+
+    if not row:
+        return None
+
+    surface = row["tag"]
+    kind = (row["kind_hint"] or "").strip().lower()
+    new_type = EntityType.EVENT.value if kind == "event" else EntityType.CONCEPT.value
+    if new_type not in {EntityType.EVENT.value, EntityType.CONCEPT.value}:
+        return None
+
+    from app.services.graph.base import normalize_name
+
+    ce = CanonicalEntity(
+        canonical_name=surface,
+        canonical_name_normalized=normalize_name(surface),
+        type=new_type,
+    )
+    db.add(ce)
+    await db.flush()
+    db.add(
+        EntityAlias(
+            canonical_id=ce.id,
+            source_system="hollywood.entity_tags",
+            source_id=str(row["id"]),
+            surface_name=surface,
+            surface_name_normalized=normalize_name(surface),
+            kind_hint=kind,
+        )
+    )
+    await db.commit()
+    return ce
 
 
 @app.post("/api/resolve/batch")
