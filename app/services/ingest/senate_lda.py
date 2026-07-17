@@ -294,13 +294,20 @@ async def ingest_client_filings(
                     )
                     stats.clients_upserted += 1
 
+                    # LDA's registrant.description is prose ("Law and Public Policy
+                    # Firm", "Public relations, lobbying and coalitions building.")
+                    # which does not fit the short-tag semantic of `kind_hint`
+                    # (varchar(32); values like "pac", "candidate", "committee").
+                    # Drop the description here; the alias `source_system` +
+                    # `source_id` are enough to trace back to the LDA registrant
+                    # record, and the surface name carries what the reader needs.
                     registrant_canonical = await _upsert_entity(
                         session,
                         surface_name=(registrant_row.get("name") or "").strip(),
                         entity_type=EntityType.ORGANIZATION.value,
                         source_system="senate_lda.registrant",
                         source_id=registrant_lda_id,
-                        kind_hint=registrant_row.get("description") or None,
+                        kind_hint=None,
                     )
                     stats.registrants_upserted += 1
 
