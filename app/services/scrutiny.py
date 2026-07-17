@@ -153,14 +153,30 @@ def _classify_from_llm(canonical_name: str, aliases: list[EntityAlias]) -> Scrut
 
         client = anthropic.Anthropic(api_key=api_key)
         prompt = (
-            "Classify this person as PUBLIC or PRIVATE for a cited-fact accountability "
-            "graph. PUBLIC = elected official, candidate, registered lobbyist, corporate "
-            "officer/exec, or otherwise notable public role. PRIVATE = everyone else, "
-            "including small political donors and private citizens.\n\n"
+            "Classify this person as PUBLIC or PRIVATE for a cited-fact "
+            "accountability graph.\n\n"
+            "PUBLIC includes anyone in a notable public role — not just "
+            "politics. Non-exhaustive: elected officials, candidates, "
+            "registered lobbyists, corporate officers/execs, notable "
+            "founders, working journalists / opinion writers / columnists / "
+            "editors at major outlets, published authors, entertainers, "
+            "musicians, filmmakers, athletes, academics with a public "
+            "profile (published research or public-facing role), "
+            "activists/organisers with a media footprint, senior military "
+            "officers (flag/general), diplomats, judges. If the person is "
+            "identifiable via widely-available public reporting about their "
+            "public work, they are PUBLIC.\n\n"
+            "PRIVATE = private individuals with no notable public role. "
+            "Small political donors, private citizens named incidentally, "
+            "generic descriptors ('a South Korean fan', 'Reddit username'), "
+            "and cases where the name is too common to attribute confidently.\n\n"
+            "Err on the side of PUBLIC when there's a plausible public role "
+            "attached to the name; err on the side of PRIVATE when a name "
+            "could refer to many people with no obvious public identity.\n\n"
             f"Name: {canonical_name}\n"
             f"Aliases: {', '.join(a.surface_name for a in aliases[:8])}\n\n"
-            'Reply with STRICT JSON only: {"class": "public|private", "decision": '
-            '"surface|aggregate|suppress", "reason": "<one-line>"}.'
+            'Reply with STRICT JSON only: {"class": "public|private", '
+            '"decision": "surface|aggregate|suppress", "reason": "<one-line>"}.'
         )
         msg = client.messages.create(
             model=settings.anthropic_model,

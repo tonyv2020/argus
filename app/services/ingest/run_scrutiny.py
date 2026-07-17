@@ -107,18 +107,37 @@ async def run_scrutiny_sweep(
         return stats
 
     async with sm() as session:
+        # Re-classify persons that either (a) haven't been through scrutiny
+        # yet (surface_mode='open' from server_default OR 'suppress' from
+        # the fail-closed create-time default with no audit row) or (b) got
+        # a stale verdict we now want to overturn (helen T5 recalibration).
+        from app.services.scrutiny import ScrutinyDecisionLog
+
         candidates = (
             (
                 await session.execute(
                     select(CanonicalEntity)
                     .where(CanonicalEntity.type == EntityType.PERSON.value)
-                    .where(CanonicalEntity.surface_mode == "open")
                     .order_by(CanonicalEntity.created_at)
                 )
             )
             .scalars()
             .all()
         )
+        # Skip persons who already have an audit row from the current LLM
+        # generation — those are stable. Recompute for the unadjudicated ones.
+        adjudicated_ids = set(
+            (
+                await session.execute(
+                    select(ScrutinyDecisionLog.canonical_id).where(
+                        ScrutinyDecisionLog.decided_by.like("scrutiny.llm.%")
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        candidates = [c for c in candidates if c.id not in adjudicated_ids]
 
     # Prioritize: GEO neighborhood first (design's MVP anchor), then everyone else.
     prioritized: list[str] = []
