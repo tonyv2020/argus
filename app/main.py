@@ -67,6 +67,88 @@ async def entity_deep_link(canonical_id: str) -> FileResponse:
     return FileResponse(str(index))
 
 
+@app.get("/api/resolve")
+async def resolve(
+    tag: str = Query(..., min_length=1, max_length=120),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Resolve a hollywood entity_tag surface (`tag_normalized`) → argus canonical entity.
+
+    Powers the-dailies article entity-chip href (helen 2026-07-17). the-dailies
+    knows a tag string; it asks argus "is this a real entity, and if so where
+    does it live?". Contract:
+
+      * MATCH   → `{resolved: true, id, type, label, path: "/entity/<id>"}`
+      * NO      → `{resolved: false, reason: "not an entity (topic/theme)"}`
+
+    Scrutiny is respected — a suppressed canonical returns `{resolved: false}`
+    (never leaks the real name) and an aliased canonical returns the
+    `public_alias` as `label` (never the real name).
+
+    Matching precedence (most specific first):
+      1. EntityAlias.source_system='hollywood.entity_tags' with a matching
+         `surface_name_normalized`. This is the highest-fidelity path — the
+         tag came from the same source system.
+      2. CanonicalEntity.canonical_name_normalized exact match (case-insensitive).
+      3. Any EntityAlias.surface_name_normalized exact match.
+    """
+    from app.services.graph.base import normalize_name
+
+    norm = normalize_name(tag)
+    if not norm:
+        return {"resolved": False, "reason": "not an entity (topic/theme)"}
+
+    # 1. hollywood.entity_tags-sourced alias (highest fidelity for the caller).
+    holly = (
+        await db.execute(
+            select(CanonicalEntity)
+            .join(EntityAlias, EntityAlias.canonical_id == CanonicalEntity.id)
+            .where(EntityAlias.source_system == "hollywood.entity_tags")
+            .where(EntityAlias.surface_name_normalized == norm)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    # 2. exact canonical_name_normalized match.
+    match = holly
+    if match is None:
+        match = (
+            await db.execute(
+                select(CanonicalEntity)
+                .where(CanonicalEntity.canonical_name_normalized == norm)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    # 3. any surface_name_normalized match.
+    if match is None:
+        match = (
+            await db.execute(
+                select(CanonicalEntity)
+                .join(EntityAlias, EntityAlias.canonical_id == CanonicalEntity.id)
+                .where(EntityAlias.surface_name_normalized == norm)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    if match is None:
+        return {"resolved": False, "reason": "not an entity (topic/theme)"}
+
+    label = _public_label(match)
+    if label is None:
+        # Suppressed — respect scrutiny; never leak a real name.
+        return {"resolved": False, "reason": "not an entity (topic/theme)"}
+
+    return {
+        "resolved": True,
+        "id": match.id,
+        "type": match.type,
+        "label": label,
+        "surface_mode": match.surface_mode,
+        "path": f"/entity/{match.id}",
+    }
+
+
 @app.get("/api/search")
 async def search(
     q: str = Query(..., min_length=1, max_length=120),
