@@ -76,8 +76,17 @@ async function fetchGraph(id, hops=1) {
 }
 
 async function fetchSearch(q) {
-  const r = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=20`);
-  return r.json();
+  // Never silent-blank — a failure here still returns a shape the caller can
+  // render an empty-state for. `matched:0` + `results:[]` is the neutral fallback.
+  try {
+    const r = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=20`);
+    if (!r.ok) return { q, matched: 0, results: [], error: `search failed (${r.status})` };
+    const data = await r.json();
+    if (!data || !Array.isArray(data.results)) return { q, matched: 0, results: [] };
+    return data;
+  } catch (err) {
+    return { q, matched: 0, results: [], error: err && err.message ? err.message : 'network error' };
+  }
 }
 
 function renderPanel(entity, graph) {
@@ -154,16 +163,40 @@ let searchTimer = null;
 const q = document.getElementById('q');
 const results = document.getElementById('results');
 
+function renderEmptyState(val, extra) {
+  return `
+    <div class="empty">
+      <strong>No entity found for “${val}”.</strong><br>
+      Argus indexes entities (people, orgs, PACs, agencies, candidates).
+      Topics like <em>“civil war”</em> or <em>“the us”</em> aren't entities here — try a
+      person, organization, or agency name.
+      ${extra ? `<div style="margin-top:.5rem;opacity:.7;font-size:.7rem;">${extra}</div>` : ''}
+    </div>
+  `;
+}
+
+function renderSearchLoading(val) {
+  return `<div class="empty">Searching for <strong>${val}</strong>…</div>`;
+}
+
 q.addEventListener('input', () => {
   clearTimeout(searchTimer);
   const val = q.value.trim();
   if (!val) { results.classList.remove('show'); results.innerHTML=''; return; }
+  // Show the panel immediately with a loading state — never leave the box
+  // silently blank between keystroke and network round-trip (helen 2026-07-17).
+  results.innerHTML = renderSearchLoading(val);
+  results.classList.add('show');
   searchTimer = setTimeout(async () => {
     const data = await fetchSearch(val);
-    if (data.matched === 0) {
-      results.innerHTML = `<div class="empty">No entity found for <strong>${val}</strong>. Argus indexes entities (people, orgs, PACs, agencies) — topics like “civil war” are not entities here.</div>`;
+    // Guard: user may have kept typing; only render if the value is still the
+    // one this fetch was for.
+    if (q.value.trim() !== val) return;
+    const items = Array.isArray(data.results) ? data.results : [];
+    if (items.length === 0) {
+      results.innerHTML = renderEmptyState(val, data.error);
     } else {
-      results.innerHTML = data.results.map(r => `
+      results.innerHTML = items.map(r => `
         <div class="item" data-id="${r.id}">
           ${r.label}<span class="type">${r.type}</span>${r.surface_mode !== 'open' ? `<span class="mode">${r.surface_mode}</span>` : ''}
         </div>

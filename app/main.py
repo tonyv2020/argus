@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
@@ -34,6 +35,19 @@ app = FastAPI(
     title="Argus",
     description="Ontology navigator — every edge cited to a filing ID or article permalink.",
     version="0.1.0",
+)
+
+# CORS — /api/resolve + /api/resolve/batch + /api/search are consumed by
+# the-dailies (https://tonyvigna.com apex) and the SPA itself. Allow the
+# `*.tonyvigna.com` family; keep credentials off (Argus is public read-only).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://tonyvigna.com", "https://www.tonyvigna.com"],
+    allow_origin_regex=r"https://[a-zA-Z0-9-]+\.tonyvigna\.com",
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["content-type"],
+    allow_credentials=False,
+    max_age=3600,
 )
 
 
@@ -67,6 +81,78 @@ async def entity_deep_link(canonical_id: str) -> FileResponse:
     return FileResponse(str(index))
 
 
+async def _resolve_one(db: AsyncSession, tag: str) -> dict:
+    """Core /api/resolve logic — reused by GET and by the batch POST."""
+    from app.services.graph.base import normalize_name
+
+    norm = normalize_name(tag)
+    if not norm:
+        return {"resolved": False, "reason": "not an entity (topic/theme)"}
+
+    match = (
+        await db.execute(
+            select(CanonicalEntity)
+            .join(EntityAlias, EntityAlias.canonical_id == CanonicalEntity.id)
+            .where(EntityAlias.source_system == "hollywood.entity_tags")
+            .where(EntityAlias.surface_name_normalized == norm)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if match is None:
+        match = (
+            await db.execute(
+                select(CanonicalEntity)
+                .where(CanonicalEntity.canonical_name_normalized == norm)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if match is None:
+        match = (
+            await db.execute(
+                select(CanonicalEntity)
+                .join(EntityAlias, EntityAlias.canonical_id == CanonicalEntity.id)
+                .where(EntityAlias.surface_name_normalized == norm)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    if match is None:
+        return {"resolved": False, "reason": "not an entity (topic/theme)"}
+    label = _public_label(match)
+    if label is None:
+        return {"resolved": False, "reason": "not an entity (topic/theme)"}
+    return {
+        "resolved": True,
+        "id": match.id,
+        "type": match.type,
+        "label": label,
+        "surface_mode": match.surface_mode,
+        "path": f"/entity/{match.id}",
+    }
+
+
+@app.post("/api/resolve/batch")
+async def resolve_batch(payload: dict, db: AsyncSession = Depends(get_db)) -> dict:
+    """Batch tag resolution — one round-trip for the-dailies chit-strip rendering.
+
+    Body: `{"tags": ["tag_normalized_1", ...]}` (deduped by caller ideally).
+    Returns: `{"results": {"tag1": <resolve>, ...}}` with the same per-tag envelope
+    as `/api/resolve`.
+
+    Caps the batch at 500 tags to keep a single call bounded.
+    """
+    tags = payload.get("tags") or []
+    if not isinstance(tags, list):
+        raise HTTPException(status_code=422, detail="tags must be a list")
+    tags = [t for t in tags if isinstance(t, str) and t.strip()][:500]
+    out: dict[str, dict] = {}
+    for tag in tags:
+        if tag in out:
+            continue
+        out[tag] = await _resolve_one(db, tag)
+    return {"results": out}
+
+
 @app.get("/api/resolve")
 async def resolve(
     tag: str = Query(..., min_length=1, max_length=120),
@@ -87,66 +173,12 @@ async def resolve(
 
     Matching precedence (most specific first):
       1. EntityAlias.source_system='hollywood.entity_tags' with a matching
-         `surface_name_normalized`. This is the highest-fidelity path — the
-         tag came from the same source system.
-      2. CanonicalEntity.canonical_name_normalized exact match (case-insensitive).
+         `surface_name_normalized`. Highest fidelity — the tag came from the
+         same source system.
+      2. CanonicalEntity.canonical_name_normalized exact match.
       3. Any EntityAlias.surface_name_normalized exact match.
     """
-    from app.services.graph.base import normalize_name
-
-    norm = normalize_name(tag)
-    if not norm:
-        return {"resolved": False, "reason": "not an entity (topic/theme)"}
-
-    # 1. hollywood.entity_tags-sourced alias (highest fidelity for the caller).
-    holly = (
-        await db.execute(
-            select(CanonicalEntity)
-            .join(EntityAlias, EntityAlias.canonical_id == CanonicalEntity.id)
-            .where(EntityAlias.source_system == "hollywood.entity_tags")
-            .where(EntityAlias.surface_name_normalized == norm)
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-
-    # 2. exact canonical_name_normalized match.
-    match = holly
-    if match is None:
-        match = (
-            await db.execute(
-                select(CanonicalEntity)
-                .where(CanonicalEntity.canonical_name_normalized == norm)
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-
-    # 3. any surface_name_normalized match.
-    if match is None:
-        match = (
-            await db.execute(
-                select(CanonicalEntity)
-                .join(EntityAlias, EntityAlias.canonical_id == CanonicalEntity.id)
-                .where(EntityAlias.surface_name_normalized == norm)
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-
-    if match is None:
-        return {"resolved": False, "reason": "not an entity (topic/theme)"}
-
-    label = _public_label(match)
-    if label is None:
-        # Suppressed — respect scrutiny; never leak a real name.
-        return {"resolved": False, "reason": "not an entity (topic/theme)"}
-
-    return {
-        "resolved": True,
-        "id": match.id,
-        "type": match.type,
-        "label": label,
-        "surface_mode": match.surface_mode,
-        "path": f"/entity/{match.id}",
-    }
+    return await _resolve_one(db, tag)
 
 
 async def _entity_importance(db: AsyncSession, entity_id: str) -> int:
