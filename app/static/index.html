@@ -33,7 +33,31 @@
   li.edge { padding:.5rem 0; border-bottom:1px solid #22303c; font-size:.88rem; }
   li.edge .rel { color:var(--accent); font-weight:600; text-transform:uppercase; letter-spacing:.04em; font-size:.7rem; }
   li.edge .cite { display:block; font-size:.7rem; color:var(--muted); margin-top:.25rem; }
-  #cy { width:100%; height:100%; background:#0a0d13; }
+  #graph-wrap { position: relative; width: 100%; height: 100%; }
+  #cy { width: 100%; height: 100%; background: #0a0d13; }
+  #filters {
+    position: absolute; top: .75rem; right: .75rem; z-index: 10;
+    background: rgba(15, 20, 28, 0.94); border: 1px solid #22303c;
+    border-radius: 8px; padding: .55rem .7rem; font-size: .78rem;
+    max-width: 260px; max-height: calc(100% - 1.5rem); overflow: auto;
+    box-shadow: 0 6px 24px rgba(0,0,0,.5); backdrop-filter: blur(4px);
+  }
+  #filters h3 { margin: .3rem 0 .2rem; font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
+  #filters .row { display: flex; align-items: center; gap: .5rem; padding: .18rem 0; cursor: pointer; }
+  #filters .row input { margin: 0; }
+  #filters .row .label { flex: 1; }
+  #filters .row .count { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #filters .swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: .25rem; }
+  #filters .slider-wrap { padding: .35rem 0; }
+  #filters .slider-wrap label { color: var(--muted); font-size: .72rem; display: block; margin-bottom: .2rem; }
+  #filters input[type=range] { width: 100%; }
+  #filters .showing {
+    display: block; padding: .35rem .5rem; margin-top: .4rem;
+    border-top: 1px solid #22303c;
+    color: var(--fg); font-weight: 600; font-size: .72rem;
+    letter-spacing: .03em; text-transform: uppercase;
+  }
+  #filters .showing .num { color: var(--accent); }
   .empty { color:var(--muted); padding:2rem; text-align:center; }
   .not-found { padding:2rem 1rem; }
   .not-found h3 { margin: 0 0 .4rem; font-size:1rem; color:var(--fg); }
@@ -51,15 +75,47 @@
 </header>
 <main>
   <aside id="panel"><div class="empty">Loading…</div></aside>
-  <div id="cy"></div>
+  <div id="graph-wrap">
+    <div id="cy"></div>
+    <div id="filters"></div>
+  </div>
 </main>
 <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+<script src="https://unpkg.com/layout-base@2.0.1/layout-base.js"></script>
+<script src="https://unpkg.com/cose-base@2.2.0/cose-base.js"></script>
+<script src="https://unpkg.com/cytoscape-fcose@2.2.0/cytoscape-fcose.js"></script>
 <script>
+if (typeof cytoscapeFcose !== 'undefined') {
+  cytoscape.use(cytoscapeFcose);
+}
 // Default anchor for the profile page — GEO Group's canonical id (seeded in P0).
 const GEO_GROUP_ID = 'b393bc4c-bacc-4556-9589-b6446854608e';
 
+// Palettes.
+const NODE_TYPE_COLOR = {
+  organization: '#3a5b7f',
+  person: '#c084fc',
+  candidate: '#eab308',
+  pac: '#22c55e',
+  agency: '#ef4444',
+  event: '#f97316',
+  concept: '#0ea5e9',
+  place: '#14b8a6',
+  unknown: '#64748b',
+};
+
+// Current entity + last-fetched raw graph; the filter panel reruns render off these.
+let currentEntity = null;
+let currentGraph = { nodes: [], edges: [] };
+// Filter state persists across navigation so a user's chosen preferences stick.
+const filterState = {
+  relations: {},   // relation -> bool  (undefined = defaults to true)
+  nodeTypes: {},   // type -> bool
+  minWeight: 0,
+  topN: 200,
+};
+
 function idFromPath() {
-  // /entity/<id>  →  <id>; anything else → null (fall back to GEO_GROUP_ID).
   const m = window.location.pathname.match(/^\/entity\/([0-9a-f-]{36})/i);
   return m ? m[1] : null;
 }
@@ -75,18 +131,49 @@ async function fetchGraph(id, hops=1) {
   return r.json();
 }
 
-async function fetchSearch(q) {
-  // Never silent-blank — a failure here still returns a shape the caller can
-  // render an empty-state for. `matched:0` + `results:[]` is the neutral fallback.
+async function fetchSearch(qv) {
   try {
-    const r = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=20`);
-    if (!r.ok) return { q, matched: 0, results: [], error: `search failed (${r.status})` };
+    const r = await fetch(`/api/search?q=${encodeURIComponent(qv)}&limit=20`);
+    if (!r.ok) return { q: qv, matched: 0, results: [], error: `search failed (${r.status})` };
     const data = await r.json();
-    if (!data || !Array.isArray(data.results)) return { q, matched: 0, results: [] };
+    if (!data || !Array.isArray(data.results)) return { q: qv, matched: 0, results: [] };
     return data;
   } catch (err) {
-    return { q, matched: 0, results: [], error: err && err.message ? err.message : 'network error' };
+    return { q: qv, matched: 0, results: [], error: err && err.message ? err.message : 'network error' };
   }
+}
+
+function isRelationOn(rel) {
+  return filterState.relations[rel] !== false;
+}
+function isNodeTypeOn(t) {
+  return filterState.nodeTypes[t] !== false;
+}
+
+// Compute the filtered subset of the graph for display.
+function computeFilteredGraph(graph) {
+  const totalEdges = graph.edges.length;
+  const totalNodes = graph.nodes.length;
+  // Apply relation-type filter.
+  let edges = graph.edges.filter(e => isRelationOn(e.data.label));
+  // Apply min-weight cutoff.
+  edges = edges.filter(e => (Number(e.data.weight) || 0) >= filterState.minWeight);
+  // Apply top-N by weight.
+  edges.sort((a, b) => (Number(b.data.weight) || 0) - (Number(a.data.weight) || 0));
+  edges = edges.slice(0, filterState.topN);
+  // Nodes that survive: the anchor + any endpoint of a kept edge, ANDed with the node-type toggle.
+  const anchor = currentEntity ? currentEntity.id : null;
+  const keepIds = new Set(anchor ? [anchor] : []);
+  for (const e of edges) {
+    keepIds.add(e.data.source);
+    keepIds.add(e.data.target);
+  }
+  let nodes = graph.nodes.filter(n => keepIds.has(n.data.id));
+  nodes = nodes.filter(n => n.data.id === anchor || isNodeTypeOn(n.data.type));
+  // Drop edges whose endpoints got filtered out by the node-type toggle.
+  const nodeSet = new Set(nodes.map(n => n.data.id));
+  edges = edges.filter(e => nodeSet.has(e.data.source) && nodeSet.has(e.data.target));
+  return { nodes, edges, totalNodes, totalEdges };
 }
 
 function renderPanel(entity, graph) {
@@ -122,30 +209,129 @@ function renderNotFound(q) {
     </div>
   `;
   document.getElementById('cy').innerHTML = '';
+  document.getElementById('filters').innerHTML = '';
+}
+
+// Filter panel — relation + node-type toggles with counts, min-weight slider, top-N cap, "showing X of Y".
+function renderFilterPanel(graph, filtered) {
+  const relCounts = {};
+  for (const e of graph.edges) relCounts[e.data.label] = (relCounts[e.data.label] || 0) + 1;
+  const typeCounts = {};
+  for (const n of graph.nodes) typeCounts[n.data.type] = (typeCounts[n.data.type] || 0) + 1;
+  const relRows = Object.entries(relCounts).sort((a, b) => b[1] - a[1]).map(([r, c]) => `
+    <label class="row">
+      <input type="checkbox" data-rel="${r}" ${isRelationOn(r) ? 'checked' : ''}>
+      <span class="label">${r.replace(/_/g, ' ')}</span>
+      <span class="count">${c}</span>
+    </label>`).join('');
+  const typeRows = Object.entries(typeCounts).sort((a, b) => b[1] - a[1]).map(([t, c]) => `
+    <label class="row">
+      <input type="checkbox" data-type="${t}" ${isNodeTypeOn(t) ? 'checked' : ''}>
+      <span class="swatch" style="background:${NODE_TYPE_COLOR[t] || NODE_TYPE_COLOR.unknown}"></span>
+      <span class="label">${t}</span>
+      <span class="count">${c}</span>
+    </label>`).join('');
+  document.getElementById('filters').innerHTML = `
+    <h3>Relation types</h3>
+    ${relRows || '<div style="color:var(--muted);font-size:.72rem;">no edges</div>'}
+    <h3>Node types</h3>
+    ${typeRows || '<div style="color:var(--muted);font-size:.72rem;">no nodes</div>'}
+    <div class="slider-wrap">
+      <label>min edge weight: <span class="showing"><span class="num" id="w-cur">${filterState.minWeight}</span></span></label>
+      <input type="range" id="min-w" min="0" max="20" step="1" value="${filterState.minWeight}">
+      <label>top-N edges by weight: <span class="showing"><span class="num" id="n-cur">${filterState.topN}</span></span></label>
+      <input type="range" id="top-n" min="10" max="500" step="10" value="${filterState.topN}">
+    </div>
+    <div class="showing">
+      showing <span class="num">${filtered.edges.length}</span> of <span class="num">${filtered.totalEdges}</span> edges ·
+      <span class="num">${filtered.nodes.length}</span> of <span class="num">${filtered.totalNodes}</span> nodes
+    </div>
+  `;
+  document.getElementById('filters').querySelectorAll('input[type=checkbox][data-rel]').forEach(el => {
+    el.addEventListener('change', () => { filterState.relations[el.dataset.rel] = el.checked; renderGraph(currentEntity, currentGraph); });
+  });
+  document.getElementById('filters').querySelectorAll('input[type=checkbox][data-type]').forEach(el => {
+    el.addEventListener('change', () => { filterState.nodeTypes[el.dataset.type] = el.checked; renderGraph(currentEntity, currentGraph); });
+  });
+  document.getElementById('min-w').addEventListener('input', (ev) => {
+    filterState.minWeight = Number(ev.target.value);
+    document.getElementById('w-cur').textContent = filterState.minWeight;
+    renderGraph(currentEntity, currentGraph);
+  });
+  document.getElementById('top-n').addEventListener('input', (ev) => {
+    filterState.topN = Number(ev.target.value);
+    document.getElementById('n-cur').textContent = filterState.topN;
+    renderGraph(currentEntity, currentGraph);
+  });
 }
 
 function renderGraph(entity, graph) {
+  currentEntity = entity;
+  currentGraph = graph;
+  const filtered = computeFilteredGraph(graph);
+  renderFilterPanel(graph, filtered);
+  // Degree count from the FILTERED edges (used for node sizing so nodes shrink with filters).
+  const degree = {};
+  for (const e of filtered.edges) {
+    degree[e.data.source] = (degree[e.data.source] || 0) + 1;
+    degree[e.data.target] = (degree[e.data.target] || 0) + 1;
+  }
+  // fcose falls back to cose-bilkent-ish behaviour when the extension isn't loaded.
+  const layoutName = (typeof cytoscapeFcose !== 'undefined') ? 'fcose' : 'cose';
   const cy = cytoscape({
     container: document.getElementById('cy'),
     elements: [
-      ...graph.nodes.map(n => ({ data: { id: n.data.id, label: n.data.label, type: n.data.type } })),
-      ...graph.edges.map(e => ({ data: { id: e.data.id, source: e.data.source, target: e.data.target, label: e.data.label.replace(/_/g,' ') } }))
+      ...filtered.nodes.map(n => ({
+        data: {
+          id: n.data.id,
+          label: n.data.label,
+          type: n.data.type,
+          degree: degree[n.data.id] || 0,
+        },
+      })),
+      ...filtered.edges.map(e => ({
+        data: {
+          id: e.data.id,
+          source: e.data.source,
+          target: e.data.target,
+          label: e.data.label.replace(/_/g, ' '),
+          weight: Number(e.data.weight) || 1,
+        },
+      })),
     ],
     style: [
-      { selector: 'node', style: { 'background-color':'#3a5b7f', 'label':'data(label)', 'color':'#e6edf3', 'font-size':10, 'text-valign':'center', 'text-halign':'center', 'width':30, 'height':30 } },
-      { selector: `node[id = "${entity.id}"]`, style: { 'background-color':'#7ab8ff', 'width':60, 'height':60, 'font-weight':'bold' } },
-      { selector: 'node[type = "person"]', style: { 'background-color':'#c084fc' } },
-      { selector: 'node[type = "candidate"]', style: { 'background-color':'#eab308' } },
-      { selector: 'node[type = "pac"]', style: { 'background-color':'#22c55e' } },
-      { selector: 'node[type = "agency"]', style: { 'background-color':'#ef4444' } },
-      { selector: 'edge', style: { 'width':1.5, 'line-color':'#3a5b7f', 'target-arrow-color':'#3a5b7f', 'target-arrow-shape':'triangle', 'curve-style':'bezier', 'label':'data(label)', 'font-size':7, 'color':'#8b9fb5', 'text-rotation':'autorotate' } },
+      { selector: 'node', style: {
+          'background-color': (n) => NODE_TYPE_COLOR[n.data('type')] || NODE_TYPE_COLOR.unknown,
+          'label': 'data(label)',
+          'color': '#e6edf3',
+          'font-size': 10,
+          'text-valign': 'center',
+          'text-halign': 'center',
+          'width': (n) => Math.max(18, 22 + Math.sqrt(n.data('degree')) * 8),
+          'height': (n) => Math.max(18, 22 + Math.sqrt(n.data('degree')) * 8),
+      }},
+      { selector: `node[id = "${entity.id}"]`, style: { 'background-color': '#7ab8ff', 'width': 64, 'height': 64, 'font-weight': 'bold' } },
+      { selector: 'edge', style: {
+          'width': (e) => Math.max(1, Math.min(10, 1 + Math.log(1 + e.data('weight')) * 1.6)),
+          'line-color': '#3a5b7f',
+          'target-arrow-color': '#3a5b7f',
+          'target-arrow-shape': 'triangle',
+          'curve-style': 'bezier',
+          'label': 'data(label)',
+          'font-size': 7,
+          'color': '#8b9fb5',
+          'text-rotation': 'autorotate',
+          'opacity': 0.85,
+      }},
     ],
-    layout: { name: 'cose', animate: false, nodeRepulsion: 8000, idealEdgeLength: 100 }
+    layout: layoutName === 'fcose'
+      ? { name: 'fcose', animate: false, quality: 'default', randomize: true, nodeSeparation: 100, idealEdgeLength: 120, nodeRepulsion: 8000, gravity: 0.3, gravityRange: 3.8, packComponents: true }
+      : { name: 'cose', animate: false, nodeRepulsion: 8000, idealEdgeLength: 120 },
   });
   cy.on('tap', 'node', (evt) => navigate(evt.target.id()));
 }
 
-async function navigate(id, push=true) {
+async function navigate(id, push = true) {
   const [e, g] = await Promise.all([fetchEntity(id), fetchGraph(id, 1)]);
   if (e) {
     if (push && window.location.pathname !== `/entity/${id}`) {
@@ -174,7 +360,6 @@ function renderEmptyState(val, extra) {
     </div>
   `;
 }
-
 function renderSearchLoading(val) {
   return `<div class="empty">Searching for <strong>${val}</strong>…</div>`;
 }
@@ -183,14 +368,10 @@ q.addEventListener('input', () => {
   clearTimeout(searchTimer);
   const val = q.value.trim();
   if (!val) { results.classList.remove('show'); results.innerHTML=''; return; }
-  // Show the panel immediately with a loading state — never leave the box
-  // silently blank between keystroke and network round-trip (helen 2026-07-17).
   results.innerHTML = renderSearchLoading(val);
   results.classList.add('show');
   searchTimer = setTimeout(async () => {
     const data = await fetchSearch(val);
-    // Guard: user may have kept typing; only render if the value is still the
-    // one this fetch was for.
     if (q.value.trim() !== val) return;
     const items = Array.isArray(data.results) ? data.results : [];
     if (items.length === 0) {
@@ -216,7 +397,6 @@ results.addEventListener('click', async (ev) => {
 q.addEventListener('keydown', async (ev) => {
   if (ev.key === 'Escape') { results.classList.remove('show'); }
   if (ev.key === 'Enter') {
-    // If exactly one result, navigate. Otherwise trigger no-entity treatment.
     const items = results.querySelectorAll('.item');
     if (items.length === 1) {
       results.classList.remove('show');
