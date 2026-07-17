@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argus-tunnel
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus-tunnel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: argus-tunnel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus-tunnel
+    spec:
+      containers:
+        - name: tunnel
+          image: registry.lan/sso/tunnel:local
+          imagePullPolicy: Always
+          env:
+            - name: SSH_HOST
+              value: tunnel@tonyvigna.com
+            - name: BIND_ADDR
+              value: 127.0.0.1
+            - name: REMOTE_PORT
+              value: "9989"
+            - name: TUNNEL_TARGET
+              value: api.argus.svc.cluster.local:80
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: sshkey
+              mountPath: /secret
+              readOnly: true
+      volumes:
+        - name: sshkey
+          secret:
+            secretName: argus-tunnel
+            defaultMode: 384

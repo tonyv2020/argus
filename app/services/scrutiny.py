@@ -236,12 +236,50 @@ async def scrutinize_person(session: AsyncSession, canonical_id: str) -> Scrutin
     return _classify_from_llm(ent.canonical_name, aliases)
 
 
+async def _person_has_cited_edges(session: AsyncSession, canonical_id: str) -> bool:
+    """True iff the canonical has at least one edge with a SourceCitation.
+
+    Used by the ALIAS-preservation rule (helen 2026-07-17): a private person
+    with real cited edges must NOT be suppressed — surface as an alias so the
+    graph structure is preserved without leaking the real name.
+    """
+    from app.models import CanonicalEdge, SourceCitation
+
+    edges = (
+        (
+            await session.execute(
+                select(CanonicalEdge).where(
+                    (CanonicalEdge.source_id == canonical_id)
+                    | (CanonicalEdge.target_id == canonical_id)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for e in edges:
+        cite = (
+            (await session.execute(select(SourceCitation).where(SourceCitation.edge_id == e.id)))
+            .scalars()
+            .first()
+        )
+        if cite:
+            return True
+    return False
+
+
 async def scrutinize_and_log(session: AsyncSession, canonical_id: str) -> ScrutinyVerdict:
     """Run the scrutiny verdict + persist an audit row + update the canonical's surface fields.
 
     Tony 2026-07-17: private people keep their unique canonical (real edges); we
     ONLY toggle `surface_mode` + set a stable `public_alias`. The graph stays
     correct; the public API renders the alias in place of the real name.
+
+    Helen 2026-07-17: `private + has-edge → ALIAS` (not SUPPRESS). If a private
+    person is nonetheless connected via a cited edge (news co-occurrence, FEC
+    small-donor listing, etc.), that connection is valuable graph structure and
+    is preserved with the alias label — the real name never surfaces, but the
+    edge does.
     """
     verdict = await scrutinize_person(session, canonical_id)
     session.add(
@@ -264,13 +302,27 @@ async def scrutinize_and_log(session: AsyncSession, canonical_id: str) -> Scruti
         #   public + surface  → OPEN (real name shown)  = public_named
         #   private + surface → ALIAS (public_alias)    = private_anonymized+alias
         #   private + aggregate → ALIAS                 = private_anonymized+alias
-        #   any + suppress    → SUPPRESS                = elided
-        if verdict.decision == ScrutinyDecision.SUPPRESS:
-            ent.surface_mode = SurfaceMode.SUPPRESS.value
-            ent.public_alias = None
-        elif verdict.classification == ScrutinyClass.PUBLIC:
+        #   private + suppress + has_cited_edge → ALIAS = private_anonymized+alias
+        #     (edge preserved, alias shown; the real name never surfaces
+        #     but the connection stays in the graph — helen 2026-07-17)
+        #   any + suppress + no cited edges → SUPPRESS  = elided
+        if verdict.classification == ScrutinyClass.PUBLIC:
             ent.surface_mode = SurfaceMode.OPEN.value
             ent.public_alias = None
+        elif verdict.decision == ScrutinyDecision.SUPPRESS:
+            # Private + would-suppress: preserve as ALIAS if the canonical
+            # already carries at least one cited edge (else true SUPPRESS).
+            if await _person_has_cited_edges(session, canonical_id):
+                ent.surface_mode = SurfaceMode.ALIAS.value
+                ent.public_alias = compute_public_alias(canonical_id)
+                # Amend the reason so the audit row shows the promotion.
+                verdict.reason = (
+                    f"{verdict.reason} — auto-promoted SUPPRESS→ALIAS: "
+                    "canonical has ≥1 cited edge (helen 2026-07-17)"
+                )
+            else:
+                ent.surface_mode = SurfaceMode.SUPPRESS.value
+                ent.public_alias = None
         else:
             ent.surface_mode = SurfaceMode.ALIAS.value
             ent.public_alias = compute_public_alias(canonical_id)
