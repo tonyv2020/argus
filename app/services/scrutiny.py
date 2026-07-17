@@ -168,7 +168,17 @@ def _classify_from_llm(canonical_name: str, aliases: list[EntityAlias]) -> Scrut
             messages=[{"role": "user", "content": prompt}],
         )
         raw = msg.content[0].text if msg.content else ""
-        data = json.loads(raw.strip())
+        # Sonnet sometimes wraps JSON in ```json ... ``` fences; strip them.
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            # Drop first + last fence lines
+            lines = stripped.splitlines()
+            if len(lines) >= 2:
+                stripped = "\n".join(lines[1:-1]).strip()
+        # Also handle "prefix text\n{json}" — take from first "{" to last "}".
+        if "{" in stripped and "}" in stripped:
+            stripped = stripped[stripped.index("{") : stripped.rindex("}") + 1]
+        data = json.loads(stripped)
         classification = ScrutinyClass(data["class"])
         decision = ScrutinyDecision(data["decision"])
         return ScrutinyVerdict(
@@ -250,14 +260,16 @@ async def scrutinize_and_log(session: AsyncSession, canonical_id: str) -> Scruti
         await session.execute(select(CanonicalEntity).where(CanonicalEntity.id == canonical_id))
     ).scalar_one_or_none()
     if ent is not None and ent.type == EntityType.PERSON.value:
-        if (
-            verdict.decision == ScrutinyDecision.SURFACE
-            and verdict.classification == ScrutinyClass.PUBLIC
-        ):
-            ent.surface_mode = SurfaceMode.OPEN.value
-            ent.public_alias = None
-        elif verdict.decision == ScrutinyDecision.SUPPRESS:
+        # Helen 2026-07-17 canonical mapping:
+        #   public + surface  → OPEN (real name shown)  = public_named
+        #   private + surface → ALIAS (public_alias)    = private_anonymized+alias
+        #   private + aggregate → ALIAS                 = private_anonymized+alias
+        #   any + suppress    → SUPPRESS                = elided
+        if verdict.decision == ScrutinyDecision.SUPPRESS:
             ent.surface_mode = SurfaceMode.SUPPRESS.value
+            ent.public_alias = None
+        elif verdict.classification == ScrutinyClass.PUBLIC:
+            ent.surface_mode = SurfaceMode.OPEN.value
             ent.public_alias = None
         else:
             ent.surface_mode = SurfaceMode.ALIAS.value
