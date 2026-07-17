@@ -1,0 +1,77 @@
+[project]
+name = "argus"
+version = "0.1.0"
+description = "Argus — decoupled ontology/relationship graph over Tony Times + public accountability data (FEC/USAspending/LDA). All-seeing, neutral, every edge cited."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "sqlalchemy[asyncio]>=2.0",
+  "psycopg[binary,pool]>=3.1",
+  "pgvector>=0.3",
+  "alembic>=1.13",
+  "neo4j>=5",
+  "httpx>=0.27",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.4",
+  "anthropic>=0.34",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "httpx>=0.27",
+  "ruff>=0.5",
+  "mypy>=1.11",
+  "interrogate>=1.7",
+  "aiosqlite>=0.20",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+extend-safe-fixes = ["UP"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Header", "fastapi.Body"]
+
+[tool.ruff.lint.per-file-ignores]
+"alembic/versions/*.py" = ["E501"]
+
+[tool.mypy]
+packages = ["app"]
+python_version = "3.11"
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+
+[tool.interrogate]
+ignore-init-method = true
+ignore-init-module = true
+ignore-magic = true
+ignore-semiprivate = true
+ignore-private = true
+ignore-nested-functions = true
+ignore-property-decorators = true
+# Ratchet plan (helen 2026-07-16):
+#   phase 1: fail-under = 60
+#   phase 2: 70; phase 3: 80; phase 4: 90
+fail-under = 60
+exclude = ["tests", "alembic/versions", "scripts"]
+verbose = 1
