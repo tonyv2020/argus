@@ -149,93 +149,173 @@ async def resolve(
     }
 
 
+async def _entity_importance(db: AsyncSession, entity_id: str) -> int:
+    """Importance ~= edge count + citation count summed. Cheap proxy for node significance."""
+    from sqlalchemy import func
+
+    from app.models import CanonicalEdge, SourceCitation
+
+    edge_count = (
+        await db.execute(
+            select(func.count(CanonicalEdge.id)).where(
+                (CanonicalEdge.source_id == entity_id) | (CanonicalEdge.target_id == entity_id)
+            )
+        )
+    ).scalar_one() or 0
+    citation_count = (
+        await db.execute(
+            select(func.count(SourceCitation.id))
+            .join(CanonicalEdge, CanonicalEdge.id == SourceCitation.edge_id)
+            .where((CanonicalEdge.source_id == entity_id) | (CanonicalEdge.target_id == entity_id))
+        )
+    ).scalar_one() or 0
+    return int(edge_count) + int(citation_count)
+
+
 @app.get("/api/search")
 async def search(
     q: str = Query(..., min_length=1, max_length=120),
     limit: int = Query(20, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Search canonical entities by name / alias — scrutiny-respecting.
+    """Search canonical entities by name / alias — scrutiny-respecting + ranked.
 
-    Rules (helen 2026-07-17):
-      * suppressed entities are never returned.
-      * alias-mode entities match on `public_alias` ONLY (never on `canonical_name`
-        or on any of their EntityAlias.surface_name rows — those are the real
-        name(s) of a real private person).
-      * open entities match on canonical_name + EntityAlias.surface_name (real
-        name is the label already, so aliasing on real-name is a fair search).
-      * Returns `{results: [{id, label, type, surface_mode}], q, matched: N}`
-        so the SPA can render "no entity found for X" gracefully.
+    Ranking (helen 2026-07-17 fix — entity-name hits must beat mid-word substrings):
+      Tier 5  exact canonical_name_normalized match.
+      Tier 4  canonical_name_normalized starts with q.
+      Tier 3  canonical_name_normalized substring (mid-word).
+      Tier 2  EntityAlias.surface_name_normalized starts with q (open only).
+      Tier 1  EntityAlias.surface_name_normalized substring (open only).
+      Tier 1  public_alias contains q (alias-mode only).
+
+    Within a tier: rank by node importance (edge_count + citation_count) desc,
+    then alphabetical by label for a stable ordering.
+
+    Scrutiny (unchanged):
+      * SUPPRESS entities are never returned.
+      * ALIAS entities match on `public_alias` ONLY (never on real name/aliases).
+      * OPEN entities may match on canonical_name + EntityAlias.surface_name.
     """
-    q_norm = q.strip()
+    q_norm = q.strip().lower()
     if not q_norm:
         return {"q": q, "results": [], "matched": 0}
-    like = f"%{q_norm.lower()}%"
+    like_any = f"%{q_norm}%"
+    like_prefix = f"{q_norm}%"
 
-    # 1. open entities by canonical_name (case-insensitive).
-    open_by_name = (
+    # Pull an over-sized candidate set so we can rank + trim. Cap each source
+    # query so a hot-word query (matches thousands) doesn't scan the world.
+    fetch_cap = min(limit * 6, 200)
+
+    open_name_hits = (
         (
             await db.execute(
                 select(CanonicalEntity)
                 .where(CanonicalEntity.surface_mode == SurfaceMode.OPEN.value)
-                .where(CanonicalEntity.canonical_name_normalized.ilike(like))
-                .limit(limit)
+                .where(CanonicalEntity.canonical_name_normalized.ilike(like_any))
+                .limit(fetch_cap)
             )
         )
         .scalars()
         .all()
     )
 
-    # 2. open entities via an alias's surface_name (real name; safe to expose).
-    open_by_alias = (
+    open_alias_hits = (
         (
             await db.execute(
                 select(CanonicalEntity)
                 .join(EntityAlias, EntityAlias.canonical_id == CanonicalEntity.id)
                 .where(CanonicalEntity.surface_mode == SurfaceMode.OPEN.value)
-                .where(EntityAlias.surface_name_normalized.ilike(like))
-                .limit(limit)
+                .where(EntityAlias.surface_name_normalized.ilike(like_any))
+                .limit(fetch_cap)
             )
         )
         .scalars()
         .all()
     )
 
-    # 3. alias-mode entities matching on `public_alias` ONLY. Real-name aliases
-    #    are NEVER matched — that would leak the identity via a hit.
-    aliased = (
+    aliased_hits = (
         (
             await db.execute(
                 select(CanonicalEntity)
                 .where(CanonicalEntity.surface_mode == SurfaceMode.ALIAS.value)
-                .where(CanonicalEntity.public_alias.ilike(like))
-                .limit(limit)
+                .where(CanonicalEntity.public_alias.ilike(like_any))
+                .limit(fetch_cap)
             )
         )
         .scalars()
         .all()
     )
 
-    # Dedup, cap, and render with public labels only.
-    seen: set[str] = set()
+    def _tier_for(e: CanonicalEntity) -> int:
+        """Compute the rank tier for an entity given the query."""
+        if e.surface_mode == SurfaceMode.OPEN.value:
+            name_norm = (e.canonical_name_normalized or "").lower()
+            if name_norm == q_norm:
+                return 5
+            if name_norm.startswith(q_norm):
+                return 4
+            if q_norm in name_norm:
+                return 3
+            return 1  # not a canonical hit → must be an alias hit
+        if e.surface_mode == SurfaceMode.ALIAS.value:
+            return 1
+        return 0
+
+    # Fetch the alias-hit prefix/substring split cheaply (only for entities in
+    # the open_alias_hits set — tier 2 vs tier 1). We only need per-entity a
+    # boolean "any alias starts with q?".
+    alias_hit_prefix: dict[str, bool] = {}
+    if open_alias_hits:
+        alias_ids = [e.id for e in open_alias_hits]
+        prefix_matches = (
+            (
+                await db.execute(
+                    select(EntityAlias.canonical_id)
+                    .where(EntityAlias.canonical_id.in_(alias_ids))
+                    .where(EntityAlias.surface_name_normalized.ilike(like_prefix))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        alias_hit_prefix = {cid: True for cid in prefix_matches}
+
+    def _final_tier(e: CanonicalEntity) -> int:
+        """Combine canonical-name tier + alias-hit-tier (max wins)."""
+        t = _tier_for(e)
+        if e.id in {x.id for x in open_alias_hits}:
+            alias_tier = 2 if alias_hit_prefix.get(e.id) else 1
+            t = max(t, alias_tier)
+        return t
+
+    # Dedup by id.
+    dedup: dict[str, CanonicalEntity] = {}
+    for e in list(open_name_hits) + list(open_alias_hits) + list(aliased_hits):
+        if _public_label(e) is None:
+            continue
+        dedup.setdefault(e.id, e)
+
+    # Rank tier desc, then importance desc, then label asc.
+    ranked: list[tuple[int, int, str, CanonicalEntity]] = []
+    for e in dedup.values():
+        tier = _final_tier(e)
+        importance = await _entity_importance(db, e.id)
+        label = _public_label(e) or ""
+        ranked.append((tier, importance, label.lower(), e))
+    ranked.sort(key=lambda t: (-t[0], -t[1], t[2]))
+
     out: list[dict] = []
-    for e in list(open_by_name) + list(open_by_alias) + list(aliased):
-        if e.id in seen:
-            continue
-        seen.add(e.id)
-        label = _public_label(e)
-        if label is None:
-            continue
+    for tier, importance, _label, e in ranked[:limit]:
         out.append(
             {
                 "id": e.id,
-                "label": label,
+                "label": _public_label(e),
                 "type": e.type,
                 "surface_mode": e.surface_mode,
+                "rank_tier": tier,
+                "importance": importance,
             }
         )
-        if len(out) >= limit:
-            break
     return {"q": q, "matched": len(out), "results": out}
 
 
