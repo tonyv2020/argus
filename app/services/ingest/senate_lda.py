@@ -338,10 +338,68 @@ async def ingest_client_filings(
     return stats
 
 
+DETENTION_INDUSTRY_LDA_CLIENTS: tuple[str, ...] = (
+    # P3c broadening pass (helen 2026-07-18) — detention-industry primes
+    # beyond the GEO Group anchor. Each name is an LDA `client_name`
+    # substring match; ``_client_name_matches`` filters LDA's fuzzy-match
+    # false positives at ingest time.
+    #
+    # Included (verified against LDA on 2026-07-18):
+    #   * The GEO Group (450 filings)
+    #   * CoreCivic (452 filings)
+    #   * Corrections Corporation of America (103 filings) — CoreCivic's
+    #     pre-2016-rename name; the same underlying canonical when the SEC
+    #     ingester's former-name aliasing catches it.
+    #   * Management and Training Corporation (64 filings) — MTC, the
+    #     third-largest private detention operator.
+    #
+    # Excluded from this pass (probed 0 filings under the obvious name variants;
+    # revisit with the LDA registrant-search endpoint if we want lobbyists FOR
+    # them rather than filings BY them):
+    #   * LaSalle Corrections
+    "The GEO Group",
+    "CoreCivic",
+    "Corrections Corporation of America",
+    "Management and Training Corporation",
+)
+
+
+async def ingest_detention_industry(
+    max_filings_per_client: int = 200, page_size: int = 25
+) -> SenateLdaStats:
+    """P3c — sweep every anchor in :data:`DETENTION_INDUSTRY_LDA_CLIENTS`.
+
+    Runs :func:`ingest_client_filings` per anchor and folds the counters
+    into a single :class:`SenateLdaStats`. Idempotent: reruns cite new
+    filings only + never double-count.
+    """
+    agg = SenateLdaStats()
+    for name in DETENTION_INDUSTRY_LDA_CLIENTS:
+        logger.info("senate_lda ingest anchor client_name=%s", name)
+        stats = await ingest_client_filings(
+            client_name=name,
+            max_filings=max_filings_per_client,
+            page_size=page_size,
+        )
+        agg.filings_fetched += stats.filings_fetched
+        agg.filings_skipped_off_anchor += stats.filings_skipped_off_anchor
+        agg.clients_upserted += stats.clients_upserted
+        agg.registrants_upserted += stats.registrants_upserted
+        agg.edges_created += stats.edges_created
+        agg.edges_reused += stats.edges_reused
+        agg.citations_created += stats.citations_created
+        agg.errors += stats.errors
+    return agg
+
+
 def main() -> None:
-    """CLI entrypoint — ``python -m app.services.ingest.senate_lda``."""
+    """CLI entrypoint — ``python -m app.services.ingest.senate_lda``.
+
+    Sweeps every client in :data:`DETENTION_INDUSTRY_LDA_CLIENTS`. Use
+    :func:`ingest_client_filings` directly for a single-anchor call.
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    stats = asyncio.run(ingest_client_filings())
+    stats = asyncio.run(ingest_detention_industry())
     logger.info("senate_lda ingest done: %s", stats)
 
 

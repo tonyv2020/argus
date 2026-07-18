@@ -71,3 +71,30 @@ def test_stats_starts_at_all_zero_counters() -> None:
     assert stats.edges_reused == 0
     assert stats.citations_created == 0
     assert stats.errors == 0
+
+
+# ─── P3c broadening pass ──────────────────────────────────────────────
+
+
+def test_detention_industry_lda_clients_covers_the_three_public_primes() -> None:
+    """The P3c anchor list must cover the two publicly-traded detention primes
+    (GEO Group + CoreCivic — under BOTH its current and pre-2016 legal names)
+    plus MTC as the largest privately-held operator with LDA filings."""
+    from app.services.ingest.senate_lda import DETENTION_INDUSTRY_LDA_CLIENTS
+
+    lower = {c.lower() for c in DETENTION_INDUSTRY_LDA_CLIENTS}
+    assert "the geo group" in lower
+    assert "corecivic" in lower
+    # CoreCivic renamed from Corrections Corporation of America in Oct 2016;
+    # the older name still shows up on filings pre-rename, so we sweep both.
+    assert "corrections corporation of america" in lower
+    # MTC — the third-largest private detention operator with LDA activity.
+    assert "management and training corporation" in lower
+
+
+def test_detention_industry_anchors_are_deduplicated_by_name() -> None:
+    """Anchor list must have unique entries — an accidental dup would double-run
+    the same LDA sweep and inflate `edges_reused` counters twice."""
+    from app.services.ingest.senate_lda import DETENTION_INDUSTRY_LDA_CLIENTS
+
+    assert len(set(DETENTION_INDUSTRY_LDA_CLIENTS)) == len(DETENTION_INDUSTRY_LDA_CLIENTS)
