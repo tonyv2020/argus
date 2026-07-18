@@ -11,10 +11,12 @@ from uuid import uuid4
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     func,
@@ -223,3 +225,36 @@ class SourceCitation(Base):
     edge: Mapped[CanonicalEdge] = relationship(back_populates="citations")
 
     __table_args__ = (Index("ix_citations_edge", "edge_id"),)
+
+
+class LlmUsage(Base):
+    """Per-call LLM usage log — one row per Anthropic call (Atlas spend Part 1b).
+
+    Written by every Anthropic caller in this app (scrutiny classifier +
+    any future LLM-driven ingestor). Atlas's MCP + dashboard reads this
+    table to compute per-app + per-feature spend, latency, and error rate.
+
+    Cost is NOT stored here — it's computed downstream in the Atlas adapter
+    against a per-model pricing config that lives on the Atlas side.
+    Cache-read + cache-write tokens live on their own columns since they
+    price at ~0.1x + ~1.25x the base input rate respectively (helen
+    2026-07-18 Part 1a refinement).
+
+    See migration 0003_llm_usage for the column shape + indexes.
+    """
+
+    __tablename__ = "llm_usage"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    app: Mapped[str] = mapped_column(String(64), nullable=False)
+    feature: Mapped[str] = mapped_column(String(128), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_write_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    call_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
