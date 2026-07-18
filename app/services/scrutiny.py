@@ -131,14 +131,20 @@ async def _hard_signals(session: AsyncSession, canonical_id: str) -> list[str]:
     return signals
 
 
-def _classify_from_llm(canonical_name: str, aliases: list[EntityAlias]) -> ScrutinyVerdict:
+async def _classify_from_llm(canonical_name: str, aliases: list[EntityAlias]) -> ScrutinyVerdict:
     """Call Anthropic Sonnet to classify a borderline case; fail-closed to PRIVATE + SUPPRESS.
 
     Only invoked when hard signals are absent. The LLM output MUST be a strict
     JSON object; any parse failure or network error falls back to the safe
     default (PRIVATE / SUPPRESS) — matches the design's "strong protection when
     uncertain" line.
+
+    Atlas spend Part 1b (helen 2026-07-18): each Anthropic call logs one row
+    to ``llm_usage`` (success or failure) so the shared Atlas dashboard can
+    attribute argus's Anthropic spend to the ``scrutiny.classify`` feature.
     """
+    import time
+
     api_key = settings.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return ScrutinyVerdict(
@@ -148,71 +154,132 @@ def _classify_from_llm(canonical_name: str, aliases: list[EntityAlias]) -> Scrut
             "no Anthropic key configured; defaulting to strong protection",
             "scrutiny.fallback",
         )
-    try:
-        import anthropic
+    from app.services.llm_usage import (
+        current_feature,
+        feature_scope,
+        log_llm_usage_or_swallow,
+    )
 
-        client = anthropic.Anthropic(api_key=api_key)
-        prompt = (
-            "Classify this person as PUBLIC or PRIVATE for a cited-fact "
-            "accountability graph.\n\n"
-            "PUBLIC includes anyone in a notable public role — not just "
-            "politics. Non-exhaustive: elected officials, candidates, "
-            "registered lobbyists, corporate officers/execs, notable "
-            "founders, working journalists / opinion writers / columnists / "
-            "editors at major outlets, published authors, entertainers, "
-            "musicians, filmmakers, athletes, academics with a public "
-            "profile (published research or public-facing role), "
-            "activists/organisers with a media footprint, senior military "
-            "officers (flag/general), diplomats, judges. If the person is "
-            "identifiable via widely-available public reporting about their "
-            "public work, they are PUBLIC.\n\n"
-            "PRIVATE = private individuals with no notable public role. "
-            "Small political donors, private citizens named incidentally, "
-            "generic descriptors ('a South Korean fan', 'Reddit username'), "
-            "and cases where the name is too common to attribute confidently.\n\n"
-            "Err on the side of PUBLIC when there's a plausible public role "
-            "attached to the name; err on the side of PRIVATE when a name "
-            "could refer to many people with no obvious public identity.\n\n"
-            f"Name: {canonical_name}\n"
-            f"Aliases: {', '.join(a.surface_name for a in aliases[:8])}\n\n"
-            'Reply with STRICT JSON only: {"class": "public|private", '
-            '"decision": "surface|aggregate|suppress", "reason": "<one-line>"}.'
+    async def _log(
+        *,
+        model: str,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        cache_read_tokens: int | None,
+        cache_write_tokens: int | None,
+        call_ms: int,
+        ok: bool,
+    ) -> None:
+        db_url = getattr(settings, "database_url", None)
+        if not db_url:
+            return
+        await log_llm_usage_or_swallow(
+            database_url=db_url,
+            feature=current_feature(),
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            call_ms=call_ms,
+            ok=ok,
         )
-        msg = client.messages.create(
-            model=settings.anthropic_model,
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = msg.content[0].text if msg.content else ""
-        # Sonnet sometimes wraps JSON in ```json ... ``` fences; strip them.
-        stripped = raw.strip()
-        if stripped.startswith("```"):
-            # Drop first + last fence lines
-            lines = stripped.splitlines()
-            if len(lines) >= 2:
-                stripped = "\n".join(lines[1:-1]).strip()
-        # Also handle "prefix text\n{json}" — take from first "{" to last "}".
-        if "{" in stripped and "}" in stripped:
-            stripped = stripped[stripped.index("{") : stripped.rindex("}") + 1]
-        data = json.loads(stripped)
-        classification = ScrutinyClass(data["class"])
-        decision = ScrutinyDecision(data["decision"])
-        return ScrutinyVerdict(
-            classification,
-            decision,
-            ["llm_borderline"],
-            data.get("reason", ""),
-            f"scrutiny.llm.{settings.anthropic_model}",
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("scrutiny LLM call failed: %s", exc)
-        return ScrutinyVerdict(
-            ScrutinyClass.PRIVATE,
-            ScrutinyDecision.SUPPRESS,
-            ["no_hard_signals", "llm_failed"],
-            f"LLM classification failed ({type(exc).__name__}); defaulting to strong protection",
-            "scrutiny.fallback",
-        )
+
+    prompt = (
+        "Classify this person as PUBLIC or PRIVATE for a cited-fact "
+        "accountability graph.\n\n"
+        "PUBLIC includes anyone in a notable public role — not just "
+        "politics. Non-exhaustive: elected officials, candidates, "
+        "registered lobbyists, corporate officers/execs, notable "
+        "founders, working journalists / opinion writers / columnists / "
+        "editors at major outlets, published authors, entertainers, "
+        "musicians, filmmakers, athletes, academics with a public "
+        "profile (published research or public-facing role), "
+        "activists/organisers with a media footprint, senior military "
+        "officers (flag/general), diplomats, judges. If the person is "
+        "identifiable via widely-available public reporting about their "
+        "public work, they are PUBLIC.\n\n"
+        "PRIVATE = private individuals with no notable public role. "
+        "Small political donors, private citizens named incidentally, "
+        "generic descriptors ('a South Korean fan', 'Reddit username'), "
+        "and cases where the name is too common to attribute confidently.\n\n"
+        "Err on the side of PUBLIC when there's a plausible public role "
+        "attached to the name; err on the side of PRIVATE when a name "
+        "could refer to many people with no obvious public identity.\n\n"
+        f"Name: {canonical_name}\n"
+        f"Aliases: {', '.join(a.surface_name for a in aliases[:8])}\n\n"
+        'Reply with STRICT JSON only: {"class": "public|private", '
+        '"decision": "surface|aggregate|suppress", "reason": "<one-line>"}.'
+    )
+
+    # Attach the feature slug for the log row (default when caller hasn't
+    # set a more specific scope). Nested feature_scope from a future caller
+    # overrides this cleanly. Scope wraps BOTH the success and failure paths
+    # so the log row on error still attributes to the scrutiny classifier.
+    default_feature = current_feature() if current_feature() != "unknown" else "scrutiny.classify"
+    call_started_ms = int(time.monotonic() * 1000)
+    with feature_scope(default_feature):
+        try:
+            from anthropic import AsyncAnthropic
+
+            client = AsyncAnthropic(api_key=api_key)
+            msg = await client.messages.create(
+                model=settings.anthropic_model,
+                max_tokens=200,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = msg.content[0].text if msg.content else ""
+            # Sonnet sometimes wraps JSON in ```json ... ``` fences; strip them.
+            stripped = raw.strip()
+            if stripped.startswith("```"):
+                lines = stripped.splitlines()
+                if len(lines) >= 2:
+                    stripped = "\n".join(lines[1:-1]).strip()
+            # Also handle "prefix text\n{json}" — take from first "{" to last "}".
+            if "{" in stripped and "}" in stripped:
+                stripped = stripped[stripped.index("{") : stripped.rindex("}") + 1]
+            data = json.loads(stripped)
+            classification = ScrutinyClass(data["class"])
+            decision = ScrutinyDecision(data["decision"])
+            usage = getattr(msg, "usage", None)
+            await _log(
+                model=getattr(msg, "model", settings.anthropic_model),
+                prompt_tokens=getattr(usage, "input_tokens", None) if usage else None,
+                completion_tokens=getattr(usage, "output_tokens", None) if usage else None,
+                cache_read_tokens=(
+                    getattr(usage, "cache_read_input_tokens", None) if usage else None
+                ),
+                cache_write_tokens=(
+                    getattr(usage, "cache_creation_input_tokens", None) if usage else None
+                ),
+                call_ms=int(time.monotonic() * 1000) - call_started_ms,
+                ok=True,
+            )
+            return ScrutinyVerdict(
+                classification,
+                decision,
+                ["llm_borderline"],
+                data.get("reason", ""),
+                f"scrutiny.llm.{settings.anthropic_model}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("scrutiny LLM call failed: %s", exc)
+            await _log(
+                model=settings.anthropic_model,
+                prompt_tokens=None,
+                completion_tokens=None,
+                cache_read_tokens=None,
+                cache_write_tokens=None,
+                call_ms=int(time.monotonic() * 1000) - call_started_ms,
+                ok=False,
+            )
+            return ScrutinyVerdict(
+                ScrutinyClass.PRIVATE,
+                ScrutinyDecision.SUPPRESS,
+                ["no_hard_signals", "llm_failed"],
+                f"LLM classification failed ({type(exc).__name__}); defaulting to strong protection",
+                "scrutiny.fallback",
+            )
 
 
 async def scrutinize_person(session: AsyncSession, canonical_id: str) -> ScrutinyVerdict:
@@ -249,7 +316,7 @@ async def scrutinize_person(session: AsyncSession, canonical_id: str) -> Scrutin
         .scalars()
         .all()
     )
-    return _classify_from_llm(ent.canonical_name, aliases)
+    return await _classify_from_llm(ent.canonical_name, aliases)
 
 
 async def _person_has_cited_edges(session: AsyncSession, canonical_id: str) -> bool:
