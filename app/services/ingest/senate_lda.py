@@ -251,14 +251,27 @@ async def ingest_client_filings(
         page = 1
         remaining = max_filings
         while remaining > 0:
-            payload = await _lda_get(
-                client,
-                "/filings/",
-                client_name=client_name,
-                page=page,
-                page_size=min(page_size, remaining),
-                ordering="-dt_posted",
-            )
+            try:
+                payload = await _lda_get(
+                    client,
+                    "/filings/",
+                    client_name=client_name,
+                    page=page,
+                    page_size=min(page_size, remaining),
+                    ordering="-dt_posted",
+                )
+            except httpx.HTTPStatusError as exc:
+                # LDA's DRF-backed API returns 404 when paginating past the
+                # last available page (rather than an empty results array).
+                # Treat that as clean end-of-stream, not a real error.
+                if exc.response.status_code == 404:
+                    logger.info(
+                        "senate_lda: end-of-pages hit for client_name=%s at page=%d",
+                        client_name,
+                        page,
+                    )
+                    break
+                raise
             rows = payload.get("results", [])
             if not rows:
                 break
