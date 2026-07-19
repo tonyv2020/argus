@@ -31,9 +31,28 @@ class ProjectionStats:
     edges_failed: int = 0
 
 
+def _ensure_pg_id_index(projection: Neo4jProjection) -> None:
+    """Ensure `Canonical(pg_id)` is unique + indexed before the sweep.
+
+    Without this, every edge MERGE does a full label scan on both endpoints
+    (~56k Canonical nodes × 2 lookups per edge) — a full reproject took
+    hours pre-index instead of the minutes it should. The UNIQUE constraint
+    auto-provisions a range index. Idempotent (IF NOT EXISTS).
+    """
+    drv = projection.driver
+    if drv is None:
+        return
+    with drv.session() as s:
+        s.run(
+            "CREATE CONSTRAINT canonical_pg_id_unique IF NOT EXISTS "
+            "FOR (c:Canonical) REQUIRE c.pg_id IS UNIQUE"
+        )
+
+
 async def project_all(session: AsyncSession, projection: Neo4jProjection) -> ProjectionStats:
     """Sweep every entity + edge into Neo4j (idempotent MERGE by pg_id)."""
     stats = ProjectionStats()
+    _ensure_pg_id_index(projection)
 
     entities = (await session.execute(select(CanonicalEntity))).scalars().all()
     for e in entities:
