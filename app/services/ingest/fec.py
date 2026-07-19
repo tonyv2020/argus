@@ -552,5 +552,182 @@ def main() -> None:
         sys.exit(2)
 
 
+async def ingest_individual_contributor(
+    contributor_query: str,
+    display_label: str,
+    max_contributions: int = 200,
+    two_year_periods: tuple[int, ...] = (2024, 2022, 2020),
+) -> FecStats:
+    """P4 E — FEC Schedule A individual-contributor mode.
+
+    Captures a mega-donor's PERSONAL giving (Musk → America PAC $11.2M,
+    Thiel → any recipient, …) — a distinct flow from the PAC-disbursement
+    path (:func:`ingest_pac`). Emits one CONTRIBUTES_TO edge per unique
+    donor→committee pair, weight summed across contributions, one
+    citation per transaction.
+
+    ``contributor_query`` is the ``contributor_name`` string the FEC
+    fuzzy-searches on (e.g. ``"MUSK, ELON"`` / ``"THIEL, PETER"``).
+    Multiple ``two_year_periods`` are swept because Schedule A partitions
+    by cycle; typical use covers the most-recent + prior two cycles.
+    """
+    stats = FecStats()
+    sm = get_sessionmaker()
+
+    # Upsert the donor canonical up front. Individual contributor keyed on
+    # the raw query so re-runs converge (source_id = the fuzzy-search
+    # string; canonical fallback creates a PERSON row).
+    donor_canonical: str
+    async with sm() as session:
+        donor_canonical = await _upsert_entity(
+            session,
+            display_label,
+            EntityType.PERSON.value,
+            "fec.contributor",
+            contributor_query,
+            kind_hint="person",
+        )
+        await session.commit()
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for period in two_year_periods:
+            page = 1
+            remaining = max_contributions
+            while remaining > 0:
+                try:
+                    payload = await _fec_get(
+                        client,
+                        "/schedules/schedule_a/",
+                        contributor_name=contributor_query,
+                        two_year_transaction_period=period,
+                        per_page=min(100, remaining),
+                        page=page,
+                        sort="-contribution_receipt_date",
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] schedule_a fetch failed period=%d page=%d",
+                        display_label, period, page,
+                    )
+                    stats.errors += 1
+                    break
+
+                rows = payload.get("results", [])
+                if not rows:
+                    break
+
+                async with sm() as session:
+                    for row in rows:
+                        stats.disbursements_fetched += 1
+                        committee = row.get("committee") or {}
+                        recipient_name = committee.get("name") or ""
+                        committee_id = committee.get("committee_id") or ""
+                        sub_id = str(
+                            row.get("sub_id")
+                            or row.get("transaction_id")
+                            or ""
+                        )
+                        if not recipient_name or not committee_id:
+                            continue
+                        kind_upper = (
+                            committee.get("committee_type_full")
+                            or committee.get("committee_type")
+                            or ""
+                        ).upper()
+                        recipient_type = (
+                            EntityType.PAC.value
+                            if "PAC" in kind_upper or "SUPER" in kind_upper
+                            else EntityType.ORGANIZATION.value
+                        )
+                        dst_canonical = await _upsert_entity(
+                            session,
+                            recipient_name,
+                            recipient_type,
+                            "fec.disbursement.recipient",
+                            committee_id,
+                        )
+                        edge_id, reused = await _emit_contribution_edge(
+                            session,
+                            donor_canonical,
+                            dst_canonical,
+                            row.get("contribution_receipt_amount"),
+                            sub_id,
+                            committee_id,
+                        )
+                        if reused:
+                            stats.edges_reused += 1
+                        else:
+                            stats.edges_created += 1
+                        stats.citations_created += 1
+                    try:
+                        await session.commit()
+                    except Exception:
+                        await session.rollback()
+                        stats.errors += 1
+                        logger.exception(
+                            "[%s] schedule_a batch commit failed",
+                            display_label,
+                        )
+                remaining -= len(rows)
+                page += 1
+                if payload.get("pagination", {}).get("pages", 1) < page:
+                    break
+    if stats.disbursements_fetched:
+        stats.pacs_found = 1
+    return stats
+
+
+async def ingest_individual_contributors_from_registry(
+    priority_domains: tuple[str, ...] | None = None,
+    max_contributions: int = 200,
+) -> dict[str, FecStats]:
+    """P4 E — sweep every registered PERSON anchor via Schedule A.
+
+    Uses ``fec.contributor`` name-search — a canonical member's
+    ``label`` becomes the ``LAST, FIRST`` variant if it isn't already
+    that shape (news uses "Peter Thiel"; FEC uses "THIEL, PETER").
+    """
+    from app.db import get_sessionmaker as _sm
+    from app.services.anchor_registry import list_anchors
+
+    out: dict[str, FecStats] = {}
+    sm = _sm()
+    async with sm() as session:
+        anchors = await list_anchors(
+            session,
+            priority_domains=priority_domains,
+            entity_types=("person",),
+        )
+
+    for anchor in anchors:
+        # Prefer explicit LAST, FIRST from name_variants; else transform.
+        query_shape = next(
+            (v for v in anchor.name_variants if "," in v),
+            None,
+        )
+        if not query_shape:
+            parts = anchor.label.rsplit(" ", 1)
+            if len(parts) == 2:
+                query_shape = f"{parts[1]}, {parts[0]}".upper()
+            else:
+                query_shape = anchor.label.upper()
+
+        try:
+            out[anchor.label] = await ingest_individual_contributor(
+                contributor_query=query_shape,
+                display_label=anchor.label,
+                max_contributions=max_contributions,
+            )
+        except Exception:
+            logger.exception(
+                "individual contributor ingest failed for %s (query=%s)",
+                anchor.label, query_shape,
+            )
+            s = FecStats()
+            s.errors = 1
+            out[anchor.label] = s
+    return out
+
+
 if __name__ == "__main__":
     main()
