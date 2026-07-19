@@ -209,6 +209,25 @@ async def model1_flow(
         row.source_id: float(row.contrib_total or 0.0)
         for row in (await session.execute(contribs_stmt)).all()
     }
+
+    # P5.3 attribution — a company's contributions land through its PAC
+    # (a separate canonical), not the company directly. Look up every
+    # PAC → sponsoring-org affiliated_with edge (P3 output) and
+    # ATTRIBUTE the PAC's contribution total to the sponsor org too.
+    # "Contribution total" survives in both the PAC row + the sponsor
+    # row so downstream reports can slice either way.
+    pac_ids = list(contribs.keys())
+    if pac_ids:
+        pac_to_org = (
+            await session.execute(
+                select(CanonicalEdge.source_id, CanonicalEdge.target_id).where(
+                    CanonicalEdge.relation == EdgeRelation.AFFILIATED_WITH.value,
+                    CanonicalEdge.source_id.in_(pac_ids),
+                )
+            )
+        ).all()
+        for pac_id, org_id in pac_to_org:
+            contribs[org_id] = contribs.get(org_id, 0.0) + contribs.get(pac_id, 0.0)
     if not contribs:
         return FlowSummary(
             party=party, rows=[], total_contrib=0.0,
