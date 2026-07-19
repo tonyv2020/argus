@@ -113,6 +113,10 @@ class FecStats:
     edges_created: int = 0
     edges_reused: int = 0
     citations_created: int = 0
+    # P3 — PAC → sponsoring-org affiliated_with edges (from FEC's
+    # affiliated_committee_name).
+    affiliation_edges_created: int = 0
+    affiliation_edges_reused: int = 0
     errors: int = 0
 
 
@@ -230,6 +234,62 @@ async def _upsert_entity(
         )
     )
     return ce.id
+
+
+async def _emit_affiliation_edge(
+    session: AsyncSession,
+    pac_canonical: str,
+    org_canonical: str,
+    committee_id: str,
+    display_label: str,
+) -> tuple[str, bool]:
+    """P3 — emit an ``affiliated_with`` edge PAC → sponsoring-org
+    (create or reuse) + attach the FEC committee record as citation.
+
+    Reused edges do NOT increment ``weight`` (affiliation is a boolean
+    fact, unlike contributes_to which sums dollars). Citations dedupe on
+    ``committee_id`` so a re-run doesn't spam duplicate citations.
+    """
+    existing = (
+        await session.execute(
+            select(CanonicalEdge).where(
+                CanonicalEdge.source_id == pac_canonical,
+                CanonicalEdge.target_id == org_canonical,
+                CanonicalEdge.relation == EdgeRelation.AFFILIATED_WITH.value,
+            )
+        )
+    ).scalar_one_or_none()
+    reused = existing is not None
+    if existing is None:
+        edge = CanonicalEdge(
+            source_id=pac_canonical,
+            target_id=org_canonical,
+            relation=EdgeRelation.AFFILIATED_WITH.value,
+            weight=1.0,
+        )
+        session.add(edge)
+        await session.flush()
+    else:
+        edge = existing
+    citation_url = f"https://www.fec.gov/data/committee/{committee_id}/"
+    existing_cite = (
+        await session.execute(
+            select(SourceCitation).where(
+                SourceCitation.edge_id == edge.id,
+                SourceCitation.citation_ref == committee_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_cite is None:
+        session.add(
+            SourceCitation(
+                edge_id=edge.id,
+                kind=SourceKind.FEC_FILING.value,
+                citation_ref=committee_id,
+                citation_url=citation_url,
+            )
+        )
+    return edge.id, reused
 
 
 async def _emit_contribution_edge(
@@ -361,6 +421,8 @@ async def ingest_from_registry(
                     agg.edges_created += partial.edges_created
                     agg.edges_reused += partial.edges_reused
                     agg.citations_created += partial.citations_created
+                    agg.affiliation_edges_created += partial.affiliation_edges_created
+                    agg.affiliation_edges_reused += partial.affiliation_edges_reused
                     agg.errors += partial.errors
                 out[anchor.label] = agg
             elif anchor.name_variants:
@@ -450,6 +512,35 @@ async def ingest_pac(
                 kind_hint="pac",
             )
             await session.commit()
+
+        # P3 — emit PAC → sponsoring-org affiliated_with edge.
+        # FEC's committee record carries `affiliated_committee_name` (the
+        # sponsoring org for corporate PACs; "NONE" for super-PACs +
+        # unaffiliated committees). Closes the contributor==contract-
+        # recipient join the P5 flow analysis needs.
+        affiliated_org_name = (pac.get("affiliated_committee_name") or "").strip()
+        if affiliated_org_name and affiliated_org_name.upper() != "NONE":
+            async with sm() as session:
+                org_canonical = await _upsert_entity(
+                    session,
+                    affiliated_org_name,
+                    EntityType.ORGANIZATION.value,
+                    "fec.affiliated_committee",
+                    committee_id,  # tag by PAC committee_id (deterministic)
+                    kind_hint="organization",
+                )
+                _, reused = await _emit_affiliation_edge(
+                    session,
+                    pac_canonical,
+                    org_canonical,
+                    committee_id,
+                    display_label,
+                )
+                if reused:
+                    stats.affiliation_edges_reused += 1
+                else:
+                    stats.affiliation_edges_created += 1
+                await session.commit()
 
         # Schedule B disbursements — payments FROM the PAC.
         page = 1
