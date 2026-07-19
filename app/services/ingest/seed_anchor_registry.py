@@ -52,7 +52,9 @@ _DETENTION_OPERATORS: tuple[SeedRow, ...] = (
         label="GEO Group",
         entity_type="organization",
         priority_domain="detention_operators",
-        fec_committee_ids=("C00382916",),   # GEO GROUP INC PAC
+        # Verified live 2026-07-19 via /names/committees/?q=geo group —
+        # THE GEO GROUP, INC. POLITICAL ACTION COMMITTEE.
+        fec_committee_ids=("C00382150",),
         sec_cik=923796,
         usaspending_recipient_names=(
             "GEO GROUP INC", "THE GEO GROUP INC", "GEO GROUP, INC.",
@@ -66,7 +68,9 @@ _DETENTION_OPERATORS: tuple[SeedRow, ...] = (
         label="CoreCivic",
         entity_type="organization",
         priority_domain="detention_operators",
-        fec_committee_ids=("C00098533",),   # CORECIVIC INC PAC (fka CCA PAC)
+        # Verified live 2026-07-19 via /names/committees/?q=corecivic —
+        # CORECIVIC, INC. POLITICAL ACTION COMMITTEE (CORECIVIC PAC).
+        fec_committee_ids=("C00366468",),
         sec_cik=1070985,
         usaspending_recipient_names=(
             "CORECIVIC INC",
@@ -86,7 +90,10 @@ _DETENTION_OPERATORS: tuple[SeedRow, ...] = (
         label="Management & Training Corp",
         entity_type="organization",
         priority_domain="detention_operators",
-        # No known FEC committee id — name-search fallback.
+        # Verified live 2026-07-19 via /names/committees/?q=management
+        # and training — MANAGEMENT AND TRAINING CORPORATION POLITICAL
+        # ACTION COMMITTEE.
+        fec_committee_ids=("C00208322",),
         usaspending_recipient_names=(
             "MANAGEMENT & TRAINING CORPORATION",
             "MANAGEMENT AND TRAINING CORPORATION",
