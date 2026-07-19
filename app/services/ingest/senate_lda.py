@@ -430,6 +430,58 @@ async def ingest_detention_industry(
     return agg
 
 
+async def ingest_from_registry(
+    priority_domains: tuple[str, ...] | None = None,
+    max_filings_per_client: int = 200,
+    page_size: int = 25,
+) -> SenateLdaStats:
+    """P4 registry-driven ingest — sweep every ``anchor_registry`` row
+    the LDA ingester is scoped to see (via ``anchors_for_senate_lda``).
+
+    Each anchor's ``lda_client_names`` list may hold multiple LDA
+    surface names (e.g. GEO Group's "The GEO Group" + historical
+    variants; CoreCivic's "CoreCivic" + pre-rename "Corrections
+    Corporation of America"). Each is swept independently.
+    """
+    from app.db import get_sessionmaker
+    from app.services.anchor_registry import anchors_for_senate_lda
+
+    agg = SenateLdaStats()
+    sm = get_sessionmaker()
+    async with sm() as session:
+        anchors = await anchors_for_senate_lda(
+            session, priority_domains=priority_domains
+        )
+
+    for anchor in anchors:
+        for client_name in anchor.lda_client_names:
+            logger.info(
+                "senate_lda registry anchor label=%s client_name=%s",
+                anchor.label, client_name,
+            )
+            try:
+                stats = await ingest_client_filings(
+                    client_name=client_name,
+                    max_filings=max_filings_per_client,
+                    page_size=page_size,
+                )
+                agg.filings_fetched += stats.filings_fetched
+                agg.filings_skipped_off_anchor += stats.filings_skipped_off_anchor
+                agg.clients_upserted += stats.clients_upserted
+                agg.registrants_upserted += stats.registrants_upserted
+                agg.edges_created += stats.edges_created
+                agg.edges_reused += stats.edges_reused
+                agg.citations_created += stats.citations_created
+                agg.errors += stats.errors
+            except Exception:
+                logger.exception(
+                    "senate_lda registry ingest failed for %s (%s)",
+                    anchor.label, client_name,
+                )
+                agg.errors += 1
+    return agg
+
+
 def main() -> None:
     """CLI entrypoint — ``python -m app.services.ingest.senate_lda``.
 

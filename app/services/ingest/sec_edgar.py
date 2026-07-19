@@ -501,6 +501,49 @@ async def ingest_default_anchors(max_filings_per_anchor: int = 200) -> SecEdgarS
     return stats
 
 
+async def ingest_from_registry(
+    priority_domains: tuple[str, ...] | None = None,
+    max_filings_per_anchor: int = 200,
+) -> SecEdgarStats:
+    """P4 registry-driven ingest — sweep every ``anchor_registry`` row
+    with a non-null ``sec_cik`` (via ``anchors_for_sec_edgar``).
+
+    Palantir + Axon + Tesla + the two detention primes surface here
+    from the P4 B seed; adding a new public-company anchor becomes a
+    registry-row INSERT.
+    """
+    from app.db import get_sessionmaker
+    from app.services.anchor_registry import anchors_for_sec_edgar
+
+    stats = SecEdgarStats()
+    sm = get_sessionmaker()
+    async with sm() as session:
+        anchors = await anchors_for_sec_edgar(
+            session, priority_domains=priority_domains
+        )
+
+    for a in anchors:
+        sec_anchor = SecAnchor(cik=a.sec_cik, surface_name=a.label)
+        logger.info(
+            "sec_edgar registry anchor cik=%s label=%s",
+            sec_anchor.cik10, a.label,
+        )
+        try:
+            stats = await ingest_anchor(
+                sec_anchor,
+                max_filings=max_filings_per_anchor,
+                stats=stats,
+            )
+            stats.anchors_processed += 1
+        except Exception:
+            logger.exception(
+                "sec_edgar registry ingest failed for %s (cik=%s)",
+                a.label, sec_anchor.cik10,
+            )
+            stats.errors += 1
+    return stats
+
+
 def main() -> None:
     """CLI entrypoint — ``python -m app.services.ingest.sec_edgar``."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
