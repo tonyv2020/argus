@@ -626,6 +626,53 @@ async def get_entity_subgraph(
     return {"nodes": kept_nodes, "edges": kept_edges}
 
 
+@app.get("/api/flow/model2")
+async def flow_model2(
+    bill: str = Query(..., description="Bill slug — congress.bill alias (e.g. 119-hr-1) or short-name (OBBB)"),
+    yes_voter_party: str | None = Query(
+        "Republican",
+        description="Party filter on YES-voters (None = any). Republican / Democrat / Independent.",
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """P5.6 Model 2 (BENEFICIARY) — cited $ attribution from a bill's
+    YES-voters + their donors + those donors' contracts inside the
+    bill's curated funding scope.
+
+    Framing (spec §5): attribution to funding scope, NOT causation.
+    """
+    from app.services.flow_query import model2_flow
+
+    summary = await model2_flow(
+        db, bill_slug=bill,
+        yes_voter_party_filter=yes_voter_party,
+        limit=limit,
+    )
+    if summary is None:
+        raise HTTPException(status_code=404, detail=f"bill {bill!r} not found")
+    return {
+        "bill_alias": summary.bill_alias,
+        "bill_label": summary.bill_label,
+        "yes_voter_party_filter": summary.yes_voter_party_filter,
+        "n_yes_voters": summary.n_yes_voters,
+        "funding_scope_note": summary.funding_scope_note,
+        "n_beneficiaries": summary.n_beneficiaries,
+        "total_contrib_to_yes_voters_usd": summary.total_contrib,
+        "total_contract_in_scope_usd": summary.total_contract,
+        "framing": "cited attribution to funding scope, not causation (spec §5)",
+        "rows": [
+            {
+                "entity_id": r.entity_id,
+                "entity_label": r.entity_label,
+                "contrib_usd": r.contrib_to_yes_voters,
+                "contract_usd": r.contract_in_scope,
+            }
+            for r in summary.rows
+        ],
+    }
+
+
 @app.get("/api/flow/model1")
 async def flow_model1(
     party: str = Query(..., description="Republican / Democratic / Independent"),
