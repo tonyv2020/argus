@@ -34,6 +34,47 @@ logger = logging.getLogger(__name__)
 
 _USA_BASE = "https://api.usaspending.gov/api/v2"
 _GEO_RECIPIENT_NAMES = ("GEO GROUP INC", "THE GEO GROUP INC", "GEO GROUP, INC.")
+
+
+# P1 (2026-07-19) — detention-industry recipient anchors.  Each entry
+# names the canonical anchor and the recipient-name variants + the
+# canonical hint (::canonical_name_normalized used by _find_canonical
+# for the pre-existing hollywood-seeded canonical).  Extends the
+# single GEO Group hardcode to CoreCivic + MTC + LaSalle, per §P1.
+DETENTION_INDUSTRY_RECIPIENTS: dict[str, dict] = {
+    "GEO Group": {
+        "recipient_names": (
+            "GEO GROUP INC", "THE GEO GROUP INC", "GEO GROUP, INC.",
+        ),
+        "canonical_hint": "GEO Group",
+    },
+    "CoreCivic": {
+        "recipient_names": (
+            "CORECIVIC INC",
+            "CORECIVIC OF TENNESSEE LLC",
+            "CORRECTIONS CORPORATION OF AMERICA",
+            "CORECIVIC OF AMERICA LLC",
+            "CORECIVIC OF ARIZONA LLC",
+        ),
+        "canonical_hint": "CoreCivic",
+    },
+    "Management & Training Corp": {
+        "recipient_names": (
+            "MANAGEMENT & TRAINING CORPORATION",
+            "MANAGEMENT AND TRAINING CORPORATION",
+            "MTC",
+        ),
+        "canonical_hint": "Management & Training Corporation",
+    },
+    "LaSalle Corrections": {
+        "recipient_names": (
+            "LASALLE CORRECTIONS LLC",
+            "LASALLE SOUTHWEST CORRECTIONS",
+            "LASALLE MANAGEMENT COMPANY",
+        ),
+        "canonical_hint": "LaSalle Corrections",
+    },
+}
 # ICE + BOP — the detention-contract accountability beat (design §7).
 # USAspending uses the Awarding SUB-AGENCY for the actual bureau (ICE / BOP);
 # the top-level "Awarding Agency" is the department level (DHS / DoJ). Match on
@@ -166,12 +207,28 @@ async def _emit_contract_edge(
 
 
 async def _find_geo_group_canonical(session: AsyncSession) -> str | None:
-    """Return the pre-existing GEO Group canonical id (from hollywood.entity_tags P0)."""
+    """Return the pre-existing GEO Group canonical id (from hollywood.entity_tags P0).
+
+    Kept for back-compat; new callers use :func:`_find_recipient_canonical`.
+    """
+    return await _find_recipient_canonical(session, "GEO Group")
+
+
+async def _find_recipient_canonical(
+    session: AsyncSession, canonical_hint: str
+) -> str | None:
+    """Return the pre-existing canonical id for the given hint.
+
+    Looks up an ORGANIZATION-type canonical whose normalized name matches
+    ``normalize_name(canonical_hint)`` — the same lookup shape the
+    hollywood.entity_tags seed produces.  Returns ``None`` when the seed
+    hasn't landed yet (caller must decide to error or create).
+    """
     row = (
         await session.execute(
             select(CanonicalEntity).where(
                 CanonicalEntity.type == EntityType.ORGANIZATION.value,
-                CanonicalEntity.canonical_name_normalized == normalize_name("GEO Group"),
+                CanonicalEntity.canonical_name_normalized == normalize_name(canonical_hint),
             )
         )
     ).scalar_one_or_none()
@@ -179,18 +236,63 @@ async def _find_geo_group_canonical(session: AsyncSession) -> str | None:
 
 
 async def ingest_geo_group_contracts(max_awards: int = 200) -> UsaSpendingStats:
-    """Fetch GEO Group's awards from ICE + BOP and materialise HOLDS_CONTRACT edges."""
+    """Back-compat wrapper — ingest ONLY GEO Group awards.
+
+    Prefer :func:`ingest_recipient_contracts` with a specific anchor or
+    :func:`ingest_detention_industry_contracts` for the full set.
+    """
+    return await ingest_recipient_contracts(
+        recipient_names=DETENTION_INDUSTRY_RECIPIENTS["GEO Group"]["recipient_names"],
+        canonical_hint=DETENTION_INDUSTRY_RECIPIENTS["GEO Group"]["canonical_hint"],
+        display_label="GEO Group",
+        max_awards=max_awards,
+    )
+
+
+async def ingest_detention_industry_contracts(
+    max_awards: int = 200,
+) -> dict[str, UsaSpendingStats]:
+    """P1: ingest the detention-industry federal contracts set."""
+    out: dict[str, UsaSpendingStats] = {}
+    for label, entry in DETENTION_INDUSTRY_RECIPIENTS.items():
+        try:
+            out[label] = await ingest_recipient_contracts(
+                recipient_names=entry["recipient_names"],
+                canonical_hint=entry["canonical_hint"],
+                display_label=label,
+                max_awards=max_awards,
+            )
+        except Exception:
+            logger.exception("usaspending ingest failed for %s", label)
+            s = UsaSpendingStats()
+            s.errors = 1
+            out[label] = s
+    return out
+
+
+async def ingest_recipient_contracts(
+    recipient_names: tuple[str, ...],
+    canonical_hint: str,
+    display_label: str,
+    max_awards: int = 200,
+) -> UsaSpendingStats:
+    """Fetch ONE recipient's contracts from ICE/BOP/USMS + emit
+    HOLDS_CONTRACT edges."""
     stats = UsaSpendingStats()
     sm = get_sessionmaker()
     async with sm() as session:
-        geo_canonical = await _find_geo_group_canonical(session)
+        geo_canonical = await _find_recipient_canonical(session, canonical_hint)
     if geo_canonical is None:
-        logger.error("GEO Group canonical not found in argus — run P0 resolver first")
+        logger.error(
+            "%s canonical not found in argus (hint=%r) — run P0 resolver first",
+            display_label,
+            canonical_hint,
+        )
         return stats
 
     body = {
         "filters": {
-            "recipient_search_text": list(_GEO_RECIPIENT_NAMES),
+            "recipient_search_text": list(recipient_names),
             "award_type_codes": ["A", "B", "C", "D"],  # procurement contract types
         },
         "fields": [
@@ -263,8 +365,42 @@ async def ingest_geo_group_contracts(max_awards: int = 200) -> UsaSpendingStats:
     return stats
 
 
-def main() -> None:
-    """CLI entrypoint — python -m app.services.ingest.usaspending."""
+def main() -> None:  # noqa: C901  — CLI dispatcher, straight-line
+    """CLI entrypoint — python -m app.services.ingest.usaspending [anchor|--all].
+
+    Default runs the full detention-industry recipient set (§P1).  Pass
+    an anchor label (``GEO Group`` / ``CoreCivic`` / ``Management &
+    Training Corp`` / ``LaSalle Corrections``) to run only that one.
+    """
+    import sys
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    arg = " ".join(sys.argv[1:]).strip() or "--all"
+    if arg in ("--all", "all", ""):
+        results = asyncio.run(ingest_detention_industry_contracts())
+        for label, stats in results.items():
+            logger.info("[%s] usaspending ingest done: %s", label, stats)
+    elif arg in DETENTION_INDUSTRY_RECIPIENTS:
+        entry = DETENTION_INDUSTRY_RECIPIENTS[arg]
+        stats = asyncio.run(
+            ingest_recipient_contracts(
+                recipient_names=entry["recipient_names"],
+                canonical_hint=entry["canonical_hint"],
+                display_label=arg,
+            )
+        )
+        logger.info("[%s] usaspending ingest done: %s", arg, stats)
+    else:
+        logger.error(
+            "unknown anchor %r; choose from %s or --all",
+            arg,
+            sorted(DETENTION_INDUSTRY_RECIPIENTS),
+        )
+        sys.exit(2)
+    return
+
+def _legacy_main() -> None:
+    """Kept for tests; the real entrypoint is :func:`main`."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     stats = asyncio.run(ingest_geo_group_contracts())
     logger.info("usaspending ingest done: %s", stats)
