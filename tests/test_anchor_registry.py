@@ -107,13 +107,48 @@ async def test_fec_filter_excludes_persons() -> None:
 @pytest.mark.asyncio
 async def test_fec_individual_filter_isolates_persons() -> None:
     """Persons go through Schedule A only — this filter returns exactly
-    the person anchors so the sweep can dispatch them to the individual-
-    contributor path."""
+    the mega-donor person anchors so the sweep can dispatch them to the
+    individual-contributor path."""
     from app.services.anchor_registry import anchors_for_fec_individual
 
     got = await anchors_for_fec_individual(_FakeSession())
     labels = {a.label for a in got}
     assert labels == {"Peter Thiel"}
+
+
+@pytest.mark.asyncio
+async def test_fec_individual_filter_excludes_congress_members(
+    monkeypatch,
+) -> None:
+    """Congress members are RECIPIENTS, not mega-donors — running
+    individual-contributor mode on 537 members burns FEC quota
+    (helen 2026-07-19 20:08Z 429 incident)."""
+    from app.services.anchor_registry import anchors_for_fec_individual, Anchor
+    from app.services import anchor_registry as ar
+
+    congress_seed = [
+        Anchor(
+            label="Ted Cruz",
+            entity_type="person",
+            priority_domain="congress",
+            fec_candidate_ids=["S8TX00232"],
+        ),
+        Anchor(
+            label="Peter Thiel",
+            entity_type="person",
+            priority_domain="surveillance",
+        ),
+    ]
+
+    async def fake_list(session, *, priority_domains=None, entity_types=None):
+        return [a for a in congress_seed if a.entity_type in (entity_types or ("person",))]
+
+    monkeypatch.setattr(ar, "list_anchors", fake_list)
+
+    got = await anchors_for_fec_individual(_FakeSession())
+    labels = {a.label for a in got}
+    assert labels == {"Peter Thiel"}
+    assert "Ted Cruz" not in labels
 
 
 @pytest.mark.asyncio

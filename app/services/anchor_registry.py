@@ -132,16 +132,24 @@ async def anchors_for_fec_individual(
     priority_domains: Sequence[str] | None = None,
 ) -> list[Anchor]:
     """Anchors the FEC ingester (individual-contributor mode, Schedule
-    A) should sweep — every ``entity_type='person'`` row.
+    A) should sweep — mega-donor persons only.
 
-    Persons carry their name in ``label`` + LAST,FIRST variant in
-    ``name_variants`` (for the FEC contributor_name query shape).
+    Explicitly EXCLUDES the ``congress`` priority domain: congress
+    members RECEIVE contributions (they're aliased so incoming FEC
+    contributions resolve to them via ``fec.candidate``); they aren't
+    mega-donors. Running individual-contributor mode on 537 members
+    burns ~1600 Schedule A requests and 429's the FEC key (helen
+    2026-07-19 20:08Z).
+
+    Persons carry LAST,FIRST in ``name_variants`` for the contributor
+    query shape.
     """
-    return await list_anchors(
+    anchors = await list_anchors(
         session,
         priority_domains=priority_domains,
         entity_types=("person",),
     )
+    return [a for a in anchors if a.priority_domain != "congress"]
 
 
 async def anchors_for_usaspending(
