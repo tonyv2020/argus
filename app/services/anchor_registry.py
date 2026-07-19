@@ -109,13 +109,39 @@ async def anchors_for_fec(
     *,
     priority_domains: Sequence[str] | None = None,
 ) -> list[Anchor]:
-    """Anchors the FEC ingester should sweep — anything with a committee ID
-    OR the name-search fallback (``name_variants``)."""
+    """Anchors the FEC ingester (PAC-mode) should sweep — anything with
+    a committee ID or the name-search fallback.
+
+    EXCLUDES ``entity_type='person'``: persons go through the
+    individual-contributor path (Schedule A) via
+    :func:`anchors_for_fec_individual`. Without this exclusion the
+    full-sweep would fire 537 congress-member name-searches at the
+    FEC ``/committees/`` endpoint and get 429'd within seconds.
+    """
     anchors = await list_anchors(session, priority_domains=priority_domains)
     return [
         a for a in anchors
-        if a.fec_committee_ids or a.name_variants
+        if a.entity_type != "person"
+        and (a.fec_committee_ids or a.name_variants)
     ]
+
+
+async def anchors_for_fec_individual(
+    session: AsyncSession,
+    *,
+    priority_domains: Sequence[str] | None = None,
+) -> list[Anchor]:
+    """Anchors the FEC ingester (individual-contributor mode, Schedule
+    A) should sweep — every ``entity_type='person'`` row.
+
+    Persons carry their name in ``label`` + LAST,FIRST variant in
+    ``name_variants`` (for the FEC contributor_name query shape).
+    """
+    return await list_anchors(
+        session,
+        priority_domains=priority_domains,
+        entity_types=("person",),
+    )
 
 
 async def anchors_for_usaspending(
