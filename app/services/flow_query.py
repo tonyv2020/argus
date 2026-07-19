@@ -213,9 +213,9 @@ async def model1_flow(
     # P5.3 attribution — a company's contributions land through its PAC
     # (a separate canonical), not the company directly. Look up every
     # PAC → sponsoring-org affiliated_with edge (P3 output) and
-    # ATTRIBUTE the PAC's contribution total to the sponsor org too.
-    # "Contribution total" survives in both the PAC row + the sponsor
-    # row so downstream reports can slice either way.
+    # ATTRIBUTE the PAC's contribution total to the sponsor org, then
+    # ZERO OUT the PAC entry so the aggregate isn't double-counted.
+    # Attributed rows carry the ORIGINAL PAC's contribs on the org id.
     pac_ids = list(contribs.keys())
     if pac_ids:
         pac_to_org = (
@@ -227,7 +227,29 @@ async def model1_flow(
             )
         ).all()
         for pac_id, org_id in pac_to_org:
-            contribs[org_id] = contribs.get(org_id, 0.0) + contribs.get(pac_id, 0.0)
+            pac_amt = contribs.get(pac_id, 0.0)
+            if pac_amt > 0:
+                contribs[org_id] = contribs.get(org_id, 0.0) + pac_amt
+                contribs.pop(pac_id, None)
+
+    # Exclude congress-member canonicals from the contributor set —
+    # the bridge (link_committees_to_candidates) creates a legit edge
+    # from a member's committee → the member, so their committee's
+    # onward contributions cascade the member as a "contributor" via
+    # the sponsor-org attribution. Real behavior but confusing surface
+    # (Ben Cline / Andy Harris looked like Republican contributors in
+    # helen's 2026-07-19 21:40Z validation). Filter here.
+    if contribs:
+        congress_ids = (
+            await session.execute(
+                select(EntityAlias.canonical_id).where(
+                    EntityAlias.source_system == "bioguide",
+                    EntityAlias.canonical_id.in_(list(contribs.keys())),
+                )
+            )
+        ).scalars().all()
+        for cid in congress_ids:
+            contribs.pop(cid, None)
     if not contribs:
         return FlowSummary(
             party=party, rows=[], total_contrib=0.0,

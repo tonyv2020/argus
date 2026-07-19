@@ -40,6 +40,9 @@ spec:
                 - secretRef:
                     name: argus-fec
                     optional: true
+                - secretRef:
+                    name: argus-congress
+                    optional: true
               resources:
                 requests:
                   memory: "1Gi"
