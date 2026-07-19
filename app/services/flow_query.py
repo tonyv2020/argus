@@ -305,3 +305,343 @@ async def model1_flow(
         total_contract=sum(r.contract_total for r in rows),
         n_contributors=len(rows),
     )
+
+
+# ---------------------------------------------------------------------------
+# P5.6 — Model 2 (BENEFICIARY) flow query.
+#
+# Analytical question (Tony 2026-07-19):
+#     "How much did private entities benefiting from a bill (e.g. OBBB)
+#      receive back, relative to their contributions to the members who
+#      passed it?"
+#
+# Chain (every hop cited):
+#     BILL --[voted_for]-> members --[contributes_to $]<-- entities
+#         --[holds_contract $]-> agency (funding-scope-filtered)
+#
+# Bill → funding-scope: the analytical linkage is bill → funding SCOPE
+# (agencies / date window), NOT bill → specific award. Surfaced as
+# ATTRIBUTION TO FUNDING SCOPE, cited (bill + the award's federal
+# account) — NOT a causal claim (spec §5).
+# ---------------------------------------------------------------------------
+
+
+# Curated bill → funding scope (agency substring set). Extend per bill.
+BILL_FUNDING_SCOPE: dict[str, tuple[tuple[str, ...], str]] = {
+    "119-hr-1": (
+        (
+            "IMMIGRATION AND CUSTOMS ENFORCEMENT",
+            "CUSTOMS AND BORDER PROTECTION",
+            "BUREAU OF PRISONS",
+            "U.S. MARSHALS SERVICE",
+            "DEPARTMENT OF HOMELAND SECURITY",
+            "NATIONAL AERONAUTICS AND SPACE ADMINISTRATION",
+            "DEPARTMENT OF DEFENSE",
+        ),
+        "OBBB funding scope — DHS/DoD/NASA/detention (helen 2026-07-19 curated)",
+    ),
+    "119-hr-2": (
+        (
+            "IMMIGRATION AND CUSTOMS ENFORCEMENT",
+            "CUSTOMS AND BORDER PROTECTION",
+            "DEPARTMENT OF HOMELAND SECURITY",
+        ),
+        "Secure the Border Act — border-enforcement scope",
+    ),
+}
+
+
+@dataclass
+class Model2Row:
+    """One beneficiary company + their aggregated $."""
+
+    entity_id: str
+    entity_label: str
+    contrib_to_yes_voters: float
+    contract_in_scope: float
+
+
+@dataclass
+class Model2Summary:
+    """Rollup for a Model 2 query."""
+
+    bill_alias: str
+    bill_label: str
+    yes_voter_party_filter: str
+    n_yes_voters: int
+    funding_scope_note: str
+    rows: list[Model2Row]
+    total_contrib: float
+    total_contract: float
+    n_beneficiaries: int
+
+
+async def _yes_voter_ids_for_bill(
+    session: AsyncSession,
+    bill_id: str,
+    party_filter: str | None,
+) -> set[str]:
+    """Return the set of member canonical ids that voted YES on the
+    given bill, optionally filtered to a party."""
+    stmt = select(CanonicalEdge.source_id).where(
+        CanonicalEdge.target_id == bill_id,
+        CanonicalEdge.relation == EdgeRelation.VOTED_FOR.value,
+    )
+    yes_ids = set((await session.execute(stmt)).scalars().all())
+    if not party_filter or not yes_ids:
+        return yes_ids
+
+    matching = (
+        await session.execute(
+            select(EntityAlias.canonical_id).where(
+                EntityAlias.source_system == "party",
+                func.lower(EntityAlias.surface_name) == party_filter.lower(),
+                EntityAlias.canonical_id.in_(yes_ids),
+            )
+        )
+    ).scalars().all()
+    return set(matching)
+
+
+async def _resolve_bill(
+    session: AsyncSession, bill_slug: str
+) -> tuple[str, str] | None:
+    """Look up a bill canonical + label by its congress.bill alias.
+
+    ``bill_slug`` accepts:
+        * the canonical alias key (``119-hr-1``)
+        * the human short-name (``OBBB``, ``obbb``)
+    """
+    row = (
+        await session.execute(
+            select(EntityAlias).where(
+                EntityAlias.source_system == "congress.bill",
+                EntityAlias.source_id == bill_slug,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is not None:
+        ent = (
+            await session.execute(
+                select(CanonicalEntity).where(CanonicalEntity.id == row.canonical_id)
+            )
+        ).scalar_one_or_none()
+        if ent is not None:
+            return ent.id, ent.canonical_name
+
+    slug_lower = bill_slug.lower()
+    ent = (
+        await session.execute(
+            select(CanonicalEntity).where(
+                CanonicalEntity.type == "bill",
+                func.lower(CanonicalEntity.canonical_name).like(f"%{slug_lower}%"),
+            )
+        )
+    ).scalar_one_or_none()
+    if ent is not None:
+        alias = (
+            await session.execute(
+                select(EntityAlias).where(
+                    EntityAlias.canonical_id == ent.id,
+                    EntityAlias.source_system == "congress.bill",
+                )
+            )
+        ).scalar_one_or_none()
+        return ent.id, ent.canonical_name
+    return None
+
+
+async def model2_flow(
+    session: AsyncSession,
+    bill_slug: str,
+    yes_voter_party_filter: str | None = "Republican",
+    limit: int = 100,
+) -> Model2Summary | None:
+    """P5.6 Model 2 — BENEFICIARY flow.
+
+    Steps:
+      1. Resolve the bill from its congress.bill alias or short-name.
+      2. Find every member who voted YES (optionally party-filtered).
+      3. Find every entity that contributes_to a YES-voter.
+      4. Attribute PAC contribs to sponsor org (same as Model 1) +
+         exclude congress-member intermediaries.
+      5. Sum funding-scope contracts per contributor. Scope = the
+         curated agency substring set for the bill.
+      6. Return sorted by contract_in_scope desc.
+
+    Framing: cited attribution to funding scope, NOT causation.
+    """
+    resolved = await _resolve_bill(session, bill_slug)
+    if resolved is None:
+        return None
+    bill_id, bill_label = resolved
+
+    # Look up funding scope by the alias key (canonical mapping).
+    alias_row = (
+        await session.execute(
+            select(EntityAlias).where(
+                EntityAlias.canonical_id == bill_id,
+                EntityAlias.source_system == "congress.bill",
+            )
+        )
+    ).scalar_one_or_none()
+    scope_key = alias_row.source_id if alias_row else bill_slug
+    scope_agencies, scope_note = BILL_FUNDING_SCOPE.get(
+        scope_key,
+        ((), f"no curated funding scope for {scope_key}"),
+    )
+
+    yes_ids = await _yes_voter_ids_for_bill(
+        session, bill_id, yes_voter_party_filter
+    )
+    if not yes_ids:
+        return Model2Summary(
+            bill_alias=scope_key, bill_label=bill_label,
+            yes_voter_party_filter=yes_voter_party_filter or "any",
+            n_yes_voters=0, funding_scope_note=scope_note,
+            rows=[], total_contrib=0.0, total_contract=0.0,
+            n_beneficiaries=0,
+        )
+
+    # Also include the yes-voters' principal-campaign committees (via
+    # bridge affiliated_with target=member).
+    bridged = (
+        await session.execute(
+            select(CanonicalEdge.source_id).where(
+                CanonicalEdge.relation == EdgeRelation.AFFILIATED_WITH.value,
+                CanonicalEdge.target_id.in_(yes_ids),
+            )
+        )
+    ).scalars().all()
+    recipient_ids = yes_ids | set(bridged)
+
+    # Contribs → yes-voter recipients (sum per contributor).
+    contribs_stmt = (
+        select(
+            CanonicalEdge.source_id,
+            func.sum(CanonicalEdge.weight).label("contrib_total"),
+        )
+        .where(
+            CanonicalEdge.relation == EdgeRelation.CONTRIBUTES_TO.value,
+            CanonicalEdge.target_id.in_(recipient_ids),
+        )
+        .group_by(CanonicalEdge.source_id)
+    )
+    contribs = {
+        row.source_id: float(row.contrib_total or 0.0)
+        for row in (await session.execute(contribs_stmt)).all()
+    }
+
+    # Attribute PAC contribs to sponsor org + zero out PAC + exclude
+    # congress-member intermediaries (same shape as Model 1).
+    pac_ids = list(contribs.keys())
+    if pac_ids:
+        pac_to_org = (
+            await session.execute(
+                select(CanonicalEdge.source_id, CanonicalEdge.target_id).where(
+                    CanonicalEdge.relation == EdgeRelation.AFFILIATED_WITH.value,
+                    CanonicalEdge.source_id.in_(pac_ids),
+                )
+            )
+        ).all()
+        for pac_id, org_id in pac_to_org:
+            pac_amt = contribs.get(pac_id, 0.0)
+            if pac_amt > 0:
+                contribs[org_id] = contribs.get(org_id, 0.0) + pac_amt
+                contribs.pop(pac_id, None)
+    if contribs:
+        congress_ids = (
+            await session.execute(
+                select(EntityAlias.canonical_id).where(
+                    EntityAlias.source_system == "bioguide",
+                    EntityAlias.canonical_id.in_(list(contribs.keys())),
+                )
+            )
+        ).scalars().all()
+        for cid in congress_ids:
+            contribs.pop(cid, None)
+    if not contribs:
+        return Model2Summary(
+            bill_alias=scope_key, bill_label=bill_label,
+            yes_voter_party_filter=yes_voter_party_filter or "any",
+            n_yes_voters=len(yes_ids), funding_scope_note=scope_note,
+            rows=[], total_contrib=0.0, total_contract=0.0,
+            n_beneficiaries=0,
+        )
+
+    # Funding-scope contracts per contributor.
+    # Contracts land in the graph as CanonicalEdge relation HOLDS_CONTRACT
+    # source=entity target=agency; the agency canonical's name matches
+    # the scope substring set.
+    if scope_agencies:
+        scope_lower = [a.lower() for a in scope_agencies]
+        scope_or = or_(
+            *[
+                func.lower(CanonicalEntity.canonical_name).contains(a)
+                for a in scope_lower
+            ]
+        )
+        agencies_in_scope = (
+            await session.execute(
+                select(CanonicalEntity.id).where(scope_or)
+            )
+        ).scalars().all()
+        agency_ids = set(agencies_in_scope)
+    else:
+        agency_ids = set()
+
+    contracts = {}
+    if agency_ids:
+        contracts_stmt = (
+            select(
+                CanonicalEdge.source_id,
+                func.sum(CanonicalEdge.weight).label("contract_total"),
+            )
+            .where(
+                CanonicalEdge.relation == EdgeRelation.HOLDS_CONTRACT.value,
+                CanonicalEdge.source_id.in_(list(contribs.keys())),
+                CanonicalEdge.target_id.in_(agency_ids),
+            )
+            .group_by(CanonicalEdge.source_id)
+        )
+        contracts = {
+            row.source_id: float(row.contract_total or 0.0)
+            for row in (await session.execute(contracts_stmt)).all()
+        }
+
+    entity_ids = list(contribs.keys())
+    entities = {
+        e.id: e
+        for e in (
+            await session.execute(
+                select(CanonicalEntity).where(CanonicalEntity.id.in_(entity_ids))
+            )
+        ).scalars().all()
+    }
+
+    rows: list[Model2Row] = [
+        Model2Row(
+            entity_id=eid,
+            entity_label=entities.get(eid).canonical_name if entities.get(eid) else "?",
+            contrib_to_yes_voters=ctotal,
+            contract_in_scope=contracts.get(eid, 0.0),
+        )
+        for eid, ctotal in contribs.items()
+    ]
+    rows.sort(
+        key=lambda r: (r.contract_in_scope, r.contrib_to_yes_voters),
+        reverse=True,
+    )
+    rows = rows[:limit]
+
+    return Model2Summary(
+        bill_alias=scope_key,
+        bill_label=bill_label,
+        yes_voter_party_filter=yes_voter_party_filter or "any",
+        n_yes_voters=len(yes_ids),
+        funding_scope_note=scope_note,
+        rows=rows,
+        total_contrib=sum(r.contrib_to_yes_voters for r in rows),
+        total_contract=sum(r.contract_in_scope for r in rows),
+        n_beneficiaries=len(rows),
+    )
