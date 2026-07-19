@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -19,8 +20,10 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -257,4 +260,72 @@ class LlmUsage(Base):
     ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     ts: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class AnchorRegistry(Base):
+    """P4 — the shared anchor registry.
+
+    Single source of truth for what the FEC / USAspending / LDA / SEC
+    ingesters target. Replaces the 4 per-module hardcoded constants
+    (``DETENTION_INDUSTRY_PACS`` etc.) with one row per curated anchor.
+
+    Adding a domain (private-prison → prison-telecom → congress →
+    Thiel/surveillance → Musk network) becomes a data edit + a re-run,
+    not a code change. External-ID-first keying (fec_committee_ids,
+    sec_cik, fec_candidate_ids) is the correctness argument — name
+    matching gave us "AMERICA PAC"=FXAIX-fund + "Anduril"=concept in
+    prior sweeps.
+
+    See migration 0004_anchor_registry for the column shape + indexes.
+    """
+
+    __tablename__ = "anchor_registry"
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False),
+        primary_key=True,
+        server_default=func.gen_random_uuid(),
+    )
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    entity_type: Mapped[str] = mapped_column(Text, nullable=False)
+    priority_domain: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fec_committee_ids: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=func.jsonb_build_array()
+    )
+    fec_candidate_ids: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=func.jsonb_build_array()
+    )
+    sec_cik: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    usaspending_recipient_names: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=func.jsonb_build_array()
+    )
+    lda_client_names: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=func.jsonb_build_array()
+    )
+    name_variants: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=func.jsonb_build_array()
+    )
+    surface_mode: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="open"
+    )
+    canonical_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("canonical_entities.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("label", "entity_type",
+                         name="uq_anchor_registry_label_type"),
+        Index("ix_anchor_registry_priority_domain", "priority_domain"),
+        Index("ix_anchor_registry_entity_type", "entity_type"),
+        Index("ix_anchor_registry_sec_cik", "sec_cik"),
     )
