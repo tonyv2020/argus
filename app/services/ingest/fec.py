@@ -78,6 +78,27 @@ DETENTION_INDUSTRY_PACS: dict[str, dict] = {
                     "LASALLE SOUTHWEST CORRECTIONS"),
         "match": ("LASALLE",),
     },
+    # Prison-telecom sub-industry — SEC-skipped (privately held, PE-owned)
+    # but FEC + LDA + USAspending coverage matters. Helen 2026-07-19: Securus
+    # + Aventiv + STOP + GTL/ViaPath are absent (0 entities) or fragmented.
+    "Securus Technologies": {
+        "queries": ("SECURUS TECHNOLOGIES", "SECURUS TECH", "SECURUS PAC"),
+        "match": ("SECURUS",),
+    },
+    "Aventiv Technologies": {
+        "queries": ("AVENTIV TECHNOLOGIES", "AVENTIV TECH", "AVENTIV PAC"),
+        "match": ("AVENTIV",),
+    },
+    "Satellite Tracking of People": {
+        "queries": ("SATELLITE TRACKING OF PEOPLE", "STOP LLC", "STOP PAC"),
+        "match": ("SATELLITE TRACKING", "STOP LLC"),
+    },
+    "GTL / ViaPath": {
+        # GTL renamed to ViaPath Technologies in 2022; cover both surface names.
+        "queries": ("GLOBAL TEL LINK", "GLOBAL TEL*LINK", "GTL PAC",
+                    "VIAPATH TECHNOLOGIES", "VIAPATH"),
+        "match": ("GLOBAL TEL", "VIAPATH", "GTL"),
+    },
 }
 
 

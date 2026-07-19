@@ -42,6 +42,9 @@ spec:
           envFrom:
             - secretRef:
                 name: argus-env
+            - secretRef:
+                name: argus-fec
+                optional: true
           ports:
             - containerPort: 8000
           readinessProbe:

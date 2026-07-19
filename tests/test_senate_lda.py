@@ -100,6 +100,21 @@ def test_detention_industry_anchors_are_deduplicated_by_name() -> None:
     assert len(set(DETENTION_INDUSTRY_LDA_CLIENTS)) == len(DETENTION_INDUSTRY_LDA_CLIENTS)
 
 
+def test_lda_anchors_include_prison_telecom() -> None:
+    """Helen 2026-07-19: prison-telecom (Securus/Aventiv/GTL/ViaPath)
+    MUST appear as LDA anchors — they lobby heavily on prison-telecom
+    contract rules but are absent from the operator-only anchor set."""
+    from app.services.ingest.senate_lda import DETENTION_INDUSTRY_LDA_CLIENTS
+
+    names = " ".join(DETENTION_INDUSTRY_LDA_CLIENTS).lower()
+    assert "securus" in names
+    assert "aventiv" in names
+    # Post-rename ViaPath + pre-rename Global Tel Link — both surface
+    # names need coverage to survive the 2022 rebrand.
+    assert "viapath" in names
+    assert "global tel link" in names
+
+
 def test_lda_get_retries_on_429_then_returns_payload() -> None:
     """A single 429 with a Retry-After header should be retried, not raised —
     lda.senate.gov aggressively throttles multi-anchor sweeps. The 4-anchor
