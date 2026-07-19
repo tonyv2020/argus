@@ -51,6 +51,8 @@ class EntityType(StrEnum):
     # policy programme, an initiative). Distinct from TOPIC/theme (a heading).
     EVENT = "event"
     CONCEPT = "concept"
+    # P5.1 — roll-call vote ingester lands bills as dedicated canonicals.
+    BILL = "bill"
     UNKNOWN = "unknown"
 
 
@@ -80,6 +82,9 @@ class EdgeRelation(StrEnum):
     AFFILIATED_WITH = "affiliated_with"
     MENTIONED_WITH = "mentioned_with"
     TAGGED_AS = "tagged_as"
+    # P5.1 — roll-call votes: member → bill edges.
+    VOTED_FOR = "voted_for"
+    VOTED_AGAINST = "voted_against"
 
 
 class SourceKind(StrEnum):
@@ -89,6 +94,8 @@ class SourceKind(StrEnum):
     FEC_FILING = "fec_filing"
     USASPENDING_AWARD = "usaspending_award"
     SENATE_LDA = "senate_lda"
+    # P5.1 — roll-call vote citations pointing at clerk/Congress.gov URLs.
+    CONGRESS_VOTE = "congress_vote"
     CORPORATE_REGISTRY = "corporate_registry"
 
 

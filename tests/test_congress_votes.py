@@ -21,11 +21,13 @@ def test_browser_ua_sent_on_every_call() -> None:
     assert "mozilla" in ua or "chrome" in ua, ua
 
 
-def test_get_helper_attaches_headers() -> None:
-    """The `_get` helper wraps every congress.gov call — it must
-    forward `_HTTP_HEADERS` so the UA never leaks."""
-    src = inspect.getsource(congress_votes._get)
-    assert "headers=_HTTP_HEADERS" in src
+def test_fetch_helpers_attach_headers() -> None:
+    """The `_fetch_json` / `_fetch_xml` helpers wrap every remote call —
+    both must forward `_HTTP_HEADERS` so the UA never leaks."""
+    src_json = inspect.getsource(congress_votes._fetch_json)
+    src_xml = inspect.getsource(congress_votes._fetch_xml)
+    assert "headers=_HTTP_HEADERS" in src_json
+    assert "headers=_HTTP_HEADERS" in src_xml
 
 
 def test_key_bills_set_is_non_empty_and_well_shaped() -> None:
@@ -55,8 +57,55 @@ def test_api_key_env_probe_returns_none_when_unset(monkeypatch) -> None:
     assert congress_votes._api_key() is None
 
 
-def test_vote_edge_citation_ref_carries_vote_kind() -> None:
-    """The vote KIND (voted_for / voted_against) must survive on the
-    citation ref so downstream analysis + audit can slice."""
+def test_house_clerk_xml_parser_extracts_bioguide_and_vote() -> None:
+    """Parse the actual clerk XML shape (verified live on roll190.xml)."""
+    xml_sample = """<?xml version="1.0"?>
+<rollcall-vote>
+<vote-data>
+<recorded-vote><legislator name-id="A000370" party="D" state="NC">Adams</legislator><vote>No</vote></recorded-vote>
+<recorded-vote><legislator name-id="A000055" party="R" state="AL">Aderholt</legislator><vote>Aye</vote></recorded-vote>
+<recorded-vote><legislator name-id="B001318" party="D" state="VT">Balint</legislator><vote>Present</vote></recorded-vote>
+</vote-data>
+</rollcall-vote>"""
+    got = congress_votes._parse_house_clerk_xml(xml_sample)
+    assert got == [
+        ("A000370", "No"),
+        ("A000055", "Aye"),
+        ("B001318", "Present"),
+    ]
+
+
+def test_yea_and_nay_normalization_maps_correctly() -> None:
+    """Aye/Yea/Yes → voted_for; No/Nay → voted_against."""
+    assert "aye" in congress_votes._YEA
+    assert "yea" in congress_votes._YEA
+    assert "no" in congress_votes._NAY
+    assert "nay" in congress_votes._NAY
+    # NEVER include Present or Not Voting in either set — spec §5.
+    assert "present" not in congress_votes._YEA
+    assert "present" not in congress_votes._NAY
+    assert "not voting" not in congress_votes._YEA
+    assert "not voting" not in congress_votes._NAY
+
+
+def test_vote_ingest_stats_carries_directional_counters() -> None:
+    """The stats surface must distinguish voted_for from voted_against
+    counters — a bill with 218-2 needs both visible in the log."""
+    s = congress_votes.VoteIngestStats()
+    assert hasattr(s, "voted_for_edges_created")
+    assert hasattr(s, "voted_against_edges_created")
+    assert hasattr(s, "votes_skipped_non_directional")
+
+
+def test_bill_canonical_type_is_bill_not_placeholder() -> None:
+    """Bill canonicals use EntityType.BILL (extended from CONCEPT
+    placeholder per helen 2026-07-19 21:59Z)."""
+    src = inspect.getsource(congress_votes._upsert_bill_canonical)
+    assert "EntityType.BILL" in src
+
+
+def test_congress_vote_source_kind_used_on_citations() -> None:
+    """Vote citations use SourceKind.CONGRESS_VOTE (extended from
+    CORPORATE_REGISTRY placeholder per helen 2026-07-19 21:59Z)."""
     src = inspect.getsource(congress_votes._emit_vote_edge)
-    assert '{vote_kind}' in src
+    assert "SourceKind.CONGRESS_VOTE" in src
