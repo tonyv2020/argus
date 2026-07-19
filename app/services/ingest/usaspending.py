@@ -305,6 +305,46 @@ async def ingest_detention_industry_contracts(
     return out
 
 
+async def ingest_from_registry(
+    priority_domains: tuple[str, ...] | None = None,
+    max_awards: int = 200,
+) -> dict[str, UsaSpendingStats]:
+    """P4 registry-driven ingest — sweep every ``anchor_registry`` row
+    the USAspending ingester is scoped to see (via
+    ``anchors_for_usaspending``).
+
+    The label is used as the ``canonical_hint`` so the ingester's
+    existing auto-seed path (P1.4 hotfix) creates the org canonical
+    for anchors that hollywood.entity_tags hasn't seeded (Securus /
+    Aventiv / STOP / GTL / Palantir / Tesla / SpaceX etc.).
+    """
+    from app.services.anchor_registry import anchors_for_usaspending
+
+    out: dict[str, UsaSpendingStats] = {}
+    sm = get_sessionmaker()
+    async with sm() as session:
+        anchors = await anchors_for_usaspending(
+            session, priority_domains=priority_domains
+        )
+
+    for anchor in anchors:
+        try:
+            out[anchor.label] = await ingest_recipient_contracts(
+                recipient_names=tuple(anchor.usaspending_recipient_names),
+                canonical_hint=anchor.label,
+                display_label=anchor.label,
+                max_awards=max_awards,
+            )
+        except Exception:
+            logger.exception(
+                "usaspending registry ingest failed for %s", anchor.label
+            )
+            s = UsaSpendingStats()
+            s.errors = 1
+            out[anchor.label] = s
+    return out
+
+
 async def ingest_recipient_contracts(
     recipient_names: tuple[str, ...],
     canonical_hint: str,
