@@ -319,6 +319,53 @@ async def ingest_detention_industry_pacs(
     return out
 
 
+async def ingest_from_registry(
+    priority_domains: tuple[str, ...] | None = None,
+    max_disbursements: int = 200,
+) -> dict[str, FecStats]:
+    """P4 registry-driven ingest — sweep every ``anchor_registry`` row
+    the FEC ingester is scoped to see (via ``anchors_for_fec``).
+
+    For this PR (B) we drive off ``name_variants`` — same shape the
+    pre-P4 ``DETENTION_INDUSTRY_PACS`` constant used. External-ID-by-
+    committee-lookup (``fec_committee_ids`` → skip fuzzy search, go
+    straight to disbursements) is a follow-on refinement that needs a
+    deeper refactor of :func:`ingest_pac`'s inline fetch loop and lands
+    in a subsequent PR.
+    """
+    from app.db import get_sessionmaker
+    from app.services.anchor_registry import anchors_for_fec
+
+    out: dict[str, FecStats] = {}
+    sm = get_sessionmaker()
+    async with sm() as session:
+        anchors = await anchors_for_fec(session, priority_domains=priority_domains)
+
+    for anchor in anchors:
+        variants = tuple(anchor.name_variants) or tuple(
+            anchor.fec_committee_ids
+        )
+        if not variants:
+            logger.warning(
+                "anchor %s has no name_variants — skipping FEC pass",
+                anchor.label,
+            )
+            continue
+        try:
+            out[anchor.label] = await ingest_pac(
+                queries=variants,
+                match_tokens=variants,
+                display_label=anchor.label,
+                max_disbursements=max_disbursements,
+            )
+        except Exception:
+            logger.exception("registry ingest failed for %s", anchor.label)
+            s = FecStats()
+            s.errors = 1
+            out[anchor.label] = s
+    return out
+
+
 async def ingest_pac(
     queries: tuple[str, ...],
     match_tokens: tuple[str, ...],
