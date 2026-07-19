@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scheduled-sweep
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: scheduled-sweep
+spec:
+  # Weekly Monday 07:00 UTC (03:00 ET) — off-hours; FEC + LDA + SEC
+  # data cadence doesn't move faster than daily so weekly is enough.
+  schedule: "0 7 * * 1"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Skip a missed run rather than backfilling — the sweep is a full
+  # priority-domain refresh, not incremental.
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      # Sweep runs a network-bound fetch loop across 4 external APIs;
+      # cap at 90 min so a truly hung run is killed rather than
+      # blocking the following week.
+      activeDeadlineSeconds: 5400
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: sweep
+              image: registry.lan/argus/api:local
+              imagePullPolicy: Always
+              command:
+                - python
+                - -m
+                - app.services.ingest.scheduled_sweep
+              envFrom:
+                - secretRef:
+                    name: argus-env
+                - secretRef:
+                    name: argus-fec
+                    optional: true
+              resources:
+                requests:
+                  memory: "1Gi"
+                  cpu: "200m"
+                limits:
+                  # Reproject holds ~11k entities + edges in RAM +
+                  # Cypher round-trip buffers — 2Gi OOM'd on the first
+                  # live run. 6Gi is a generous ceiling with headroom.
+                  memory: "6Gi"
+                  cpu: "1000m"
