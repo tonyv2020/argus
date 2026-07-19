@@ -392,6 +392,13 @@ DETENTION_INDUSTRY_LDA_CLIENTS: tuple[str, ...] = (
     "CoreCivic",
     "Corrections Corporation of America",
     "Management and Training Corporation",
+    # Prison-telecom sub-industry (helen 2026-07-19 anchor extension).
+    # These are privately held (PE-owned) so no SEC — the LDA + FEC +
+    # USAspending triangle is our accountability surface for them.
+    "Securus Technologies",
+    "Aventiv Technologies",
+    "Global Tel Link",
+    "ViaPath Technologies",
 )
 
 

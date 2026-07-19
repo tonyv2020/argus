@@ -74,6 +74,41 @@ DETENTION_INDUSTRY_RECIPIENTS: dict[str, dict] = {
         ),
         "canonical_hint": "LaSalle Corrections",
     },
+    # Prison-telecom sub-industry (helen 2026-07-19 anchor extension).
+    "Securus Technologies": {
+        "recipient_names": (
+            "SECURUS TECHNOLOGIES INC",
+            "SECURUS TECHNOLOGIES LLC",
+            "SECURUS TECHNOLOGIES",
+        ),
+        "canonical_hint": "Securus Technologies",
+    },
+    "Aventiv Technologies": {
+        "recipient_names": (
+            "AVENTIV TECHNOLOGIES LLC",
+            "AVENTIV TECHNOLOGIES INC",
+            "AVENTIV TECHNOLOGIES",
+        ),
+        "canonical_hint": "Aventiv Technologies",
+    },
+    "Satellite Tracking of People": {
+        "recipient_names": (
+            "SATELLITE TRACKING OF PEOPLE LLC",
+            "SATELLITE TRACKING OF PEOPLE",
+            "STOP LLC",
+        ),
+        "canonical_hint": "Satellite Tracking of People",
+    },
+    "GTL / ViaPath": {
+        "recipient_names": (
+            "GLOBAL TEL LINK CORPORATION",
+            "GLOBAL TEL*LINK CORPORATION",
+            "GLOBAL TEL LINK",
+            "VIAPATH TECHNOLOGIES",
+            "VIAPATH TECHNOLOGIES LLC",
+        ),
+        "canonical_hint": "GTL / ViaPath",
+    },
 }
 # ICE + BOP — the detention-contract accountability beat (design §7).
 # USAspending uses the Awarding SUB-AGENCY for the actual bureau (ICE / BOP);

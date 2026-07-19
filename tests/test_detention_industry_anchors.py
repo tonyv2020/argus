@@ -85,3 +85,35 @@ def test_corecivic_has_historical_cca_alias():
     joined = " ".join(cc["queries"]).upper()
     assert "CORECIVIC" in joined
     assert "CCA" in joined or "CORRECTIONS CORPORATION" in joined
+
+
+def test_prison_telecom_anchors_in_fec_set():
+    """Helen 2026-07-19: prison-telecom sub-industry MUST be covered
+    (Securus + Aventiv + STOP + GTL/ViaPath). Detention operators would
+    not catch it."""
+    labels = set(fec.DETENTION_INDUSTRY_PACS)
+    assert labels >= {
+        "Securus Technologies",
+        "Aventiv Technologies",
+        "Satellite Tracking of People",
+        "GTL / ViaPath",
+    }
+
+
+def test_prison_telecom_anchors_in_usaspending_set():
+    labels = set(usaspending.DETENTION_INDUSTRY_RECIPIENTS)
+    assert labels >= {
+        "Securus Technologies",
+        "Aventiv Technologies",
+        "Satellite Tracking of People",
+        "GTL / ViaPath",
+    }
+
+
+def test_gtl_viapath_has_both_surface_names():
+    """GTL renamed to ViaPath Technologies in 2022 — both must appear
+    in the query list or a post-rename filing will miss the anchor."""
+    entry = fec.DETENTION_INDUSTRY_PACS["GTL / ViaPath"]
+    joined = " ".join(entry["queries"]).upper()
+    assert "GLOBAL TEL" in joined
+    assert "VIAPATH" in joined
