@@ -117,3 +117,19 @@ def test_gtl_viapath_has_both_surface_names():
     joined = " ".join(entry["queries"]).upper()
     assert "GLOBAL TEL" in joined
     assert "VIAPATH" in joined
+
+
+def test_usaspending_ingest_auto_seeds_missing_canonical():
+    """Prison-telecom anchors (Securus/Aventiv/STOP/GTL) are absent
+    from hollywood.entity_tags — the USAspending ingester must
+    auto-seed the canonical from the anchor hint rather than error
+    out with 'run P0 resolver first'."""
+    src = inspect.getsource(usaspending.ingest_recipient_contracts)
+    assert "_find_or_create_canonical" in src, (
+        "ingest_recipient_contracts must fall through to auto-seed when the "
+        "canonical is missing — prison-telecom P0 seed will not land it"
+    )
+    assert "usaspending.anchor" in src or "anchor" in src.lower(), (
+        "auto-seed path must use a distinctive source_system so the alias-keyed "
+        "lookup on rerun stays idempotent"
+    )
