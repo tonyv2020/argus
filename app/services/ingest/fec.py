@@ -688,15 +688,13 @@ async def ingest_individual_contributors_from_registry(
     that shape (news uses "Peter Thiel"; FEC uses "THIEL, PETER").
     """
     from app.db import get_sessionmaker as _sm
-    from app.services.anchor_registry import list_anchors
+    from app.services.anchor_registry import anchors_for_fec_individual
 
     out: dict[str, FecStats] = {}
     sm = _sm()
     async with sm() as session:
-        anchors = await list_anchors(
-            session,
-            priority_domains=priority_domains,
-            entity_types=("person",),
+        anchors = await anchors_for_fec_individual(
+            session, priority_domains=priority_domains
         )
 
     for anchor in anchors:

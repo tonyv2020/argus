@@ -53,8 +53,10 @@ def test_registry_dispatch_transforms_first_last_to_fec_shape() -> None:
 
 def test_registry_dispatch_filters_to_person_entity_type() -> None:
     """Individual-contributor mode operates on persons only — orgs
-    have their own PAC-disbursement path."""
+    have their own PAC-disbursement path. Dispatch goes through
+    ``anchors_for_fec_individual`` which is defined to filter
+    ``entity_type='person'`` at the anchor-registry layer."""
     src = inspect.getsource(fec.ingest_individual_contributors_from_registry)
-    assert '"person"' in src or "'person'" in src, (
-        "dispatch must scope its anchor read to entity_type='person'"
+    assert "anchors_for_fec_individual" in src, (
+        "dispatch must use the person-only anchor filter"
     )

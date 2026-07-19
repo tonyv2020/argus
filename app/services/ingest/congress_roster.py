@@ -36,6 +36,8 @@ import yaml
 
 from app.db import get_sessionmaker
 from app.services.anchor_registry import upsert_anchor
+from app.services.ingest.fec import _upsert_entity as _upsert_person_canonical
+from app.models import EntityType
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,9 @@ class RosterStats:
     house_members: int = 0
     senate_members: int = 0
     fec_candidate_ids_attached: int = 0
+    person_canonicals_created: int = 0
+    bioguide_aliases_created: int = 0
+    fec_candidate_aliases_created: int = 0
     errors: int = 0
 
 
@@ -162,6 +167,40 @@ async def ingest_roster() -> RosterStats:
                     f"{district_str} bioguide={bioguide}"
                 )
 
+                # Materialize a CanonicalEntity(person) + aliases so
+                # roll-call votes + FEC contributions resolve back to the
+                # member. anchor_registry rows alone don't touch the graph;
+                # helen 2026-07-19 flagged that.
+                canonical_id: str | None = None
+                if bioguide:
+                    canonical_id = await _upsert_person_canonical(
+                        session,
+                        label,
+                        EntityType.PERSON.value,
+                        "bioguide",
+                        bioguide,
+                        kind_hint="person",
+                    )
+                    stats.bioguide_aliases_created += 1
+                # Each fec.candidate id becomes its own alias on the same
+                # canonical — a member with multiple runs (S8TX00232 +
+                # S6TX00298) has multiple ids all pointing at the same
+                # person.
+                for fec_id in fec_ids:
+                    canonical_from_fec = await _upsert_person_canonical(
+                        session,
+                        label,
+                        EntityType.PERSON.value,
+                        "fec.candidate",
+                        fec_id,
+                        kind_hint="person",
+                    )
+                    if canonical_id is None:
+                        canonical_id = canonical_from_fec
+                    stats.fec_candidate_aliases_created += 1
+                if canonical_id is not None:
+                    stats.person_canonicals_created += 1
+
                 await upsert_anchor(
                     session,
                     label=label,
@@ -170,6 +209,7 @@ async def ingest_roster() -> RosterStats:
                     fec_candidate_ids=tuple(fec_ids),
                     name_variants=tuple(variants),
                     surface_mode="open",
+                    canonical_id=canonical_id,
                     notes=notes,
                 )
                 stats.members_upserted += 1

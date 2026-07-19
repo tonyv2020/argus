@@ -93,15 +93,27 @@ def _patch_list_anchors(monkeypatch, anchors_seed):
 
 
 @pytest.mark.asyncio
-async def test_fec_filter_includes_committee_ids_and_name_variants() -> None:
-    """FEC ingester needs anything with either a committee-id crosswalk
-    OR a name-search fallback. Palantir has no FEC committee id nor name
-    variants → excluded. Thiel has name variants (individual-contributor
-    mode dispatches to a different endpoint but the anchor stays in-scope
-    for the FEC domain by having name variants)."""
+async def test_fec_filter_excludes_persons() -> None:
+    """FEC PAC-mode ingester operates on orgs + pacs — NEVER on persons.
+    The full-sweep 429'd on 537 congress name-searches when the filter
+    let persons through (helen 2026-07-19 20:00 UTC). Persons go through
+    ``anchors_for_fec_individual`` → Schedule A only."""
     got = await anchors_for_fec(_FakeSession())
     labels = {a.label for a in got}
-    assert labels == {"GEO Group", "Peter Thiel", "America PAC"}, labels
+    assert labels == {"GEO Group", "America PAC"}
+    assert "Peter Thiel" not in labels
+
+
+@pytest.mark.asyncio
+async def test_fec_individual_filter_isolates_persons() -> None:
+    """Persons go through Schedule A only — this filter returns exactly
+    the person anchors so the sweep can dispatch them to the individual-
+    contributor path."""
+    from app.services.anchor_registry import anchors_for_fec_individual
+
+    got = await anchors_for_fec_individual(_FakeSession())
+    labels = {a.label for a in got}
+    assert labels == {"Peter Thiel"}
 
 
 @pytest.mark.asyncio
