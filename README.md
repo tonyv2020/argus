@@ -30,6 +30,10 @@ Cytoscape viz). It shares zero code — own repo, own DB, own deploy.
 - **P2** — profile + expandable Cytoscape UI; GEO Group profile end-to-end; live on achilles k3s
   (namespace `argus`, LAN-registry images).
 - **P3** — Senate LDA + corporate registry + broaden past GEO Group.
+- **P3b/P4 (coverage expansion, 2026-07-19)** — parameterized FEC + USAspending
+  ingesters over the detention-industry anchor set (GEO Group + CoreCivic +
+  Management & Training Corp + LaSalle Corrections). Back-compat GEO-only
+  wrappers retained. Design: `helen-k3s/docs/argus-coverage-expansion-design.md`.
 
 ## The Scrutiny Agent (P1)
 

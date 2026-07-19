@@ -81,8 +81,26 @@ class SenateLdaStats:
 
 
 async def _lda_get(client: httpx.AsyncClient, path: str, **params) -> dict:
-    """One GET to lda.senate.gov; returns parsed JSON. Raises on non-2xx."""
-    r = await client.get(f"{_LDA_BASE}{path}", params=params)
+    """One GET to lda.senate.gov; returns parsed JSON. Raises on non-2xx.
+
+    Handles 429 with exponential backoff (2s, 4s, 8s, up to 5 attempts)
+    honouring a Retry-After header when present. lda.senate.gov throttles
+    aggressively on a multi-anchor sweep — see
+    ``helen-k3s/docs/argus-coverage-expansion-design.md`` rate-limits.
+    """
+    import asyncio
+
+    delay = 2.0
+    for attempt in range(5):
+        r = await client.get(f"{_LDA_BASE}{path}", params=params)
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after and retry_after.isdigit() else delay
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, 60.0)
+            continue
+        r.raise_for_status()
+        return r.json()
     r.raise_for_status()
     return r.json()
 

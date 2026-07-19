@@ -98,3 +98,56 @@ def test_detention_industry_anchors_are_deduplicated_by_name() -> None:
     from app.services.ingest.senate_lda import DETENTION_INDUSTRY_LDA_CLIENTS
 
     assert len(set(DETENTION_INDUSTRY_LDA_CLIENTS)) == len(DETENTION_INDUSTRY_LDA_CLIENTS)
+
+
+def test_lda_get_retries_on_429_then_returns_payload() -> None:
+    """A single 429 with a Retry-After header should be retried, not raised —
+    lda.senate.gov aggressively throttles multi-anchor sweeps. The 4-anchor
+    2026-07-19 run 429'd on MTC page 2 with no backoff; the retry loop must
+    honour Retry-After when present and fall back to exponential otherwise."""
+    import asyncio
+
+    import httpx
+
+    from app.services.ingest.senate_lda import _lda_get
+
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(len(calls))
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        return httpx.Response(200, json={"results": ["ok"], "count": 1})
+
+    async def run() -> dict:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            return await _lda_get(client, "/filings/", page=1)
+
+    payload = asyncio.run(run())
+    assert payload == {"results": ["ok"], "count": 1}
+    assert len(calls) == 2
+
+
+def test_lda_get_gives_up_after_repeated_429s() -> None:
+    """The retry loop is bounded — after 5 straight 429s, raise so the
+    caller sees the throttle instead of hanging forever."""
+    import asyncio
+
+    import httpx
+    import pytest
+
+    from app.services.ingest.senate_lda import _lda_get
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "0"})
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            await _lda_get(client, "/filings/", page=1)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(run())
