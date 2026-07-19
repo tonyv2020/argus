@@ -44,8 +44,41 @@ logger = logging.getLogger(__name__)
 _FEC_BASE = "https://api.open.fec.gov/v1"
 _DEFAULT_KEY = "DEMO_KEY"
 
-# GEO Group's known FEC name variants — used to find the PAC.
+# GEO Group's known FEC name variants — kept for back-compat with any
+# callers still using the specialized GEO entrypoint.
 _GEO_PAC_NAME_QUERIES = ("GEO GROUP INC PAC", "GEO GROUP", "GEO GROUP INC")
+
+
+# P1 (2026-07-19) — detention-industry anchor set.  Extended from the
+# single GEO Group anchor to CoreCivic + MTC + LaSalle so their PAC
+# contributions land in the graph too.  Each entry is a tuple of
+# committee-name-search queries.  Every query hits the FEC committee
+# search independently; the first result whose name contains ANY of
+# the ``match`` tokens is treated as the PAC for that anchor.  Keeps
+# the same lookup shape ``find_geo_group_pac`` used but generalizes
+# it, per design §2.P1.
+DETENTION_INDUSTRY_PACS: dict[str, dict] = {
+    "GEO Group": {
+        "queries": ("GEO GROUP INC PAC", "GEO GROUP", "GEO GROUP INC"),
+        "match": ("GEO GROUP",),
+    },
+    "CoreCivic": {
+        # Historical CCA PAC name + current CoreCivic PAC name.
+        "queries": ("CORECIVIC INC PAC", "CORECIVIC PAC", "CCA PAC",
+                    "CORRECTIONS CORPORATION OF AMERICA"),
+        "match": ("CORECIVIC", "CCA PAC", "CORRECTIONS CORPORATION"),
+    },
+    "Management & Training Corp": {
+        "queries": ("MANAGEMENT AND TRAINING CORP", "MTC PAC",
+                    "MANAGEMENT & TRAINING CORPORATION"),
+        "match": ("MANAGEMENT AND TRAINING", "MANAGEMENT & TRAINING", "MTC"),
+    },
+    "LaSalle Corrections": {
+        "queries": ("LASALLE CORRECTIONS", "LASALLE MANAGEMENT",
+                    "LASALLE SOUTHWEST CORRECTIONS"),
+        "match": ("LASALLE",),
+    },
+}
 
 
 @dataclass
@@ -78,13 +111,31 @@ async def _fec_get(client: httpx.AsyncClient, path: str, **params) -> dict:
 async def find_geo_group_pac(client: httpx.AsyncClient) -> dict | None:
     """Return the first FEC committee record matching a known GEO Group PAC name.
 
-    Committee shape from FEC: `{committee_id, name, party, committee_type, ...}`.
+    Kept for back-compat.  New callers use :func:`find_pac_by_queries` with
+    the appropriate entry from :data:`DETENTION_INDUSTRY_PACS`.
     """
-    for q in _GEO_PAC_NAME_QUERIES:
+    entry = DETENTION_INDUSTRY_PACS["GEO Group"]
+    return await find_pac_by_queries(client, entry["queries"], entry["match"])
+
+
+async def find_pac_by_queries(
+    client: httpx.AsyncClient,
+    queries: tuple[str, ...],
+    match_tokens: tuple[str, ...],
+) -> dict | None:
+    """Generic FEC-committee finder used by the P1 detention-industry set.
+
+    ``queries`` is the list of committee-search strings to try in order
+    (FEC's ``q`` accepts a name substring).  ``match_tokens`` are the
+    uppercase substrings we require in the returned committee name to
+    accept a row — guards against unrelated committees whose names
+    happen to appear in the search results.
+    """
+    for q in queries:
         payload = await _fec_get(client, "/committees/", q=q, per_page=5)
         for row in payload.get("results", []):
             name_upper = (row.get("name") or "").upper()
-            if "GEO GROUP" in name_upper:
+            if any(tok in name_upper for tok in match_tokens):
                 return row
     return None
 
@@ -208,23 +259,70 @@ async def _emit_contribution_edge(
 
 
 async def ingest_geo_group_pac(max_disbursements: int = 200) -> FecStats:
-    """Fetch GEO Group's PAC, its recent disbursements, and materialise the edges.
+    """Back-compat wrapper — ingest ONLY GEO Group PAC.
 
-    Bounded by `max_disbursements` so a DEMO_KEY-throttled run finishes cleanly;
-    resumability is achieved via the unique alias key on `source_id` (transaction
-    sub_id) — reruns skip already-cited edges.
+    Prefer :func:`ingest_pac` with a specific anchor or
+    :func:`ingest_detention_industry_pacs` for the full set.
+    """
+    return await ingest_pac(
+        queries=DETENTION_INDUSTRY_PACS["GEO Group"]["queries"],
+        match_tokens=DETENTION_INDUSTRY_PACS["GEO Group"]["match"],
+        display_label="GEO Group",
+        max_disbursements=max_disbursements,
+    )
+
+
+async def ingest_detention_industry_pacs(
+    max_disbursements: int = 200,
+) -> dict[str, FecStats]:
+    """P1: ingest the whole detention-industry PAC set.
+
+    Returns a per-anchor mapping of :class:`FecStats` so callers see
+    which anchor lit up which counters.  Each anchor's failure is
+    isolated — one missing committee doesn't sink the batch.
+    """
+    out: dict[str, FecStats] = {}
+    for label, entry in DETENTION_INDUSTRY_PACS.items():
+        try:
+            out[label] = await ingest_pac(
+                queries=entry["queries"],
+                match_tokens=entry["match"],
+                display_label=label,
+                max_disbursements=max_disbursements,
+            )
+        except Exception:
+            logger.exception("ingest failed for anchor %s", label)
+            s = FecStats()
+            s.errors = 1
+            out[label] = s
+    return out
+
+
+async def ingest_pac(
+    queries: tuple[str, ...],
+    match_tokens: tuple[str, ...],
+    display_label: str,
+    max_disbursements: int = 200,
+) -> FecStats:
+    """Fetch ONE PAC (via ``queries``/``match_tokens``), its recent
+    disbursements, and materialise the edges — parameterized version of
+    the legacy GEO-only entrypoint.
+
+    Bounded by `max_disbursements` so a DEMO_KEY-throttled run finishes
+    cleanly; resumability is via the unique alias key on `source_id`
+    (transaction sub_id) — reruns skip already-cited edges.
     """
     stats = FecStats()
     sm = get_sessionmaker()
     async with httpx.AsyncClient(timeout=15.0) as client:
-        pac = await find_geo_group_pac(client)
+        pac = await find_pac_by_queries(client, queries, match_tokens)
         if pac is None:
-            logger.error("GEO Group PAC not found in FEC committee search")
+            logger.error("%s PAC not found in FEC committee search", display_label)
             return stats
         stats.pacs_found = 1
         committee_id = pac["committee_id"]
         pac_name = pac["name"]
-        logger.info("found GEO Group PAC: %s (%s)", pac_name, committee_id)
+        logger.info("found %s PAC: %s (%s)", display_label, pac_name, committee_id)
 
         async with sm() as session:
             pac_canonical = await _upsert_entity(
@@ -305,10 +403,37 @@ async def ingest_geo_group_pac(max_disbursements: int = 200) -> FecStats:
 
 
 def main() -> None:
-    """CLI entrypoint — python -m app.services.ingest.fec."""
+    """CLI entrypoint — python -m app.services.ingest.fec [anchor|--all].
+
+    Default runs the full detention-industry anchor set (§P1).  Pass
+    an anchor label (``GEO Group`` / ``CoreCivic`` / ``Management &
+    Training Corp`` / ``LaSalle Corrections``) to run only that one.
+    """
+    import sys
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    stats = asyncio.run(ingest_geo_group_pac())
-    logger.info("fec ingest done: %s", stats)
+    arg = " ".join(sys.argv[1:]).strip() or "--all"
+    if arg in ("--all", "all", ""):
+        results = asyncio.run(ingest_detention_industry_pacs())
+        for label, stats in results.items():
+            logger.info("[%s] fec ingest done: %s", label, stats)
+    elif arg in DETENTION_INDUSTRY_PACS:
+        entry = DETENTION_INDUSTRY_PACS[arg]
+        stats = asyncio.run(
+            ingest_pac(
+                queries=entry["queries"],
+                match_tokens=entry["match"],
+                display_label=arg,
+            )
+        )
+        logger.info("[%s] fec ingest done: %s", arg, stats)
+    else:
+        logger.error(
+            "unknown anchor %r; choose from %s or --all",
+            arg,
+            sorted(DETENTION_INDUSTRY_PACS),
+        )
+        sys.exit(2)
 
 
 if __name__ == "__main__":
