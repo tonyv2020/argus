@@ -263,6 +263,48 @@ class LlmUsage(Base):
     )
 
 
+class AliasCrosswalk(Base):
+    """P2 — one row per curated merge decision.
+
+    ``from_id`` will be merged INTO ``to_id`` when the merge pass runs.
+    ``applied_at`` is NULL for pending rows; set after re-pointing
+    completes.
+
+    Fail-closed on surface_mode (spec §3): the surviving canonical
+    inherits the MOST-protected surface_mode across the pair. See
+    migration 0005_alias_crosswalk for the column shape.
+    """
+
+    __tablename__ = "alias_crosswalk"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    from_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("canonical_entities.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    to_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("canonical_entities.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Frozen copies survive canonical delete — SET NULL removes the FKs
+    # but the audit trail keeps its original references.
+    from_id_frozen: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    to_id_frozen: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class AnchorRegistry(Base):
     """P4 — the shared anchor registry.
 
