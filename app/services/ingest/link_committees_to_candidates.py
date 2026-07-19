@@ -108,15 +108,36 @@ async def bridge_all(max_committees: int = 5000) -> BridgeStats:
     stats = BridgeStats()
     sm = get_sessionmaker()
 
-    # Fetch every (committee_id, canonical_id) via aliases.
+    # Fetch every (committee_id, canonical_id) via aliases:
+    # * fec.committee — the sponsoring PAC we ingested via PAC-mode
+    # * fec.disbursement.recipient — recipient committees ingested as
+    #   contribution TARGETS in ingest_pac. Their source_id is the
+    #   FEC committee id when the recipient was a committee (not a
+    #   candidate) — filter on the leading "C".
     async with sm() as session:
-        rows = (
+        rows_pac = (
             await session.execute(
                 select(EntityAlias.source_id, EntityAlias.canonical_id)
                 .where(EntityAlias.source_system == "fec.committee")
+            )
+        ).all()
+        rows_recip = (
+            await session.execute(
+                select(EntityAlias.source_id, EntityAlias.canonical_id)
+                .where(EntityAlias.source_system == "fec.disbursement.recipient")
+                .where(EntityAlias.source_id.like("C%"))
                 .limit(max_committees)
             )
         ).all()
+    # Dedupe on committee_id (a canonical may carry both aliases if it
+    # was ingested from multiple angles).
+    seen: set[str] = set()
+    rows: list[tuple[str, str]] = []
+    for cid, canon in list(rows_pac) + list(rows_recip):
+        if cid in seen:
+            continue
+        seen.add(cid)
+        rows.append((cid, canon))
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         for committee_id, committee_canonical in rows:
