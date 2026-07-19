@@ -316,8 +316,50 @@ _MUSK_NETWORK: tuple[SeedRow, ...] = (
 )
 
 
+# P5.2 — party committees. NRSC/NRCC = Republican, DSCC/DCCC =
+# Democratic. Committee IDs verified live 2026-07-19 via
+# /names/committees/. Their PAC contributions flow ENTIRELY to their
+# party's candidates; capturing them is the missing "party-level giving"
+# side of the influence model.
+_PARTY_COMMITTEES: tuple[SeedRow, ...] = (
+    SeedRow(
+        label="National Republican Senatorial Committee",
+        entity_type="pac",
+        priority_domain="party_committees",
+        fec_committee_ids=("C00027466",),   # NRSC
+        name_variants=("NRSC", "National Republican Senatorial Committee"),
+        notes="party=Republican chamber=Senate",
+    ),
+    SeedRow(
+        label="National Republican Congressional Committee",
+        entity_type="pac",
+        priority_domain="party_committees",
+        fec_committee_ids=("C00075820",),   # NRCC
+        name_variants=("NRCC", "National Republican Congressional Committee"),
+        notes="party=Republican chamber=House",
+    ),
+    SeedRow(
+        label="Democratic Senatorial Campaign Committee",
+        entity_type="pac",
+        priority_domain="party_committees",
+        fec_committee_ids=("C00042366",),   # DSCC
+        name_variants=("DSCC", "Democratic Senatorial Campaign Committee"),
+        notes="party=Democratic chamber=Senate",
+    ),
+    SeedRow(
+        label="Democratic Congressional Campaign Committee",
+        entity_type="pac",
+        priority_domain="party_committees",
+        fec_committee_ids=("C00000935",),   # DCCC
+        name_variants=("DCCC", "Democratic Congressional Campaign Committee"),
+        notes="party=Democratic chamber=House",
+    ),
+)
+
+
 _ALL_SEED: tuple[SeedRow, ...] = (
     _DETENTION_OPERATORS + _PRISON_TELECOM + _SURVEILLANCE + _MUSK_NETWORK
+    + _PARTY_COMMITTEES
 )
 
 

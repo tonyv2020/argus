@@ -308,6 +308,7 @@ async def ingest_detention_industry_contracts(
 async def ingest_from_registry(
     priority_domains: tuple[str, ...] | None = None,
     max_awards: int = 200,
+    broaden_agency_scope: bool = False,
 ) -> dict[str, UsaSpendingStats]:
     """P4 registry-driven ingest — sweep every ``anchor_registry`` row
     the USAspending ingester is scoped to see (via
@@ -334,6 +335,7 @@ async def ingest_from_registry(
                 canonical_hint=anchor.label,
                 display_label=anchor.label,
                 max_awards=max_awards,
+                broaden_agency_scope=broaden_agency_scope,
             )
         except Exception:
             logger.exception(
@@ -350,9 +352,15 @@ async def ingest_recipient_contracts(
     canonical_hint: str,
     display_label: str,
     max_awards: int = 200,
+    broaden_agency_scope: bool = False,
 ) -> UsaSpendingStats:
-    """Fetch ONE recipient's contracts from ICE/BOP/USMS + emit
-    HOLDS_CONTRACT edges."""
+    """Fetch ONE recipient's contracts + emit HOLDS_CONTRACT edges.
+
+    Default scope: ICE / BOP / USMS (detention beat). When
+    ``broaden_agency_scope=True``, accept EVERY awarding sub-agency —
+    Tesla/SpaceX NASA + DoD contracts land through this path (helen
+    2026-07-19 P4 validation note).
+    """
     stats = UsaSpendingStats()
     sm = get_sessionmaker()
     async with sm() as session:
@@ -411,7 +419,12 @@ async def ingest_recipient_contracts(
                     top_agency = (r.get("Awarding Agency") or "").upper()
                     matched = next((a for a in _TARGET_AGENCIES if a in sub_agency), None)
                     if not matched:
-                        continue
+                        if not broaden_agency_scope:
+                            continue
+                        # Broadened mode — accept any sub-agency; use the
+                        # actual string as the anchor label so NASA/DoD
+                        # etc. surface distinctly.
+                        matched = sub_agency or top_agency or "UNKNOWN"
                     stats.agencies_matched += 1
                     award_id = r.get("generated_internal_id") or r.get("Award ID")
                     if not award_id:
