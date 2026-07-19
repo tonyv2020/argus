@@ -342,22 +342,39 @@ async def ingest_from_registry(
         anchors = await anchors_for_fec(session, priority_domains=priority_domains)
 
     for anchor in anchors:
-        variants = tuple(anchor.name_variants) or tuple(
-            anchor.fec_committee_ids
-        )
-        if not variants:
-            logger.warning(
-                "anchor %s has no name_variants — skipping FEC pass",
-                anchor.label,
-            )
-            continue
         try:
-            out[anchor.label] = await ingest_pac(
-                queries=variants,
-                match_tokens=variants,
-                display_label=anchor.label,
-                max_disbursements=max_disbursements,
-            )
+            if anchor.fec_committee_ids:
+                # External-ID path — one call per committee (a company may
+                # have PAC + super-PAC + affiliated committees). Aggregate
+                # counters into a single FecStats for the anchor.
+                agg = FecStats()
+                for cid in anchor.fec_committee_ids:
+                    partial = await ingest_pac(
+                        committee_id=cid,
+                        display_label=anchor.label,
+                        max_disbursements=max_disbursements,
+                    )
+                    agg.pacs_found += partial.pacs_found
+                    agg.disbursements_fetched += partial.disbursements_fetched
+                    agg.recipients_created += partial.recipients_created
+                    agg.recipients_matched += partial.recipients_matched
+                    agg.edges_created += partial.edges_created
+                    agg.edges_reused += partial.edges_reused
+                    agg.citations_created += partial.citations_created
+                    agg.errors += partial.errors
+                out[anchor.label] = agg
+            elif anchor.name_variants:
+                out[anchor.label] = await ingest_pac(
+                    queries=tuple(anchor.name_variants),
+                    match_tokens=tuple(anchor.name_variants),
+                    display_label=anchor.label,
+                    max_disbursements=max_disbursements,
+                )
+            else:
+                logger.warning(
+                    "anchor %s has no fec_committee_ids nor name_variants — skipping",
+                    anchor.label,
+                )
         except Exception:
             logger.exception("registry ingest failed for %s", anchor.label)
             s = FecStats()
@@ -367,14 +384,23 @@ async def ingest_from_registry(
 
 
 async def ingest_pac(
-    queries: tuple[str, ...],
-    match_tokens: tuple[str, ...],
-    display_label: str,
+    queries: tuple[str, ...] = (),
+    match_tokens: tuple[str, ...] = (),
+    display_label: str = "",
     max_disbursements: int = 200,
+    committee_id: str | None = None,
 ) -> FecStats:
-    """Fetch ONE PAC (via ``queries``/``match_tokens``), its recent
-    disbursements, and materialise the edges — parameterized version of
-    the legacy GEO-only entrypoint.
+    """Fetch ONE PAC and materialise its recent disbursements as edges.
+
+    Two resolution paths:
+
+    * ``committee_id`` (external-ID) — skip the fuzzy name search + fetch
+      the committee directly via ``/committee/{id}``. This is the P4
+      correctness win: "AMERICA PAC" the name matches the FXAIX mutual
+      fund via committee-search but ``C00838163`` (the actual Musk PAC)
+      is unambiguous.
+    * ``queries`` / ``match_tokens`` (name-search fallback) — the legacy
+      pre-P4 path. Kept for anchors with no committee id.
 
     Bounded by `max_disbursements` so a DEMO_KEY-throttled run finishes
     cleanly; resumability is via the unique alias key on `source_id`
@@ -383,10 +409,32 @@ async def ingest_pac(
     stats = FecStats()
     sm = get_sessionmaker()
     async with httpx.AsyncClient(timeout=15.0) as client:
-        pac = await find_pac_by_queries(client, queries, match_tokens)
-        if pac is None:
-            logger.error("%s PAC not found in FEC committee search", display_label)
-            return stats
+        if committee_id is not None:
+            # External-ID lookup — no fuzzy search.
+            try:
+                payload = await _fec_get(
+                    client, f"/committee/{committee_id}/"
+                )
+            except Exception:
+                logger.exception(
+                    "%s FEC committee lookup by id=%s failed",
+                    display_label, committee_id,
+                )
+                stats.errors = 1
+                return stats
+            results = payload.get("results") or []
+            if not results:
+                logger.error(
+                    "%s FEC committee id=%s not found",
+                    display_label, committee_id,
+                )
+                return stats
+            pac = results[0]
+        else:
+            pac = await find_pac_by_queries(client, queries, match_tokens)
+            if pac is None:
+                logger.error("%s PAC not found in FEC committee search", display_label)
+                return stats
         stats.pacs_found = 1
         committee_id = pac["committee_id"]
         pac_name = pac["name"]

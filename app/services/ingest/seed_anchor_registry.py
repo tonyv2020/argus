@@ -274,9 +274,12 @@ _MUSK_NETWORK: tuple[SeedRow, ...] = (
         label="America PAC",
         entity_type="pac",
         priority_domain="musk_network",
-        fec_committee_ids=("C00838163",),
+        # C00879510 — verified live 2026-07-19 via
+        # /names/committees/?q=america pac (id C00838163 in initial seed
+        # was wrong; the real Musk super-PAC's committee_id is 879510).
+        fec_committee_ids=("C00879510",),
         name_variants=("America PAC",),
-        notes="Musk-funded super-PAC. External-ID keyed (name search hits FXAIX fund).",
+        notes="Musk-funded super-PAC. External-ID keyed (name search hits FXAIX + 401(k) America PAC + others).",
     ),
     SeedRow(
         label="X Corp",
