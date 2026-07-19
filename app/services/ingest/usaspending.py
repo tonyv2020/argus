@@ -317,13 +317,26 @@ async def ingest_recipient_contracts(
     sm = get_sessionmaker()
     async with sm() as session:
         geo_canonical = await _find_recipient_canonical(session, canonical_hint)
-    if geo_canonical is None:
-        logger.error(
-            "%s canonical not found in argus (hint=%r) — run P0 resolver first",
-            display_label,
-            canonical_hint,
-        )
-        return stats
+        if geo_canonical is None:
+            # helen 2026-07-19: prison-telecom sub-industry is entirely absent
+            # from hollywood.entity_tags (Securus/Aventiv/STOP = 0 entities).
+            # Auto-seed an ORGANIZATION canonical from the anchor hint so the
+            # USAspending edges can attach. Idempotent: the alias-keyed lookup
+            # in _find_or_create_canonical returns the same id on rerun.
+            geo_canonical = await _find_or_create_canonical(
+                session,
+                surface_name=canonical_hint,
+                entity_type=EntityType.ORGANIZATION.value,
+                source_system="usaspending.anchor",
+                source_id=canonical_hint,
+            )
+            await session.commit()
+            logger.info(
+                "%s: seeded canonical %s from anchor hint %r",
+                display_label,
+                geo_canonical,
+                canonical_hint,
+            )
 
     body = {
         "filters": {
