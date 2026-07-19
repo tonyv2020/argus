@@ -624,3 +624,43 @@ async def get_entity_subgraph(
         if e["data"]["source"] not in suppressed_ids and e["data"]["target"] not in suppressed_ids
     ]
     return {"nodes": kept_nodes, "edges": kept_edges}
+
+
+@app.get("/api/flow/model1")
+async def flow_model1(
+    party: str = Query(..., description="Republican / Democratic / Independent"),
+    agency_relation: str = Query(
+        "holds_contract",
+        description="Edge relation to sum for the 'contract $' side (default: holds_contract)",
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """P5.3 Model 1 (INFLUENCE) flow query — cited $ correlation
+    between contributors to a party + their federal-contract receipts.
+
+    Framing (spec §5): correlation, NOT causation. Every $ in this
+    response is a sum of edge weights, each backed by a citation.
+    """
+    from app.services.flow_query import model1_flow
+
+    summary = await model1_flow(
+        db, party=party, agency_relation=agency_relation, limit=limit
+    )
+    return {
+        "party": summary.party,
+        "agency_relation": agency_relation,
+        "n_contributors": summary.n_contributors,
+        "total_contrib_usd": summary.total_contrib,
+        "total_contract_usd": summary.total_contract,
+        "framing": "cited $ correlation, not causation (spec §5)",
+        "rows": [
+            {
+                "entity_id": r.entity_id,
+                "entity_label": r.entity_label,
+                "contrib_usd": r.contrib_total,
+                "contract_usd": r.contract_total,
+            }
+            for r in summary.rows
+        ],
+    }

@@ -34,10 +34,13 @@ from typing import Any
 import httpx
 import yaml
 
+from sqlalchemy import select
+
 from app.db import get_sessionmaker
 from app.services.anchor_registry import upsert_anchor
 from app.services.ingest.fec import _upsert_entity as _upsert_person_canonical
-from app.models import EntityType
+from app.models import EntityAlias, EntityType
+from app.services.graph.base import normalize_name
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,9 @@ class RosterStats:
     person_canonicals_created: int = 0
     bioguide_aliases_created: int = 0
     fec_candidate_aliases_created: int = 0
+    # P5.2 — party attribution: one alias per member with
+    # source_system='party' + surface_name='Democratic'/'Republican'/…
+    party_aliases_created: int = 0
     errors: int = 0
 
 
@@ -200,6 +206,32 @@ async def ingest_roster() -> RosterStats:
                     stats.fec_candidate_aliases_created += 1
                 if canonical_id is not None:
                     stats.person_canonicals_created += 1
+                    # P5.2 — attach party as an EntityAlias directly on
+                    # the member canonical (not via _upsert_entity, which
+                    # would create a new canonical named "Democratic").
+                    # Idempotent: dedupe on (canonical_id, source_system,
+                    # source_id).
+                    if party and bioguide:
+                        existing = (
+                            await session.execute(
+                                select(EntityAlias).where(
+                                    EntityAlias.canonical_id == canonical_id,
+                                    EntityAlias.source_system == "party",
+                                    EntityAlias.source_id == bioguide,
+                                )
+                            )
+                        ).scalar_one_or_none()
+                        if existing is None:
+                            session.add(
+                                EntityAlias(
+                                    canonical_id=canonical_id,
+                                    source_system="party",
+                                    source_id=bioguide,
+                                    surface_name=party,
+                                    surface_name_normalized=normalize_name(party) or party.lower(),
+                                )
+                            )
+                            stats.party_aliases_created += 1
 
                 await upsert_anchor(
                     session,
