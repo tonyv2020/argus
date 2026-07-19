@@ -218,9 +218,14 @@ async def apply_pending(dry_run: bool = False) -> MergeStats:
             if row is None:
                 continue
             if dry_run:
+                # Exercise the fail-closed check + report — no DB writes.
+                # Helen's P2 H adversarial test requires this so a
+                # SUPPRESS→OPEN merge in the queue increments
+                # refused_privacy WITHOUT touching prod (2026-07-19 20:53Z).
+                verdict = await _preview_one(session, row, stats)
                 logger.info(
-                    "DRY-RUN would merge %s → %s reason=%s",
-                    row.from_id, row.to_id, row.reason,
+                    "DRY-RUN %s → %s: %s (%s)",
+                    row.from_id, row.to_id, verdict, row.reason,
                 )
                 continue
             try:
@@ -233,6 +238,44 @@ async def apply_pending(dry_run: bool = False) -> MergeStats:
                 )
                 stats.errors += 1
     return stats
+
+
+async def _preview_one(
+    session: AsyncSession, row: AliasCrosswalk, stats: MergeStats
+) -> str:
+    """Simulate ``_apply_one`` for dry-run — exercises the fail-closed
+    check + updates ``refused_privacy`` / stats counters, but performs
+    NO DB writes. Returns a short verdict string."""
+    src = (
+        await session.execute(
+            select(CanonicalEntity).where(CanonicalEntity.id == row.from_id)
+        )
+    ).scalar_one_or_none()
+    dst = (
+        await session.execute(
+            select(CanonicalEntity).where(CanonicalEntity.id == row.to_id)
+        )
+    ).scalar_one_or_none()
+
+    if src is None or dst is None:
+        return "SKIP (from or to missing)"
+
+    if _SURFACE_MODE_STRICTNESS[src.surface_mode] > _SURFACE_MODE_STRICTNESS[
+        dst.surface_mode
+    ]:
+        stats.refused_privacy += 1
+        return (
+            f"REFUSED (privacy) src.surface_mode={src.surface_mode} > "
+            f"dst.surface_mode={dst.surface_mode}"
+        )
+
+    survivor_mode = _most_protected(src.surface_mode, dst.surface_mode)
+    if survivor_mode != dst.surface_mode:
+        return (
+            f"WOULD ESCALATE dst.surface_mode {dst.surface_mode} → "
+            f"{survivor_mode}, then merge"
+        )
+    return "WOULD APPLY"
 
 
 def main() -> None:
