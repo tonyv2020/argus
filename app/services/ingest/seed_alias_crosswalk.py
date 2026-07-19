@@ -68,6 +68,16 @@ _CURATED: tuple[tuple[str, str, str], ...] = (
         "Palantir Technologies Inc.",
         "News short-form; both refer to the same PLTR (CIK 1321655) issuer",
     ),
+    # Sponsor-org / news-org fragments (P3 + P0). Merges into the
+    # richest-connected surviving canonical for each corporate identity.
+    (
+        "Geo Group",
+        "THE GEO GROUP, INC.",
+        "News title-case canonical; merged into P3 sponsor-org canonical "
+        "(THE GEO GROUP, INC. — 12 edges vs Geo Group's 9)",
+    ),
+    # MANAGMENT & TRAINING CORPORATION (P3 typo) survives as-is until an
+    # MTC canonical with more edges exists to merge into.
 )
 
 
