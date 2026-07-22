@@ -85,9 +85,51 @@
   .not-found { padding:2rem 1rem; }
   .not-found h3 { margin: 0 0 .4rem; font-size:1rem; color:var(--fg); }
   .not-found p { margin: 0; color:var(--muted); font-size:.85rem; }
+  /* Ontology explainer banner — first-time viewer orientation. Dismissal
+     persists in localStorage under argus.explainer.dismissed. Static copy
+     only — no entity content, so surface_mode has nothing to gate here. */
+  #ontology-explainer {
+    display: none;
+    padding: .55rem 1rem;
+    background: linear-gradient(90deg, #131a24, #161f2b);
+    border-bottom: 1px solid #22303c;
+    color: var(--fg);
+    font-size: .82rem;
+    line-height: 1.4;
+    position: relative;
+    z-index: 25;
+  }
+  #ontology-explainer.show { display: block; }
+  #ontology-explainer .inner {
+    display: flex; align-items: flex-start; gap: .8rem;
+    max-width: 1100px; margin: 0 auto;
+  }
+  #ontology-explainer .body { flex: 1; color: var(--fg); }
+  #ontology-explainer .body strong { color: var(--accent); font-weight: 600; }
+  #ontology-explainer .body .muted { color: var(--muted); }
+  #ontology-explainer .dismiss {
+    background: transparent; border: 1px solid #22303c;
+    color: var(--muted); border-radius: 4px;
+    padding: .2rem .5rem; font-size: .72rem; cursor: pointer;
+    flex-shrink: 0; line-height: 1;
+  }
+  #ontology-explainer .dismiss:hover { color: var(--fg); border-color: var(--accent); }
 </style>
 </head>
 <body>
+<div id="ontology-explainer" role="note" aria-label="About Argus">
+  <div class="inner">
+    <div class="body">
+      <strong>What is this?</strong>
+      Argus maps the people, organizations, and money behind the news. Every node is an entity;
+      every connection is a relationship found in published reporting and public records
+      <span class="muted">(FEC, USAspending, lobbying disclosures)</span>.
+      Click any node or link to see the exact sources.
+      <span class="muted">This is a research tool — connections are evidence-backed, not conclusions.</span>
+    </div>
+    <button class="dismiss" id="explainer-dismiss" type="button" aria-label="Dismiss">Got it ✕</button>
+  </div>
+</div>
 <header>
   <h1 id="home">Argus</h1>
   <span class="tag">ontology navigator · every edge cited</span>
@@ -496,6 +538,23 @@ window.addEventListener('popstate', () => {
   const id = idFromPath() || GEO_GROUP_ID;
   navigate(id, false);
 });
+
+// Ontology-explainer banner — show only if the viewer hasn't dismissed it.
+// localStorage read is wrapped so a locked-down browser (Safari private,
+// no-storage kiosk) still lets Argus load; on error we simply show the banner.
+(function initExplainer() {
+  const el = document.getElementById('ontology-explainer');
+  if (!el) return;
+  let dismissed = false;
+  try { dismissed = window.localStorage.getItem('argus.explainer.dismissed') === '1'; }
+  catch (_) { dismissed = false; }
+  if (!dismissed) el.classList.add('show');
+  const btn = document.getElementById('explainer-dismiss');
+  if (btn) btn.addEventListener('click', () => {
+    el.classList.remove('show');
+    try { window.localStorage.setItem('argus.explainer.dismissed', '1'); } catch (_) {}
+  });
+})();
 
 (async () => {
   const id = idFromPath() || GEO_GROUP_ID;
