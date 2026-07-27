@@ -30,7 +30,7 @@ spec:
         - name: postgres
           # glibc pgvector image — musl (Alpine) postgres silently corrupts text btree
           # collation (see hollywood/docs/postmortem-2026-05-12-postgres-index-corruption.md).
-          image: pgvector/pgvector:pg16
+          image: docker.io/pgvector/pgvector:pg16
           env:
             - name: POSTGRES_DB
               value: argus
