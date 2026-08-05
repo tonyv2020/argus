@@ -85,6 +85,12 @@ class EdgeRelation(StrEnum):
     # P5.1 — roll-call votes: member → bill edges.
     VOTED_FOR = "voted_for"
     VOTED_AGAINST = "voted_against"
+    # D2 (2026-08-05) — OGE 278e financial-disclosure edges.
+    HOLDS_ASSET = "holds_asset"
+    INCOME_FROM = "income_from"
+    HELD_POSITION = "held_position"
+    OWES = "owes"
+    PARTY_TO_AGREEMENT = "party_to_agreement"
 
 
 class SourceKind(StrEnum):
@@ -97,6 +103,11 @@ class SourceKind(StrEnum):
     # P5.1 — roll-call vote citations pointing at clerk/Congress.gov URLs.
     CONGRESS_VOTE = "congress_vote"
     CORPORATE_REGISTRY = "corporate_registry"
+    # D2 (2026-08-05) — financial-disclosure citations point at the archived
+    # OGE PDF at a specific page (source_url includes ``#page=<n>``); the
+    # ``disclosure_row_id`` column FKs back to the disclosure_rows ledger.
+    OGE_278E = "oge_278e"
+    OGE_278T = "oge_278t"
 
 
 class CanonicalEntity(Base):
@@ -191,6 +202,12 @@ class CanonicalEdge(Base):
     )
     relation: Mapped[str] = mapped_column(String(32), nullable=False)
     weight: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # D2 (2026-08-05): per-edge structured attributes (value_band + numeric
+    # band_low/band_high, income_type, income_band, account_group, eif, and
+    # per-Part-N fields like position/org_type/year_incurred/rate/term).
+    # Bands stored as bands + numeric derivations; never a false-precision
+    # point value on top of a band.
+    edge_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -228,13 +245,25 @@ class SourceCitation(Base):
     citation_url: Mapped[str] = mapped_column(Text, nullable=False)
     # E.g. FEC transaction ID, USAspending award ID, article permalink slug.
     citation_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # D2 (2026-08-05) — OGE-278e specific: FK back to the ledger row that
+    # produced this citation + the 1-based PDF page. Both nullable so
+    # pre-existing FEC/USAspending/news citations don't need backfill.
+    disclosure_row_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("disclosure_rows.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    page: Mapped[int | None] = mapped_column(Integer, nullable=True)
     seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     edge: Mapped[CanonicalEdge] = relationship(back_populates="citations")
 
-    __table_args__ = (Index("ix_citations_edge", "edge_id"),)
+    __table_args__ = (
+        Index("ix_citations_edge", "edge_id"),
+        Index("ix_source_citations_disclosure_row_id", "disclosure_row_id"),
+    )
 
 
 class LlmUsage(Base):
