@@ -378,3 +378,66 @@ class AnchorRegistry(Base):
         Index("ix_anchor_registry_entity_type", "entity_type"),
         Index("ix_anchor_registry_sec_cik", "sec_cik"),
     )
+
+
+# ─── D1 financial-disclosure ingestion (see 0007 migration) ─────────
+
+
+class DisclosureDocument(Base):
+    """One archived OGE 278e / 278-T financial-disclosure PDF.
+
+    Owns the audit lineage for its rows. The PDF bytes live at
+    ``storage_path`` on the container volume; ``sha256`` is the
+    citation contract's fingerprint (same value is quoted in the
+    per-edge citation once D2 lands).
+    """
+
+    __tablename__ = "disclosure_documents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    form_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    filer_name: Mapped[str] = mapped_column(Text, nullable=False)
+    oge_url: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    filed_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    storage_path: Mapped[str] = mapped_column(Text, nullable=False)
+    bytes_len: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class DisclosureRow(Base):
+    """One parsed source line from a disclosure PDF — the audit ledger
+    between the page and any downstream graph edge D2+ emits.
+
+    HIGH rows carry a structured ``parsed`` payload; LOW rows carry
+    only the raw text and a machine-readable ``reason``. Never
+    coerced. The design's fail-closed contract is enforced by the
+    parser side (see :mod:`app.services.disclosure_parser`); this
+    table just stores what the parser said.
+    """
+
+    __tablename__ = "disclosure_rows"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    doc_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("disclosure_documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    part: Mapped[str] = mapped_column(String(32), nullable=False)
+    row_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    account_group: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    page: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+    parsed: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    parse_confidence: Mapped[str] = mapped_column(String(8), nullable=False)
+    parse_method: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
