@@ -82,13 +82,20 @@ FILER_NAME = "Donald J. Trump"
 FILER_TYPE = EntityType.PERSON.value
 
 
-async def emit_edges_for_doc(doc_id: str) -> EmitSummary:
+async def emit_edges_for_doc(doc_id: str, *, commit_every: int = 500) -> EmitSummary:
     """Emit D2 edges for one archived disclosure document.
 
     Idempotent: re-running is safe. Edge dedup is by
     ``(source_id, target_id, relation)``; citation dedup is by
     ``(edge_id, disclosure_row_id)``. Re-running does not create
     duplicate persons.
+
+    Progress + throughput: commits are batched every ``commit_every``
+    rows so the session doesn't accumulate 27k+ pending operations,
+    and a resolve cache short-circuits the O(n)-per-call name-match
+    fallback in the pgvector store when the same issuer name recurs
+    (typical in a Trump-annual: AAPL appears in every one of 8
+    accounts × ~3-5 times).
     """
     sm = get_sessionmaker()
     async with sm() as db:
@@ -97,6 +104,24 @@ async def emit_edges_for_doc(doc_id: str) -> EmitSummary:
             raise ValueError(f"disclosure_documents/{doc_id} not found")
 
         filer_id = await _get_or_create_filer(db)
+        await db.commit()  # persist filer independently of the emit batch loop
+
+    stats: dict[str, int] = {}
+    unresolved: list[str] = []
+    edges_emitted = 0
+    citations_emitted = 0
+    persons_suppressed = 0
+    high_rows_total = 0
+
+    # (surface_name_normalized, entity_type) -> canonical_id.
+    # Bounded by the count of distinct issuer/creditor names in the doc
+    # (Trump 2026: a few thousand distinct issuers at most).
+    resolve_cache: dict[tuple[str, str], str] = {}
+
+    async with sm() as db:
+        # Reload the doc + filer inside the emit-loop session so ORM
+        # identity is fresh.
+        doc = await db.get(DisclosureDocument, doc_id)
 
         rows = (
             (
@@ -110,16 +135,17 @@ async def emit_edges_for_doc(doc_id: str) -> EmitSummary:
             .scalars()
             .all()
         )
-        logger.info("D2 emit: %d HIGH rows for doc %s", len(rows), doc_id)
+        high_rows_total = len(rows)
+        logger.info("D2 emit: %d HIGH rows for doc %s", high_rows_total, doc_id)
 
-        stats: dict[str, int] = {}
-        unresolved: list[str] = []
-        edges_emitted = 0
-        citations_emitted = 0
-        persons_suppressed = 0
-
-        for row in rows:
-            result = await _emit_row(db, doc=doc, filer_id=filer_id, row=row)
+        for i, row in enumerate(rows, start=1):
+            result = await _emit_row(
+                db,
+                doc=doc,
+                filer_id=filer_id,
+                row=row,
+                resolve_cache=resolve_cache,
+            )
             if result is None:
                 unresolved.append(f"{row.id} [{row.part}]: no target derivable")
                 continue
@@ -131,13 +157,31 @@ async def emit_edges_for_doc(doc_id: str) -> EmitSummary:
                 citations_emitted += 1
             if made_person_suppressed:
                 persons_suppressed += 1
+            if i % commit_every == 0:
+                await db.commit()
+                logger.info(
+                    "D2 emit: committed %d/%d rows (edges=%d citations=%d resolves=%d)",
+                    i,
+                    high_rows_total,
+                    edges_emitted,
+                    citations_emitted,
+                    len(resolve_cache),
+                )
 
         await db.commit()
+        logger.info(
+            "D2 emit DONE: rows=%d edges=%d citations=%d persons_suppressed=%d unresolved=%d",
+            high_rows_total,
+            edges_emitted,
+            citations_emitted,
+            persons_suppressed,
+            len(unresolved),
+        )
 
     return EmitSummary(
         doc_id=doc_id,
         filer_canonical_id=filer_id,
-        high_rows_read=len(rows),
+        high_rows_read=high_rows_total,
         edges_emitted=edges_emitted,
         citations_emitted=citations_emitted,
         persons_suppressed_at_emit=persons_suppressed,
@@ -187,6 +231,7 @@ async def _emit_row(
     doc: DisclosureDocument,
     filer_id: str,
     row: DisclosureRow,
+    resolve_cache: dict[tuple[str, str], str],
 ) -> tuple[str, bool, bool, bool] | None:
     """Emit one edge (+ its citation) for one HIGH ledger row.
 
@@ -202,13 +247,34 @@ async def _emit_row(
         Part.PART_5_SPOUSE_ASSETS.value,
         Part.PART_6_OTHER_ASSETS.value,
     ):
-        return await _emit_asset(db, doc=doc, filer_id=filer_id, row=row, parsed=parsed)
+        return await _emit_asset(
+            db,
+            doc=doc,
+            filer_id=filer_id,
+            row=row,
+            parsed=parsed,
+            resolve_cache=resolve_cache,
+        )
 
     if part == Part.PART_1_POSITIONS.value:
-        return await _emit_position(db, doc=doc, filer_id=filer_id, row=row, parsed=parsed)
+        return await _emit_position(
+            db,
+            doc=doc,
+            filer_id=filer_id,
+            row=row,
+            parsed=parsed,
+            resolve_cache=resolve_cache,
+        )
 
     if part == Part.PART_8_LIABILITIES.value:
-        return await _emit_liability(db, doc=doc, filer_id=filer_id, row=row, parsed=parsed)
+        return await _emit_liability(
+            db,
+            doc=doc,
+            filer_id=filer_id,
+            row=row,
+            parsed=parsed,
+            resolve_cache=resolve_cache,
+        )
 
     # Parts 3 (agreements), 4 (comp), 7 (transactions), 9 (gifts) are
     # not D2-scope per helen's dispatch. D3 handles Part 7 trades; Parts
@@ -227,6 +293,7 @@ async def _emit_asset(
     filer_id: str,
     row: DisclosureRow,
     parsed: dict,
+    resolve_cache: dict[tuple[str, str], str],
 ) -> tuple[str, bool, bool, bool] | None:
     """Emit ``holds_asset`` (always) + ``income_from`` (when income_band
     is present + non-trivial) for a Parts 2/5/6 row."""
@@ -243,6 +310,7 @@ async def _emit_asset(
         surface_name=description,
         entity_type=tgt_type,
         surface_mode=SurfaceMode.OPEN.value,
+        resolve_cache=resolve_cache,
     )
     if tgt_id is None:
         return None
@@ -307,6 +375,7 @@ async def _emit_position(
     filer_id: str,
     row: DisclosureRow,
     parsed: dict,
+    resolve_cache: dict[tuple[str, str], str],
 ) -> tuple[str, bool, bool, bool] | None:
     """Emit ``held_position`` for a Part 1 row.
 
@@ -327,6 +396,7 @@ async def _emit_position(
         surface_name=org_name,
         entity_type=tgt_type,
         surface_mode=SurfaceMode.OPEN.value,
+        resolve_cache=resolve_cache,
     )
     if tgt_id is None:
         return None
@@ -355,6 +425,7 @@ async def _emit_liability(
     filer_id: str,
     row: DisclosureRow,
     parsed: dict,
+    resolve_cache: dict[tuple[str, str], str],
 ) -> tuple[str, bool, bool, bool] | None:
     """Emit ``owes`` for a Part 8 row.
 
@@ -382,6 +453,7 @@ async def _emit_liability(
             surface_name=creditor,
             entity_type=tgt_type,
             surface_mode=SurfaceMode.SUPPRESS.value,
+            resolve_cache=resolve_cache,
         )
         # Was it created NOW, or did it already exist?
         if tgt_id is not None:
@@ -397,6 +469,7 @@ async def _emit_liability(
             surface_name=creditor,
             entity_type=tgt_type,
             surface_mode=SurfaceMode.OPEN.value,
+            resolve_cache=resolve_cache,
         )
     if tgt_id is None:
         return None
@@ -437,6 +510,7 @@ async def _resolve_or_create(
     surface_name: str,
     entity_type: str,
     surface_mode: str,
+    resolve_cache: dict[tuple[str, str], str],
 ) -> str | None:
     """Resolve ``surface_name`` in the graph store; on miss, create a
     new canonical with the given ``surface_mode``.
@@ -445,26 +519,48 @@ async def _resolve_or_create(
     for ``surface_mode=SUPPRESS`` we set that at CREATE time inside the
     same session/transaction. There is no window where a public API
     could see the person in an OPEN state.
+
+    Uses the caller's ``resolve_cache`` (keyed by ``(normalized_name,
+    entity_type)``) to short-circuit the O(n)-per-call name-match
+    fallback in :class:`PgVectorStore.resolve_entity` when the same
+    issuer appears in many rows (typical in a Trump-annual: APPLE INC
+    appears once per account × 8 accounts, roughly).
     """
     if not surface_name:
         return None
-    store = PgVectorStore()
-    resolved = await store.resolve_entity(
-        db,
-        surface_name=surface_name,
-        entity_type=entity_type,
-        embedding=None,
-    )
-    if resolved is not None:
-        return resolved
+    norm = normalize_name(surface_name)
+    cache_key = (norm, entity_type)
+    hit = resolve_cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    # Fast normalized-name exact match FIRST — index-backed via the
+    # existing ``ix_canonical_entities_type_norm`` composite index. This
+    # skips the O(n) candidate scan in :meth:`PgVectorStore.resolve_entity`
+    # when embedding is None.
+    if norm:
+        exact = (
+            await db.execute(
+                select(CanonicalEntity.id).where(
+                    CanonicalEntity.type == entity_type,
+                    CanonicalEntity.canonical_name_normalized == norm,
+                )
+            )
+        ).scalar_one_or_none()
+        if exact is not None:
+            resolve_cache[cache_key] = exact
+            return exact
+
+    # New canonical.
     ent = CanonicalEntity(
         canonical_name=surface_name,
-        canonical_name_normalized=normalize_name(surface_name),
+        canonical_name_normalized=norm,
         type=entity_type,
         surface_mode=surface_mode,
     )
     db.add(ent)
     await db.flush()
+    resolve_cache[cache_key] = ent.id
     return ent.id
 
 
