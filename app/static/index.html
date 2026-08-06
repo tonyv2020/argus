@@ -44,6 +44,26 @@
   li.neighbor .swatch { width:6px; height:6px; border-radius:2px; flex-shrink:0; }
   li.neighbor .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   li.neighbor .cite-count { color:var(--muted); font-size:.7rem; font-variant-numeric:tabular-nums; }
+  /* D4 — disclosure surfacing */
+  .disclosure-note { font-size:.72rem; color:var(--muted); margin:.2rem 0 .5rem; }
+  .disclosure-group .rel-head.disclosure-head-h { color:#7fd6a0; }
+  li.neighbor.disclosure { display:block; padding:.5rem 0; }
+  li.neighbor.disclosure .disclosure-head { display:flex; align-items:center; gap:.3rem; }
+  .band-chip, .pos-chip { display:inline-block; padding:.05rem .35rem; border:1px solid #2b3b48; border-radius:3px; background:#0e161d; color:#cadde7; font-size:.7rem; font-variant-numeric:tabular-nums; margin-left:.35rem; }
+  .pos-chip { color:#a3c9ea; }
+  .receipt-chips { display:flex; flex-wrap:wrap; gap:.25rem; margin:.3rem 0 .1rem 12px; }
+  .receipt-chip { padding:.05rem .35rem; border:1px solid #274a3a; background:#0e1e17; color:#7fd6a0; border-radius:3px; font-size:.68rem; text-decoration:none; font-variant-numeric:tabular-nums; }
+  .receipt-chip:hover { background:#12291d; }
+  .receipt-more { color:var(--muted); font-size:.68rem; padding:.05rem .2rem; }
+  .tx-block { margin:.3rem 0 .1rem 12px; border-left:2px solid #223832; padding-left:.4rem; font-size:.72rem; }
+  .tx-row { display:grid; grid-template-columns: 4.5rem 4.5rem 1fr 2.2rem; gap:.4rem; align-items:center; padding:.1rem 0; color:#c7dae4; }
+  .tx-type { text-transform:uppercase; font-size:.62rem; letter-spacing:.05em; color:#8fd0a4; }
+  .tx-type.txsale { color:#e6a179; }
+  .tx-type.txexchange { color:#e6d179; }
+  .tx-date { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .tx-band { color:#cadde7; font-variant-numeric:tabular-nums; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tx-page { color:#7fd6a0; text-decoration:none; font-size:.65rem; text-align:right; }
+  .tx-more { color:var(--muted); padding:.15rem 0; }
   /* Hover peek — small floating card over the graph */
   #peek {
     position: absolute; z-index: 20;
@@ -251,16 +271,101 @@ function renderPanel(entity) {
   const connections = entity.connections || {};
   // Render each relation's neighbours, sorted by citation_count desc (already done server-side).
   const relKeys = Object.keys(connections).sort((a, b) => connections[b].length - connections[a].length);
-  const relBlocks = relKeys.map(rel => {
+  // D4: separate the OGE disclosure relations into their own section so
+  // holdings / income / creditors / positions / trades render with page
+  // receipts + the value/amount band from edge_metadata. Non-disclosure
+  // relations render as before.
+  const DISCLOSURE_RELS = new Set(['holds_asset','income_from','held_position','owes','party_to_agreement','traded']);
+  const DISCLOSURE_LABELS = {
+    holds_asset: 'Holdings',
+    income_from: 'Income sources',
+    held_position: 'Positions',
+    owes: 'Creditors',
+    party_to_agreement: 'Agreements',
+    traded: 'Trades',
+  };
+
+  function esc(s) { return (s == null ? '' : String(s)).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+  function receiptChips(n) {
+    if (!Array.isArray(n.receipts) || n.receipts.length === 0) return '';
+    // Show up to 8 receipts as page-anchored chips (…PDF#page=N).
+    const chips = n.receipts.slice(0, 8).map(r =>
+      `<a class="receipt-chip" href="${esc(r.url)}" target="_blank" rel="noopener" title="OGE ${esc(r.kind)} ref=${esc(r.ref)}">p.${esc(r.page || '?')}</a>`
+    ).join('');
+    const more = n.receipts.length > 8 ? `<span class="receipt-more">+${n.receipts.length - 8}</span>` : '';
+    return `<span class="receipt-chips">${chips}${more}</span>`;
+  }
+
+  function transactionBlock(n) {
+    // Only for traded — show up to 12 per-transaction rows: type · date · amount_band with page link.
+    if (!Array.isArray(n.transactions) || n.transactions.length === 0) return '';
+    const rows = n.transactions.slice(0, 12).map(t =>
+      `<div class="tx-row">
+         <span class="tx-type tx-${esc((t.type||'').replace(/[^a-z]/g,''))}">${esc(t.type || '?')}</span>
+         <span class="tx-date">${esc(t.date || '')}</span>
+         <span class="tx-band">${esc(t.amount_band || '')}</span>
+         <a class="tx-page" href="${esc(t.url)}" target="_blank" rel="noopener">p.${esc(t.page || '?')}</a>
+       </div>`
+    ).join('');
+    const more = n.transactions.length > 12 ? `<div class="tx-more">+${n.transactions.length - 12} more transactions</div>` : '';
+    return `<div class="tx-block">${rows}${more}</div>`;
+  }
+
+  function bandChip(n) {
+    // Prefer value_band (assets), then amount_band (owes/traded), then income_band (income_from).
+    const m = n.edge_metadata || {};
+    const b = m.value_band || m.amount_band || m.income_band;
+    if (!b) return '';
+    return `<span class="band-chip" title="from OGE filing">${esc(b)}</span>`;
+  }
+
+  function positionChip(n) {
+    // Part 1 positions carry raw_lead which usually includes the position title.
+    const m = n.edge_metadata || {};
+    const raw = m.raw_lead;
+    if (!raw) return '';
+    // Strip the leading org name (already the neighbour label) and take the rest.
+    return `<span class="pos-chip" title="from OGE Part 1">${esc(raw.slice(0, 90))}${raw.length > 90 ? '…' : ''}</span>`;
+  }
+
+  function disclosureItem(n, rel) {
+    const chips = rel === 'held_position' ? positionChip(n) : bandChip(n);
+    return `
+      <li class="neighbor disclosure" data-id="${esc(n.id)}">
+        <div class="disclosure-head">
+          <span class="swatch" style="background:${NODE_TYPE_COLOR[n.type] || NODE_TYPE_COLOR.unknown}"></span>
+          <span class="name" title="${esc(n.label)}">${esc(n.label)}</span>
+          ${chips}
+          <span class="cite-count">${n.citation_count || 0}</span>
+        </div>
+        ${receiptChips(n)}
+        ${rel === 'traded' ? transactionBlock(n) : ''}
+      </li>`;
+  }
+
+  const disclosureBlocks = relKeys
+    .filter(rel => DISCLOSURE_RELS.has(rel))
+    .map(rel => {
+      const items = connections[rel];
+      return `
+        <div class="connection-group disclosure-group" data-rel="${esc(rel)}">
+          <div class="rel-head disclosure-head-h">${DISCLOSURE_LABELS[rel] || rel.replace(/_/g,' ')} · ${items.length}</div>
+          <ul>${items.map(n => disclosureItem(n, rel)).join('')}</ul>
+        </div>`;
+    }).join('');
+
+  const otherRelKeys = relKeys.filter(rel => !DISCLOSURE_RELS.has(rel));
+  const relBlocks = otherRelKeys.map(rel => {
     const items = connections[rel];
     return `
       <div class="connection-group">
         <div class="rel-head">${rel.replace(/_/g,' ')} · ${items.length}</div>
         <ul>
           ${items.map(n => `
-            <li class="neighbor" data-id="${n.id}">
+            <li class="neighbor" data-id="${esc(n.id)}">
               <span class="swatch" style="background:${NODE_TYPE_COLOR[n.type] || NODE_TYPE_COLOR.unknown}"></span>
-              <span class="name" title="${n.label}">${n.label}</span>
+              <span class="name" title="${esc(n.label)}">${esc(n.label)}</span>
               <span class="cite-count">${n.citation_count || 0}</span>
             </li>
           `).join('')}
@@ -290,12 +395,19 @@ function renderPanel(entity) {
              </li>
            `).join('')}${articles.length > 25 ? `<li class="article" style="color:var(--muted);border:none;">+${articles.length - 25} more…</li>` : ''}</ul>`}
       `}
+    ${disclosureBlocks ? `<h2>Financial disclosure</h2><div class="disclosure-note">Cited to OGE 278e/278-T public filings; each row links to the source PDF page.</div>${disclosureBlocks}` : ''}
     <h2>Connections</h2>
-    ${relKeys.length === 0 ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No connections surfaced yet.</div>' : relBlocks}
+    ${otherRelKeys.length === 0 && !disclosureBlocks ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No connections surfaced yet.</div>' : (otherRelKeys.length === 0 ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No non-disclosure connections.</div>' : relBlocks)}
   `;
-  // Wire neighbour click → navigate.
+  // Wire neighbour click → navigate. Don't fire when the click is
+  // on a receipt-chip / tx-page link (those open the OGE PDF; they
+  // are inside a disclosure neighbour row so the click would
+  // otherwise bubble and reload the panel).
   panel.querySelectorAll('li.neighbor').forEach(el => {
-    el.addEventListener('click', () => navigate(el.dataset.id));
+    el.addEventListener('click', (ev) => {
+      if (ev.target.closest('a')) return;
+      navigate(el.dataset.id);
+    });
   });
 }
 

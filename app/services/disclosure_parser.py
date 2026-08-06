@@ -145,17 +145,71 @@ _ROW_BAND_ANCHOR = re.compile(
     rf"(?P<band>{_VALUE_BAND_ALT})",
 )
 
-# For Part 7: "Type Date Amount" tail. Type is one of a small closed set
-# per OGE instructions. Case-insensitive because the annual mixes cases
-# ("Purchase" and "purchase" both appear).
-_PART7_TYPES = ("purchase", "sale", "exchange", "S (partial)", "P (partial)")
+# For Part 7 (annual + 278-T periodic): "Type Date [Yes|No] Amount"
+# tail. Type is one of a small closed set per OGE instructions.
+# Case-insensitive because the annual mixes cases ("Purchase" and
+# "purchase" both appear).
+#
+# D3 (2026-08-06):
+#   * added OCR variants seen on the 278-T scans (``ourchaso`` /
+#     ``ourchase`` / ``purchaso`` — "p"→"o" is the common Adobe Paper
+#     Capture mistake on the scanned periodic reports)
+#   * added optional Yes/No column (278-T's "Notification Received
+#     Over 30 Days Ago") between date and amount_band. The annual
+#     does not carry this column so the (?: … )? group is optional.
+_PART7_TYPES = (
+    "purchase",
+    "sale",
+    "exchange",
+    "S (partial)",
+    "P (partial)",
+    # OCR variants observed on 278-T scans (Adobe Paper Capture flips
+    # leading "p" to "o" fairly often). Keeping the CLOSED vocabulary
+    # discipline — we don't fabricate types, we just tolerate these
+    # specific documented mis-scans.
+    "ourchase",
+    "ourchaso",
+    "purchaso",
+    "salo",
+    "salo (partial)",
+    "oxchange",
+)
 _PART7_TYPE_ALT = "|".join(map(re.escape, _PART7_TYPES))
+# Some 278-T rows use bullet "•" as the range dash on the amount band
+# (OCR variant of "-"). Accept it as an alternative.
+_VALUE_BAND_ALT_278T = _VALUE_BAND_ALT.replace(re.escape("-"), r"[\-–••]")
 _PART7_TAIL = re.compile(
     rf"(?P<type>{_PART7_TYPE_ALT})\s+"
     rf"(?P<date>\d{{1,2}}/\d{{1,2}}/\d{{4}})\s+"
+    rf"(?:(?:Yes|No)\s+)?"
     rf"(?P<band>{_VALUE_BAND_ALT})\s*$",
     re.IGNORECASE,
 )
+
+# 278-T-tolerant tail (accepts the "•" range separator sometimes emitted
+# on scanned pages) — used only by :func:`parse_text_278t`.
+#
+# The date is a STRONG anchor (mm/dd/yyyy) and the amount_band is the
+# closed-vocabulary anchor. Between them: an OCR'd "type" token
+# (purchase/sale/exchange with common mis-scans like nurchaso,
+# nurch113e, ourchase, salo, oxchange) + optional Yes/No column. We
+# accept ANY alnum token 3-18 chars in the type slot; downstream code
+# maps it to a canonical type or quarantines the row if the OCR mangle
+# is too far. Anti-fabrication: bands still must round-trip against
+# VALUE_BANDS; types too-far-from-vocab quarantine as LOW.
+_PART7_TAIL_278T = re.compile(
+    r"(?P<type>[a-zA-Z][a-zA-Z0-9]{2,17})\s+"
+    r"(?P<date>\d{1,2}/\d{1,2}/\d{4})\s+"
+    r"(?:(?:Yes|No)\s+)?"
+    rf"(?P<band>{_VALUE_BAND_ALT_278T})\s*$",
+    re.IGNORECASE,
+)
+
+
+# Normalize the range-dash variants back to a canonical "-" so a HIGH
+# ``amount_band`` string always matches the closed VALUE_BANDS set.
+def _canonicalize_band(band: str) -> str:
+    return band.replace("–", "-").replace("•", "-").replace("•", "-")
 
 
 # ─── Data shapes ────────────────────────────────────────────────────
@@ -316,6 +370,184 @@ def _tokenize_block(b: _Block) -> ParsedRow:
         page=b.page,
         account_group=b.account_group,
     )
+
+
+def parse_text_278t(text: str) -> list[ParsedRow]:
+    """Parse a 278-T periodic transaction report's layout text.
+
+    D3 (2026-08-06). 278-T structure differs from the annual: there is
+    no ``Part 7:`` header, the file starts with certifications, and
+    each transaction row is a single logical line with the shape::
+
+      #  Description ...    Type  Date  Yes|No  Amount-band
+
+    Row numbers sometimes appear on their own line above the row
+    content (Adobe Paper Capture wrap). Some rows have OCR'd type
+    tokens (``ourchaso`` → ``purchase``). Value bands sometimes use
+    ``•`` as the range dash.
+
+    Strategy — **reverse-anchor** on the row TAIL. For each line, try
+    to match a Part-7 tail ``type date [yes|no] amount_band``. If it
+    matches, the description is everything before the tail (walking
+    up over blank / row-number-only lines to gather the wrapped
+    description). Nothing that doesn't match a tail becomes a row.
+
+    Anti-fabrication contract holds: bands still must match
+    :data:`VALUE_BANDS` (via the closed alt); types still must match
+    the documented + OCR-variant set. Nothing invented.
+    """
+    pages = text.split(_PAGE_SPLIT)
+    rows: list[ParsedRow] = []
+    running_row_index = 0
+
+    for page_idx, page_text in enumerate(pages, start=1):
+        lines = page_text.splitlines()
+        for line_idx, raw_line in enumerate(lines):
+            m = _PART7_TAIL_278T.search(raw_line)
+            if m is None:
+                continue
+            # Description is everything on this line BEFORE the tail.
+            description = raw_line[: m.start()].strip()
+
+            # Walk backwards to pick up a wrapped description line
+            # OR a bare row-number line. Skip blank / boilerplate /
+            # row-number-only lines.
+            for back in range(line_idx - 1, max(-1, line_idx - 4), -1):
+                prev = lines[back].strip()
+                if not prev:
+                    continue
+                if _is_boilerplate(prev):
+                    continue
+                # Bare row-number line (e.g. "12" alone).
+                if re.fullmatch(r"\d+", prev):
+                    running_row_index = int(prev)
+                    break
+                # Wrapped description continuation — prepend and keep looking.
+                description = (prev + " " + description).strip()
+
+            if not description:
+                continue
+
+            # Canonicalize band variants back to the exact VALUE_BANDS form.
+            band = _canonicalize_band(m.group("band"))
+            if band not in VALUE_BANDS:
+                # Never coerce a band we can't fully round-trip.
+                rows.append(
+                    ParsedRow(
+                        part=Part.PART_7_TRANSACTIONS,
+                        row_index=running_row_index,
+                        raw_text=raw_line.rstrip(),
+                        page=page_idx,
+                        account_group=None,
+                        confidence=Confidence.LOW,
+                        reason="band_not_in_vocabulary",
+                    )
+                )
+                running_row_index += 1
+                continue
+
+            # Normalize the type token — map OCR variants to canonical
+            # or quarantine when the mis-scan is too far off.
+            transaction_type = _canonicalize_type(m.group("type"))
+            if transaction_type is None:
+                rows.append(
+                    ParsedRow(
+                        part=Part.PART_7_TRANSACTIONS,
+                        row_index=running_row_index,
+                        raw_text=raw_line.rstrip(),
+                        page=page_idx,
+                        account_group=None,
+                        confidence=Confidence.LOW,
+                        reason="type_not_recognized",
+                    )
+                )
+                running_row_index += 1
+                continue
+
+            running_row_index += 1
+            rows.append(
+                ParsedRow(
+                    part=Part.PART_7_TRANSACTIONS,
+                    row_index=running_row_index,
+                    raw_text=raw_line.rstrip(),
+                    page=page_idx,
+                    account_group=None,
+                    confidence=Confidence.HIGH,
+                    parsed={
+                        "description": description,
+                        "transaction_type": transaction_type,
+                        "trade_date": m.group("date"),
+                        "amount_band": band,
+                    },
+                )
+            )
+
+    return rows
+
+
+# Canonical transaction types (OGE Form 278-T Instructions).
+_CANONICAL_TYPES: tuple[str, ...] = ("purchase", "sale", "exchange")
+
+# Explicit map for the well-documented mis-scans. Kept + short —
+# entries are only added when the mis-scan is confirmed in a source
+# doc. Anything not in this map runs through the small fuzzy check
+# in :func:`_canonicalize_type` (Levenshtein ≤ 3 to a canonical type).
+_OCR_TYPE_MAP: dict[str, str] = {
+    "purchase": "purchase",
+    "ourchase": "purchase",
+    "ourchaso": "purchase",
+    "purchaso": "purchase",
+    "nurchase": "purchase",
+    "nurchaso": "purchase",
+    "nurchasc": "purchase",
+    "purchasc": "purchase",
+    "sale": "sale",
+    "salo": "sale",
+    "exchange": "exchange",
+    "oxchange": "exchange",
+}
+
+
+def _canonicalize_type(raw_type: str) -> str | None:
+    """Map an OCR'd type token to a canonical purchase/sale/exchange,
+    or return None if the token is too far from any canonical (row
+    quarantines).
+
+    Two-stage:
+      1. Exact hit in :data:`_OCR_TYPE_MAP` — the documented mis-scans.
+      2. Levenshtein distance ≤ 3 to any canonical form — catches
+         one-off OCR mangles without opening the door to arbitrary
+         words. Distance-4 or worse → None (quarantine).
+    """
+    key = raw_type.lower().strip()
+    hit = _OCR_TYPE_MAP.get(key)
+    if hit is not None:
+        return hit
+    for canon in _CANONICAL_TYPES:
+        if _lev_distance(key, canon) <= 3:
+            return canon
+    return None
+
+
+def _lev_distance(a: str, b: str) -> int:
+    """Standard Levenshtein — small string budget so the naive
+    dynamic-programming form is fine."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, start=1):
+            ins = cur[j - 1] + 1
+            dele = prev[j] + 1
+            sub = prev[j - 1] + (0 if ca == cb else 1)
+            cur[j] = min(ins, dele, sub)
+        prev = cur
+    return prev[-1]
 
 
 def summarize(rows: list[ParsedRow]) -> dict:

@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import CanonicalEdge, CanonicalEntity, SourceCitation
+from app.models import CanonicalEdge, CanonicalEntity, SourceCitation, SurfaceMode
 
 logger = logging.getLogger(__name__)
 
@@ -68,15 +68,46 @@ class Neo4jProjection:
             return list(s.run(cypher, **params))
 
     async def project_entity(self, session: AsyncSession, canonical: CanonicalEntity) -> bool:
-        """MERGE a Canonical node and stamp `projected_at` on success."""
+        """MERGE a Canonical node and stamp `projected_at` on success.
+
+        Privacy gate (D2, 2026-08-05): the label written to Neo4j MUST
+        respect ``surface_mode``:
+
+          * ``OPEN``     → label = ``canonical_name``.
+          * ``ALIAS``    → label = ``public_alias`` (real name is never
+                          projected).
+          * ``SUPPRESS`` → the entity is NOT projected at all. Neo4j has
+                          no node for a suppressed canonical, so
+                          Cypher-level readers cannot leak a real name
+                          through the graph either.
+
+        The public API's own render layer already enforces the same
+        contract; this is defense-in-depth so a Cypher query that
+        bypasses the API layer cannot see a suppressed real name.
+        """
         if not self.available:
             return False
+        mode = canonical.surface_mode or SurfaceMode.OPEN.value
+        if mode == SurfaceMode.SUPPRESS.value:
+            # Do NOT project — no node in Neo4j for a suppressed canonical.
+            # ``projected_at`` remains NULL; a subsequent Scrutiny
+            # promotion to OPEN/ALIAS will cause the next sweep to
+            # project properly.
+            return False
+        if mode == SurfaceMode.ALIAS.value:
+            label = canonical.public_alias or (
+                f"Private donor #{canonical.id.replace('-', '')[:8]}"
+            )
+        else:
+            label = canonical.canonical_name
         try:
             self._run(
-                "MERGE (c:Canonical {pg_id: $id}) SET c.label=$label, c.type=$type",
+                "MERGE (c:Canonical {pg_id: $id}) "
+                "SET c.label=$label, c.type=$type, c.surface_mode=$mode",
                 id=canonical.id,
-                label=canonical.canonical_name,
+                label=label,
                 type=canonical.type,
+                mode=mode,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("neo4j project_entity failed for %s: %s", canonical.id, exc)

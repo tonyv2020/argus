@@ -35,6 +35,7 @@ from app.models import DisclosureDocument, DisclosureRow
 from app.services.disclosure_parser import (
     ParsedRow,
     parse_text,
+    parse_text_278t,
     summarize,
 )
 
@@ -73,12 +74,16 @@ async def ingest_annual(
     period_start: date | None = None,
     period_end: date | None = None,
     storage_root: Path | None = None,
+    form_type: str = "oge_278e",
 ) -> IngestSummary:
-    """Archive + parse + ledger a 278e annual filing.
+    """Archive + parse + ledger a disclosure PDF filing.
 
-    Idempotent: if the same ``sha256`` is already in
-    ``disclosure_documents`` we return its existing summary and skip
-    re-parsing.
+    Idempotent by ``sha256``: re-ingesting the same PDF returns its
+    prior summary and does not re-parse.
+
+    ``form_type`` — ``"oge_278e"`` (annual) or ``"oge_278t"`` (periodic
+    transaction report). D3 (2026-08-06) uses ``oge_278t`` for the
+    periodic reports; the parser + ledger pipeline is identical.
     """
     root = storage_root or DEFAULT_STORAGE_ROOT
     root.mkdir(parents=True, exist_ok=True)
@@ -131,7 +136,7 @@ async def ingest_annual(
     sm = get_sessionmaker()
     async with sm() as db:
         doc = DisclosureDocument(
-            form_type="oge_278e",
+            form_type=form_type,
             filer_name=filer_name,
             oge_url=oge_url,
             sha256=sha256,
@@ -147,8 +152,13 @@ async def ingest_annual(
         await db.refresh(doc)
         doc_id = doc.id
 
-    # Parse + ledger.
-    parsed_rows = parse_text(layout_text)
+    # Parse + ledger. 278-T periodic reports have a different top-level
+    # shape (no ``Part N:`` headers, single-purpose transactions
+    # section) so they route to the dedicated parser.
+    if form_type == "oge_278t":
+        parsed_rows = parse_text_278t(layout_text)
+    else:
+        parsed_rows = parse_text(layout_text)
     logger.info(
         "disclosure parse: doc_id=%s rows=%d",
         doc_id,

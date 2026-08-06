@@ -512,6 +512,16 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
 
     # Connections-by-relation. For each neighbour we compute an edge-scoped
     # citation_count so callers can rank most-sourced first.
+    #
+    # D4 (2026-08-06) — disclosure surfacing. When an edge carries an OGE
+    # citation (kind ∈ {oge_278e, oge_278t}), inline its receipts on the
+    # connection so the dossier UI + Cassandra + Ask-Argus MCP can render
+    # a clickable page anchor (…PDF#page=N). For TRADED edges we further
+    # expand each receipt with its parsed transaction (type/date/
+    # amount_band) from the ledger row — that's what makes the trades
+    # section useful vs a raw citation count. Receipts + edge_metadata
+    # are ONLY surfaced when the caller entity ``ent`` is OPEN (belt-
+    # and-suspenders to §P7's rule that receipts can de-anonymize).
     connections: dict[str, list[dict]] = {}
     if edges:
         # Bulk-pull neighbour entities + per-edge citation counts.
@@ -528,15 +538,62 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
             .scalars()
             .all()
         }
+        edge_ids_all = [e.id for e in edges]
         edge_cite_counts = dict(
             (
                 await db.execute(
                     select(SourceCitation.edge_id, func.count(SourceCitation.id))
-                    .where(SourceCitation.edge_id.in_([e.id for e in edges]))
+                    .where(SourceCitation.edge_id.in_(edge_ids_all))
                     .group_by(SourceCitation.edge_id)
                 )
             ).all()
         )
+
+        # Bulk-pull the OGE citations for the caller's edges (D4). One
+        # round-trip per dossier — the payload is O(citations) per
+        # edge; the annual has a small handful per edge (typical ~2).
+        oge_receipts: dict[str, list[dict]] = {}
+        if is_open:
+            oge_cites = (
+                (
+                    await db.execute(
+                        select(SourceCitation)
+                        .where(SourceCitation.edge_id.in_(edge_ids_all))
+                        .where(SourceCitation.kind.in_(("oge_278e", "oge_278t")))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            row_ids_needed = [c.disclosure_row_id for c in oge_cites if c.disclosure_row_id]
+            # Pull the disclosure_rows once — traded expansion below reads
+            # `parsed` (transaction_type / trade_date / amount_band).
+            row_lookup: dict[str, dict] = {}
+            if row_ids_needed:
+                from app.models import DisclosureRow
+
+                dr_rows = (
+                    (
+                        await db.execute(
+                            select(DisclosureRow).where(DisclosureRow.id.in_(row_ids_needed))
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for dr in dr_rows:
+                    row_lookup[dr.id] = dr.parsed or {}
+            for c in oge_cites:
+                oge_receipts.setdefault(c.edge_id, []).append(
+                    {
+                        "kind": c.kind,
+                        "url": c.citation_url,
+                        "ref": c.citation_ref,
+                        "page": c.page,
+                        "row": row_lookup.get(c.disclosure_row_id) if c.disclosure_row_id else None,
+                    }
+                )
+
         for e in edges:
             neighbour_id = e.source_id if e.target_id == canonical_id else e.target_id
             neighbour = neighbours.get(neighbour_id)
@@ -546,16 +603,52 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
             if nlabel is None:
                 # Suppressed neighbour — do not surface even the connection.
                 continue
-            connections.setdefault(e.relation, []).append(
-                {
-                    "id": neighbour.id,
-                    "label": nlabel,
-                    "type": neighbour.type,
-                    "surface_mode": neighbour.surface_mode,
-                    "citation_count": int(edge_cite_counts.get(e.id, 0)),
-                    "weight": e.weight,
-                }
+            # Receipts stay open-gated on BOTH ends: the caller ``ent``
+            # must be open AND the neighbour must be open. A creditor
+            # who is an aliased private person still gets a
+            # non-identifying connection row, but NO OGE receipt link
+            # (which would otherwise resolve the alias by page).
+            neighbour_open = neighbour.surface_mode == SurfaceMode.OPEN.value
+            receipts_for_edge = (
+                oge_receipts.get(e.id, []) if (is_open and neighbour_open) else []
             )
+            row = {
+                "id": neighbour.id,
+                "label": nlabel,
+                "type": neighbour.type,
+                "surface_mode": neighbour.surface_mode,
+                "citation_count": int(edge_cite_counts.get(e.id, 0)),
+                "weight": e.weight,
+            }
+            if is_open and neighbour_open:
+                # edge_metadata carries value_band / band_low / band_high /
+                # amount_band / income_type / account_group / eif / part
+                # — the substance the disclosure UI renders per row.
+                # Same open-on-both-ends gate as receipts.
+                row["edge_metadata"] = e.edge_metadata or {}
+            if receipts_for_edge:
+                # Sort receipts by page ascending for a stable display.
+                receipts_for_edge.sort(key=lambda r: (r.get("page") or 0, r.get("ref") or ""))
+                row["receipts"] = [
+                    {"kind": r["kind"], "url": r["url"], "ref": r["ref"], "page": r["page"]}
+                    for r in receipts_for_edge
+                ]
+                if e.relation == "traded":
+                    # Per-transaction expansion — type/date/amount_band
+                    # from the ledger row (already stored on the citation
+                    # by D3).
+                    row["transactions"] = [
+                        {
+                            "type": (r.get("row") or {}).get("transaction_type"),
+                            "date": (r.get("row") or {}).get("trade_date"),
+                            "amount_band": (r.get("row") or {}).get("amount_band"),
+                            "page": r["page"],
+                            "url": r["url"],
+                        }
+                        for r in receipts_for_edge
+                        if r.get("row")
+                    ]
+            connections.setdefault(e.relation, []).append(row)
         for rel in connections:
             connections[rel].sort(
                 key=lambda x: (-x["citation_count"], -(x["weight"] or 0), x["label"].lower())
