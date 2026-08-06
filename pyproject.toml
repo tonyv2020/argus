@@ -55,6 +55,9 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "f
 
 [tool.ruff.lint.per-file-ignores]
 "alembic/versions/*.py" = ["E501"]
+# D1 disclosure-parser fixtures need exact column geometry to mirror
+# the source PDF's ``pdftotext -layout`` output — long by nature.
+"tests/test_disclosure_parser.py" = ["E501"]
 
 [tool.mypy]
 packages = ["app"]
