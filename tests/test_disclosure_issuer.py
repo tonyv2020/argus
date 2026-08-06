@@ -108,3 +108,37 @@ def test_never_returns_empty_for_nonempty_input() -> None:
     for raw in ("A", "AB", "CARNIVAL", "X CORP", "CORP F", "MTG"):
         got = normalize_issuer(raw)
         assert got != "", f"over-stripped {raw!r} → empty"
+
+
+# D2.1 polish (helen 2026-08-06) — doubled-tail collapse, DB / year
+# strip, PRTNRSHP → PARTN, curated historical aliases.
+POLISH_CASES: list[tuple[str, str]] = [
+    # PRTNRSHP → PARTN unify (Certificate of Partnership).
+    ("ORANGE CNTY FL SCH BRD CTF PRTNRSHP", "ORANGE CNTY FL SCH BRD CTF PARTN"),
+    # Trailing standalone year.
+    ("CAMDENTON MO CTF PARTN 2025", "CAMDENTON MO CTF PARTN"),
+    ("SOME MUNI ISSUER 2027", "SOME MUNI ISSUER"),
+    # Trailing standalone DB.
+    ("FORT BEND CNTY TX CTF OBLIG DB", "FORT BEND CNTY TX CTF OBLIG"),
+    # Doubled trailing tail.
+    ("CAMDENTON MO CTF PARTN CTF PARTN", "CAMDENTON MO CTF PARTN"),
+    # Full helen example: doubled + year.
+    ("CAMDENTON MO CTF PARTN CTF PARTN 2025", "CAMDENTON MO CTF PARTN"),
+    # Historical alias — Apple Computer Inc → Apple Inc (2007 rename).
+    ("APPLE COMPUTER INC", "APPLE INC"),
+    ("APPLE COMPUTER INC.", "APPLE INC."),
+    # PRTNRSHP + doubled combo.
+    ("GREENE CNTY MO CTF PARTN CTF PRTNRSHP", "GREENE CNTY MO CTF PARTN"),
+    # Distinct real bond variants stay distinct — helen's "muni issuers
+    # themselves stay distinct real entities" rule.
+    ("GREENE CNTY MO CTF PARTN CAP PJS", "GREENE CNTY MO CTF PARTN CAP PJS"),
+    ("FORT BEND CNTY TX MUD 118", "FORT BEND CNTY TX MUD 118"),
+]
+
+
+@pytest.mark.parametrize("raw,expected", POLISH_CASES)
+def test_normalize_issuer_polish(raw: str, expected: str) -> None:
+    """D2.1 polish transforms match expected clean output."""
+    assert normalize_issuer(raw) == expected, (
+        f"raw={raw!r} → got={normalize_issuer(raw)!r} want={expected!r}"
+    )

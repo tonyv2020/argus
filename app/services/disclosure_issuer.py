@@ -210,6 +210,21 @@ def normalize_issuer(description: str) -> str:
         tokens.pop()
     s = " ".join(tokens)
 
+    # D2.1 polish (helen 2026-08-06):
+    #   * PRTNRSHP → PARTN (same word, two OGE-form spellings).
+    #   * Strip a trailing standalone year (2016-2099 range).
+    #   * Strip a trailing standalone ``DB`` (debenture / discount-bond
+    #     stub).
+    #   * Collapse doubled trailing multi-word tails (``CTF PARTN CTF
+    #     PARTN`` → ``CTF PARTN``).
+    #   * Well-known historical-alias collapses (APPLE COMPUTER INC →
+    #     APPLE INC).
+    s = _POLISH_PARTN_RE.sub("PARTN", s)
+    s = _POLISH_TRAILING_YEAR_RE.sub("", s).rstrip()
+    s = _POLISH_TRAILING_DB_RE.sub("", s).rstrip()
+    s = _collapse_doubled_tail(s)
+    s = _apply_historical_aliases(s)
+
     return s.strip()
 
 
@@ -276,6 +291,59 @@ def _repair_space_collapse(s: str) -> str:
         s = head + " " + rest
 
     return s.strip()
+
+
+# D2.1 polish primitives (helen 2026-08-06).
+
+# PRTNRSHP is another OGE spelling of PARTN (both = Certificate of
+# Partnership). Unify to PARTN so muni sibling nodes collapse.
+_POLISH_PARTN_RE = re.compile(r"\bPRTNRSHP\b", re.IGNORECASE)
+
+# Trailing standalone year (2016-2099) — used on some CTF PARTN muni
+# rows as the issuance year suffix (``... CTF PARTN 2025``). Not part
+# of the issuer identity.
+_POLISH_TRAILING_YEAR_RE = re.compile(r"\s+\b(?:20[1-9][0-9])\b\s*$")
+
+# Trailing standalone ``DB`` — muni-bond issuers occasionally carry it
+# as a bond-class stub (``FORT BEND CNTY TX CTF OBLIG DB``).
+_POLISH_TRAILING_DB_RE = re.compile(r"\s+\bDB\b\s*$")
+
+# Well-known historical org-name changes. Curated + tiny by design —
+# only well-established renames get an entry so we never accidentally
+# collapse two genuinely distinct entities.
+_HISTORICAL_ALIASES: dict[str, str] = {
+    "apple computer inc": "APPLE INC",
+    "apple computer inc.": "APPLE INC.",
+    "apple computer": "APPLE",
+}
+
+
+def _collapse_doubled_tail(s: str) -> str:
+    """Collapse a doubled trailing multi-word tail — ``X CTF PARTN CTF
+    PARTN`` → ``X CTF PARTN``. Works for tail lengths 1-3 tokens and
+    only when the same token sequence appears twice at the end.
+    """
+    tokens = s.split()
+    if len(tokens) < 4:
+        return s
+    for tail_len in (3, 2, 1):
+        if len(tokens) < 2 * tail_len:
+            continue
+        tail = tokens[-tail_len:]
+        prev = tokens[-2 * tail_len : -tail_len]
+        if [t.upper() for t in tail] == [t.upper() for t in prev]:
+            return " ".join(tokens[:-tail_len])
+    return s
+
+
+def _apply_historical_aliases(s: str) -> str:
+    """Replace a well-known historical org name with its modern form
+    (``APPLE COMPUTER INC`` → ``APPLE INC``). Keyed on the lowercase
+    exact normalized form; returns the input unchanged when no entry
+    applies.
+    """
+    hit = _HISTORICAL_ALIASES.get(s.lower())
+    return hit if hit is not None else s
 
 
 def _strip_security_tail(s: str) -> str:
