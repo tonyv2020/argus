@@ -46,6 +46,7 @@ from app.models import (
     SurfaceMode,
 )
 from app.services.disclosure_bands import bounds_of
+from app.services.disclosure_issuer import normalize_issuer
 from app.services.disclosure_parser import Part
 from app.services.graph.base import normalize_name
 from app.services.graph.pgvector_store import PgVectorStore
@@ -303,11 +304,15 @@ async def _emit_asset(
     if not description or not value_band:
         return None
 
-    # Issuer / fund / bond descriptors are always OPEN.
-    tgt_type = _guess_org_type(description)
+    # D2.1 (2026-08-05): normalize to the ISSUER before resolution so
+    # ``NETFLIX INC REG S DUE ...`` resolves to the pre-existing NETFLIX
+    # canonical instead of minting a new junky-token node. Fragmentation
+    # incident: 3387 new vs 784 matched targets in the initial D2 run.
+    issuer_name = normalize_issuer(description) or description
+    tgt_type = _guess_org_type(issuer_name)
     tgt_id = await _resolve_or_create(
         db,
-        surface_name=description,
+        surface_name=issuer_name,
         entity_type=tgt_type,
         surface_mode=SurfaceMode.OPEN.value,
         resolve_cache=resolve_cache,
@@ -390,10 +395,14 @@ async def _emit_position(
     org_name = _extract_part1_org(lead)
     if not org_name:
         return None
-    tgt_type = _guess_org_type(org_name)
+    # D2.1: normalize Position org names too (strip legal-suffix cruft
+    # that would otherwise create ``CIC DIGITAL LLC`` alongside
+    # ``CIC Digital LLC``).
+    issuer_name = normalize_issuer(org_name) or org_name
+    tgt_type = _guess_org_type(issuer_name)
     tgt_id = await _resolve_or_create(
         db,
-        surface_name=org_name,
+        surface_name=issuer_name,
         entity_type=tgt_type,
         surface_mode=SurfaceMode.OPEN.value,
         resolve_cache=resolve_cache,
@@ -447,10 +456,15 @@ async def _emit_liability(
 
     person_suppressed = False
     tgt_type, is_person = _classify_creditor(creditor)
+    # D2.1: normalize ORG creditors (banks, LLCs, agencies). Persons run
+    # unchanged — normalize_issuer targets bond/security cruft, not
+    # human names, and the person-conservative default demands we never
+    # transform a person name.
+    creditor_for_resolve = creditor if is_person else (normalize_issuer(creditor) or creditor)
     if is_person:
         tgt_id = await _resolve_or_create(
             db,
-            surface_name=creditor,
+            surface_name=creditor_for_resolve,
             entity_type=tgt_type,
             surface_mode=SurfaceMode.SUPPRESS.value,
             resolve_cache=resolve_cache,
@@ -466,7 +480,7 @@ async def _emit_liability(
     else:
         tgt_id = await _resolve_or_create(
             db,
-            surface_name=creditor,
+            surface_name=creditor_for_resolve,
             entity_type=tgt_type,
             surface_mode=SurfaceMode.OPEN.value,
             resolve_cache=resolve_cache,
