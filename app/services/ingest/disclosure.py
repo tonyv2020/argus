@@ -35,6 +35,7 @@ from app.models import DisclosureDocument, DisclosureRow
 from app.services.disclosure_parser import (
     ParsedRow,
     parse_text,
+    parse_text_278t,
     summarize,
 )
 
@@ -151,8 +152,13 @@ async def ingest_annual(
         await db.refresh(doc)
         doc_id = doc.id
 
-    # Parse + ledger.
-    parsed_rows = parse_text(layout_text)
+    # Parse + ledger. 278-T periodic reports have a different top-level
+    # shape (no ``Part N:`` headers, single-purpose transactions
+    # section) so they route to the dedicated parser.
+    if form_type == "oge_278t":
+        parsed_rows = parse_text_278t(layout_text)
+    else:
+        parsed_rows = parse_text(layout_text)
     logger.info(
         "disclosure parse: doc_id=%s rows=%d",
         doc_id,
