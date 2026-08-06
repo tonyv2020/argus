@@ -219,10 +219,18 @@ def normalize_issuer(description: str) -> str:
     #     PARTN`` → ``CTF PARTN``).
     #   * Well-known historical-alias collapses (APPLE COMPUTER INC →
     #     APPLE INC).
+    #
+    # Applied as a FIXED-POINT LOOP: DB-then-year cascades matter
+    # (``...TAX 2020 DB`` → strip DB → ``...TAX 2020`` → strip year →
+    # ``...TAX``). A single pass ordered either way misses one direction.
     s = _POLISH_PARTN_RE.sub("PARTN", s)
-    s = _POLISH_TRAILING_YEAR_RE.sub("", s).rstrip()
-    s = _POLISH_TRAILING_DB_RE.sub("", s).rstrip()
-    s = _collapse_doubled_tail(s)
+    for _ in range(4):
+        before = s
+        s = _POLISH_TRAILING_DB_RE.sub("", s).rstrip()
+        s = _POLISH_TRAILING_YEAR_RE.sub("", s).rstrip()
+        s = _collapse_doubled_tail(s)
+        if s == before:
+            break
     s = _apply_historical_aliases(s)
 
     return s.strip()
