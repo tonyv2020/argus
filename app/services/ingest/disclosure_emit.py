@@ -277,10 +277,22 @@ async def _emit_row(
             resolve_cache=resolve_cache,
         )
 
-    # Parts 3 (agreements), 4 (comp), 7 (transactions), 9 (gifts) are
-    # not D2-scope per helen's dispatch. D3 handles Part 7 trades; Parts
-    # 3/4 have no HIGH rows (all narrative); Part 9 is scrutiny-heavy
-    # and follows in a later build.
+    # D3 (2026-08-06) — Part 7 transactions: Trump → issuer TRADED
+    # edges with (transaction_type, trade_date, amount_band).
+    if part == Part.PART_7_TRANSACTIONS.value:
+        return await _emit_transaction(
+            db,
+            doc=doc,
+            filer_id=filer_id,
+            row=row,
+            parsed=parsed,
+            resolve_cache=resolve_cache,
+        )
+
+    # Parts 3 (agreements), 4 (comp), 9 (gifts) still not in scope.
+    # Parts 3/4 have no HIGH rows (all narrative); Part 9 is
+    # scrutiny-heavy (named private donors) and follows in a later
+    # build.
     return None
 
 
@@ -368,6 +380,65 @@ async def _emit_asset(
             row=row,
         )
     return (EdgeRelation.HOLDS_ASSET.value, made_edge, made_citation, False)
+
+
+# ─── Transactions (Part 7 annual + 278-T) → traded ──────────────────
+
+
+async def _emit_transaction(
+    db: AsyncSession,
+    *,
+    doc: DisclosureDocument,
+    filer_id: str,
+    row: DisclosureRow,
+    parsed: dict,
+    resolve_cache: dict[tuple[str, str], str],
+) -> tuple[str, bool, bool, bool] | None:
+    """Emit a ``traded`` edge (Trump → issuer) for a Part 7 (annual) or
+    278-T (periodic) HIGH row.
+
+    Same resolve-to-existing-canonical path as ``_emit_asset`` — the
+    ``normalize_issuer`` step is what stops the transaction cargo
+    (bond descriptor, share class) from creating fragments.
+    """
+    description = (parsed.get("description") or "").strip()
+    amount_band = parsed.get("amount_band")
+    transaction_type = parsed.get("transaction_type")
+    trade_date = parsed.get("trade_date")
+    if not description or not amount_band or not transaction_type:
+        return None
+
+    issuer_name = normalize_issuer(description) or description
+    tgt_type = _guess_org_type(issuer_name)
+    tgt_id = await _resolve_or_create(
+        db,
+        surface_name=issuer_name,
+        entity_type=tgt_type,
+        surface_mode=SurfaceMode.OPEN.value,
+        resolve_cache=resolve_cache,
+    )
+    if tgt_id is None:
+        return None
+
+    a_low, a_high = _bounds(amount_band)
+    edge_meta = {
+        "transaction_type": transaction_type,
+        "trade_date": trade_date,
+        "amount_band": amount_band,
+        "band_low": a_low,
+        "band_high": a_high,
+        "account_group": row.account_group,
+        "part": row.part,
+    }
+    made_edge, edge_id = await _upsert_edge(
+        db,
+        source_id=filer_id,
+        target_id=tgt_id,
+        relation=EdgeRelation.TRADED.value,
+        edge_metadata=edge_meta,
+    )
+    made_citation = await _upsert_citation(db, edge_id=edge_id, doc=doc, row=row)
+    return (EdgeRelation.TRADED.value, made_edge, made_citation, False)
 
 
 # ─── Positions (Part 1) → held_position ─────────────────────────────
@@ -626,19 +697,32 @@ async def _upsert_citation(
     """Emit one OGE_278E citation on ``edge_id`` for ``row`` if not
     already present. Dedup on ``(edge_id, disclosure_row_id)`` so
     re-running is idempotent."""
+    # Tolerate multiple pre-existing citations for the same
+    # (edge_id, disclosure_row_id) — no unique constraint on that pair,
+    # and D2.1 fragment merges may have re-parented citations onto a
+    # survivor edge that already had one for the same row.
     existing = (
         await db.execute(
             select(SourceCitation.id).where(
                 SourceCitation.edge_id == edge_id,
                 SourceCitation.disclosure_row_id == row.id,
-            )
+            ).limit(1)
         )
     ).scalar_one_or_none()
     if existing is not None:
         return False
+    # Kind is dictated by the source document's form_type — annual
+    # ``oge_278e`` docs cite as OGE_278E; periodic ``oge_278t`` docs
+    # cite as OGE_278T (D3). Both fingerprints remain the same shape
+    # (URL + page anchor + FK back to the ledger row).
+    kind = (
+        SourceKind.OGE_278T.value
+        if doc.form_type == "oge_278t"
+        else SourceKind.OGE_278E.value
+    )
     citation = SourceCitation(
         edge_id=edge_id,
-        kind=SourceKind.OGE_278E.value,
+        kind=kind,
         citation_url=f"{doc.oge_url}#page={row.page}",
         citation_ref=f"{doc.sha256[:16]}::{row.part}::row{row.row_index}::p{row.page}",
         disclosure_row_id=row.id,
@@ -812,7 +896,7 @@ def _split_part8_tail(raw_tail: str) -> tuple[str | None, str | None, str | None
 
 
 async def _run_all_for_latest_doc() -> None:  # pragma: no cover — CLI shim
-    """Emit D2 edges for the most recently ingested disclosure_documents row."""
+    """Emit edges for the most recently ingested disclosure_documents row."""
     import logging as _logging
 
     _logging.basicConfig(level=_logging.INFO)
@@ -829,6 +913,37 @@ async def _run_all_for_latest_doc() -> None:  # pragma: no cover — CLI shim
             print("no disclosure_documents rows found — run D1 ingester first")
             return
     result = await emit_edges_for_doc(doc_id)
+    _print_summary(result)
+
+
+async def _run_all_docs() -> None:  # pragma: no cover — D3 CLI shim
+    """Emit edges for EVERY disclosure_documents row (annual + all 278-T)."""
+    import logging as _logging
+
+    _logging.basicConfig(level=_logging.INFO)
+    sm = get_sessionmaker()
+    async with sm() as db:
+        doc_rows = (
+            (
+                await db.execute(
+                    select(DisclosureDocument.id, DisclosureDocument.form_type,
+                           DisclosureDocument.filed_date)
+                    .order_by(DisclosureDocument.filed_date.asc())
+                )
+            )
+            .all()
+        )
+    print(f"emitting for {len(doc_rows)} disclosure_documents:")
+    for row in doc_rows:
+        print(f"  {row.filed_date} {row.form_type} id={row.id}")
+    for row in doc_rows:
+        print(f"\n=== doc {row.id} ({row.form_type} filed {row.filed_date}) ===")
+        result = await emit_edges_for_doc(row.id)
+        _print_summary(result)
+
+
+def _print_summary(result: EmitSummary) -> None:
+    """Pretty-print an ``EmitSummary`` block."""
     print(f"doc_id                    : {result.doc_id}")
     print(f"filer_canonical_id        : {result.filer_canonical_id}")
     print(f"high_rows_read            : {result.high_rows_read}")
@@ -840,15 +955,28 @@ async def _run_all_for_latest_doc() -> None:  # pragma: no cover — CLI shim
         print(f"  {rel:22s} = {n}")
     if result.unresolved:
         print(f"unresolved                : {len(result.unresolved)}")
-        for line in result.unresolved[:20]:
+        for line in result.unresolved[:5]:
             print(f"  {line}")
 
 
 def _entrypoint() -> None:  # pragma: no cover — CLI shim
-    """``python -m app.services.ingest.disclosure_emit``."""
+    """``python -m app.services.ingest.disclosure_emit [--all]``.
+
+    Default: emit for the most recently ingested doc. ``--all``: emit
+    for every disclosure_documents row (D3 uses this to cover annual
+    Part 7 + every 278-T periodic report in one pass).
+    """
+    import argparse
     import asyncio
 
-    asyncio.run(_run_all_for_latest_doc())
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--all", action="store_true",
+                    help="Emit for every disclosure_documents row.")
+    args = ap.parse_args()
+    if args.all:
+        asyncio.run(_run_all_docs())
+    else:
+        asyncio.run(_run_all_for_latest_doc())
 
 
 if __name__ == "__main__":  # pragma: no cover

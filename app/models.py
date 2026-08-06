@@ -91,6 +91,8 @@ class EdgeRelation(StrEnum):
     HELD_POSITION = "held_position"
     OWES = "owes"
     PARTY_TO_AGREEMENT = "party_to_agreement"
+    # D3 (2026-08-06) — OGE Part 7 annual + 278-T periodic transactions.
+    TRADED = "traded"
 
 
 class SourceKind(StrEnum):
