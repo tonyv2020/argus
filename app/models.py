@@ -71,6 +71,23 @@ class SurfaceMode(StrEnum):
     SUPPRESS = "suppress"  # not surfaced at all
 
 
+class PublicationState(StrEnum):
+    """RG1 (2026-08-07) — content-lifecycle gate orthogonal to surface_mode.
+
+    ``surface_mode`` gates PRIVACY; ``publication_state`` gates whether the
+    row is live on the public read path. Both gates AND — a published +
+    suppress row is still 404 to the public. A published node's staged
+    edges stay dark until the batch is published.
+
+    Migration default is ``PUBLISHED`` (server_default) so the existing
+    corpus stays live. Only bulk-disclosure ingests (RG3) stamp
+    ``STAGED``; steady-state emitters keep the column default.
+    """
+
+    PUBLISHED = "published"
+    STAGED = "staged"
+
+
 class EdgeRelation(StrEnum):
     """Relationship type on a canonical edge (design §4 table)."""
 
@@ -136,6 +153,14 @@ class CanonicalEntity(Base):
     # it's distinct + stable per real person.
     surface_mode: Mapped[str] = mapped_column(String(16), nullable=False, server_default="open")
     public_alias: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # RG1 (2026-08-07): content-lifecycle gate. Default 'published' so the
+    # existing corpus stays live post-migration; only bulk disclosure
+    # emitters stamp 'staged'. `batch_id` groups a bulk ingest for atomic
+    # publish/unpublish.
+    publication_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="published"
+    )
+    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -210,6 +235,13 @@ class CanonicalEdge(Base):
     # Bands stored as bands + numeric derivations; never a false-precision
     # point value on top of a band.
     edge_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    # RG1 (2026-08-07): mirrors CanonicalEntity — default 'published' keeps
+    # steady-state emitters' edges live; disclosure_emit (RG3) stamps
+    # 'staged' + a batch_id.
+    publication_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="published"
+    )
+    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
