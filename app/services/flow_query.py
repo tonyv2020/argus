@@ -35,6 +35,7 @@ from app.models import (
     EdgeRelation,
     EntityAlias,
 )
+from app.services.read_gate import published_edge
 
 
 @dataclass
@@ -136,11 +137,13 @@ async def _party_recipient_ids(
         return direct
 
     # Committees affiliated_with a party member (P5.3 bridge).
+    # RG2: exclude staged edges from public flow attribution.
     bridged = (
         await session.execute(
             select(CanonicalEdge.source_id).where(
                 CanonicalEdge.relation == EdgeRelation.AFFILIATED_WITH.value,
                 CanonicalEdge.target_id.in_(members),
+                published_edge(),
             )
         )
     ).scalars().all()
@@ -194,6 +197,7 @@ async def model1_flow(
         )
 
     # Aggregate contributions per contributor to any party recipient.
+    # RG2: staged contribution edges must not inflate a mid-batch flow response.
     contribs_stmt = (
         select(
             CanonicalEdge.source_id,
@@ -202,6 +206,7 @@ async def model1_flow(
         .where(
             CanonicalEdge.relation == EdgeRelation.CONTRIBUTES_TO.value,
             CanonicalEdge.target_id.in_(recipient_ids),
+            published_edge(),
         )
         .group_by(CanonicalEdge.source_id)
     )
@@ -218,11 +223,13 @@ async def model1_flow(
     # Attributed rows carry the ORIGINAL PAC's contribs on the org id.
     pac_ids = list(contribs.keys())
     if pac_ids:
+        # RG2: PAC → sponsor org attribution must not follow staged edges.
         pac_to_org = (
             await session.execute(
                 select(CanonicalEdge.source_id, CanonicalEdge.target_id).where(
                     CanonicalEdge.relation == EdgeRelation.AFFILIATED_WITH.value,
                     CanonicalEdge.source_id.in_(pac_ids),
+                    published_edge(),
                 )
             )
         ).all()
@@ -258,6 +265,7 @@ async def model1_flow(
 
     # Aggregate contracts per contributor (contributors that ALSO
     # hold contracts — the join point).
+    # RG2: staged contract edges must not surface in a public flow response.
     contracts_stmt = (
         select(
             CanonicalEdge.source_id,
@@ -266,6 +274,7 @@ async def model1_flow(
         .where(
             CanonicalEdge.relation == agency_relation,
             CanonicalEdge.source_id.in_(contribs.keys()),
+            published_edge(),
         )
         .group_by(CanonicalEdge.source_id)
     )
@@ -383,9 +392,11 @@ async def _yes_voter_ids_for_bill(
 ) -> set[str]:
     """Return the set of member canonical ids that voted YES on the
     given bill, optionally filtered to a party."""
+    # RG2: staged voted_for edges shouldn't seed a flow response.
     stmt = select(CanonicalEdge.source_id).where(
         CanonicalEdge.target_id == bill_id,
         CanonicalEdge.relation == EdgeRelation.VOTED_FOR.value,
+        published_edge(),
     )
     yes_ids = set((await session.execute(stmt)).scalars().all())
     if not party_filter or not yes_ids:
@@ -505,17 +516,20 @@ async def model2_flow(
 
     # Also include the yes-voters' principal-campaign committees (via
     # bridge affiliated_with target=member).
+    # RG2: staged affiliation edges shouldn't expand the recipient set.
     bridged = (
         await session.execute(
             select(CanonicalEdge.source_id).where(
                 CanonicalEdge.relation == EdgeRelation.AFFILIATED_WITH.value,
                 CanonicalEdge.target_id.in_(yes_ids),
+                published_edge(),
             )
         )
     ).scalars().all()
     recipient_ids = yes_ids | set(bridged)
 
     # Contribs → yes-voter recipients (sum per contributor).
+    # RG2: staged contribs must not appear in public $ totals.
     contribs_stmt = (
         select(
             CanonicalEdge.source_id,
@@ -524,6 +538,7 @@ async def model2_flow(
         .where(
             CanonicalEdge.relation == EdgeRelation.CONTRIBUTES_TO.value,
             CanonicalEdge.target_id.in_(recipient_ids),
+            published_edge(),
         )
         .group_by(CanonicalEdge.source_id)
     )
@@ -536,11 +551,13 @@ async def model2_flow(
     # congress-member intermediaries (same shape as Model 1).
     pac_ids = list(contribs.keys())
     if pac_ids:
+        # RG2: PAC → sponsor org attribution must not follow staged edges.
         pac_to_org = (
             await session.execute(
                 select(CanonicalEdge.source_id, CanonicalEdge.target_id).where(
                     CanonicalEdge.relation == EdgeRelation.AFFILIATED_WITH.value,
                     CanonicalEdge.source_id.in_(pac_ids),
+                    published_edge(),
                 )
             )
         ).all()
@@ -592,6 +609,7 @@ async def model2_flow(
 
     contracts = {}
     if agency_ids:
+        # RG2: staged contract edges must not appear in the funding-scope total.
         contracts_stmt = (
             select(
                 CanonicalEdge.source_id,
@@ -601,6 +619,7 @@ async def model2_flow(
                 CanonicalEdge.relation == EdgeRelation.HOLDS_CONTRACT.value,
                 CanonicalEdge.source_id.in_(list(contribs.keys())),
                 CanonicalEdge.target_id.in_(agency_ids),
+                published_edge(),
             )
             .group_by(CanonicalEdge.source_id)
         )

@@ -15,6 +15,11 @@ from app.db import get_db
 from app.models import CanonicalEntity, EntityAlias, SurfaceMode
 from app.services.graph.base import CytoscapeGraph, empty_graph
 from app.services.graph.pgvector_store import PgVectorStore
+from app.services.read_gate import (
+    is_published_entity,
+    published_edge,
+    published_entity,
+)
 
 
 def _public_label(ent: CanonicalEntity) -> str | None:
@@ -261,16 +266,22 @@ async def resolve(
 
 
 async def _entity_importance(db: AsyncSession, entity_id: str) -> int:
-    """Importance ~= edge count + citation count summed. Cheap proxy for node significance."""
+    """Importance ~= edge count + citation count summed. Cheap proxy for node significance.
+
+    RG2: staged edges MUST NOT inflate degree / citation counts / search ranking —
+    otherwise a staged batch would bump entities up the search order pre-publish.
+    """
     from sqlalchemy import func
 
     from app.models import CanonicalEdge, SourceCitation
 
     edge_count = (
         await db.execute(
-            select(func.count(CanonicalEdge.id)).where(
+            select(func.count(CanonicalEdge.id))
+            .where(
                 (CanonicalEdge.source_id == entity_id) | (CanonicalEdge.target_id == entity_id)
             )
+            .where(published_edge())
         )
     ).scalar_one() or 0
     citation_count = (
@@ -278,6 +289,7 @@ async def _entity_importance(db: AsyncSession, entity_id: str) -> int:
             select(func.count(SourceCitation.id))
             .join(CanonicalEdge, CanonicalEdge.id == SourceCitation.edge_id)
             .where((CanonicalEdge.source_id == entity_id) | (CanonicalEdge.target_id == entity_id))
+            .where(published_edge())
         )
     ).scalar_one() or 0
     return int(edge_count) + int(citation_count)
@@ -317,11 +329,13 @@ async def search(
     # query so a hot-word query (matches thousands) doesn't scan the world.
     fetch_cap = min(limit * 6, 200)
 
+    # RG2: all three candidate queries must apply the published-state gate.
     open_name_hits = (
         (
             await db.execute(
                 select(CanonicalEntity)
                 .where(CanonicalEntity.surface_mode == SurfaceMode.OPEN.value)
+                .where(published_entity())
                 .where(CanonicalEntity.canonical_name_normalized.ilike(like_any))
                 .limit(fetch_cap)
             )
@@ -336,6 +350,7 @@ async def search(
                 select(CanonicalEntity)
                 .join(EntityAlias, EntityAlias.canonical_id == CanonicalEntity.id)
                 .where(CanonicalEntity.surface_mode == SurfaceMode.OPEN.value)
+                .where(published_entity())
                 .where(EntityAlias.surface_name_normalized.ilike(like_any))
                 .limit(fetch_cap)
             )
@@ -349,6 +364,7 @@ async def search(
             await db.execute(
                 select(CanonicalEntity)
                 .where(CanonicalEntity.surface_mode == SurfaceMode.ALIAS.value)
+                .where(published_entity())
                 .where(CanonicalEntity.public_alias.ilike(like_any))
                 .limit(fetch_cap)
             )
@@ -455,6 +471,10 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
     ).scalar_one_or_none()
     if ent is None:
         raise HTTPException(status_code=404, detail="entity not found")
+    # RG2: staged entity itself is dark to the public — 404 with the same
+    # shape as the surface_mode gates below (never leak that it exists).
+    if not is_published_entity(ent):
+        raise HTTPException(status_code=404, detail="entity not found")
     label = _public_label(ent)
     if label is None:
         raise HTTPException(status_code=404, detail="entity not surfaceable")
@@ -466,13 +486,17 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
     # non-naming connection topology.
     is_open = ent.surface_mode == SurfaceMode.OPEN.value
 
+    # RG2: even for a published node, staged edges (mid-batch bulk ingest)
+    # must not surface until the batch is published.
     edges = (
         (
             await db.execute(
-                select(CanonicalEdge).where(
+                select(CanonicalEdge)
+                .where(
                     (CanonicalEdge.source_id == canonical_id)
                     | (CanonicalEdge.target_id == canonical_id)
                 )
+                .where(published_edge())
             )
         )
         .scalars()
@@ -688,7 +712,13 @@ async def get_entity_subgraph(
     ).scalar_one_or_none()
     if ent is None or _public_label(ent) is None:
         return empty_graph()
+    # RG2: subgraph of a staged entity = empty (same dark-until-published
+    # contract as the dossier 404).
+    if not is_published_entity(ent):
+        return empty_graph()
     store = PgVectorStore()
+    # RG2: the store honors the read-gate on its edge pull; staged edges +
+    # staged nodes never appear in the returned graph.
     graph = await store.get_entity_subgraph(db, canonical_id, hops=hops)
     # Rewrite labels + drop suppressed nodes before returning.
     node_ids = [n["data"]["id"] for n in graph["nodes"]]
