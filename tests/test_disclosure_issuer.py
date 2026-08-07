@@ -37,7 +37,11 @@ CASES: list[tuple[str, str]] = [
     ("AMAZON COM INC", "AMAZON COM INC"),
     ("AMAZON COM INC COM", "AMAZON COM INC"),
     ("AMAZON.COMINC", "AMAZON.COM INC"),
-    ("APPLECOMPUTERINC", "APPLE COMPUTER INC"),
+    # Space-repair glues APPLE+COMPUTER+INC, then the curated historical
+    # alias (Apple Computer Inc -> Apple Inc, the 2007 rename) collapses it
+    # onto the modern canonical. Same real entity: must resolve to the
+    # existing APPLE INC node, never fork a duplicate.
+    ("APPLECOMPUTERINC", "APPLE INC"),
     # Bond-descriptor cases (design §3 shape)
     (
         "NETFLIX INC REG S DUE 11/15/2029 5.375 REG INT ON 854000 BND",
