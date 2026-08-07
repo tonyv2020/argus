@@ -41,6 +41,7 @@ from app.models import (
     DisclosureRow,
     EdgeRelation,
     EntityType,
+    PublicationState,
     SourceCitation,
     SourceKind,
     SurfaceMode,
@@ -83,7 +84,12 @@ FILER_NAME = "Donald J. Trump"
 FILER_TYPE = EntityType.PERSON.value
 
 
-async def emit_edges_for_doc(doc_id: str, *, commit_every: int = 500) -> EmitSummary:
+async def emit_edges_for_doc(
+    doc_id: str,
+    *,
+    batch_id: str,
+    commit_every: int = 500,
+) -> EmitSummary:
     """Emit D2 edges for one archived disclosure document.
 
     Idempotent: re-running is safe. Edge dedup is by
@@ -97,14 +103,24 @@ async def emit_edges_for_doc(doc_id: str, *, commit_every: int = 500) -> EmitSum
     fallback in the pgvector store when the same issuer name recurs
     (typical in a Trump-annual: AAPL appears in every one of 8
     accounts × ~3-5 times).
+
+    RG3 (2026-08-07): bulk disclosure ingests write ``staged`` with a
+    ``batch_id`` grouping tag. The caller stamps ``batch_id`` — this
+    function never computes one internally. Publish happens via
+    ``POST /api/admin/batches/{batch_id}/publish`` after scrutiny
+    completes for every batch entity (RG4). Pre-existing entities
+    that merely gain a new staged edge are NOT touched — they stay
+    ``published``.
     """
+    if not batch_id:
+        raise ValueError("batch_id is required (RG3): stamp it in the caller, not here")
     sm = get_sessionmaker()
     async with sm() as db:
         doc = await db.get(DisclosureDocument, doc_id)
         if doc is None:
             raise ValueError(f"disclosure_documents/{doc_id} not found")
 
-        filer_id = await _get_or_create_filer(db)
+        filer_id = await _get_or_create_filer(db, batch_id=batch_id)
         await db.commit()  # persist filer independently of the emit batch loop
 
     stats: dict[str, int] = {}
@@ -146,6 +162,7 @@ async def emit_edges_for_doc(doc_id: str, *, commit_every: int = 500) -> EmitSum
                 filer_id=filer_id,
                 row=row,
                 resolve_cache=resolve_cache,
+                batch_id=batch_id,
             )
             if result is None:
                 unresolved.append(f"{row.id} [{row.part}]: no target derivable")
@@ -194,12 +211,17 @@ async def emit_edges_for_doc(doc_id: str, *, commit_every: int = 500) -> EmitSum
 # ─── Filer ──────────────────────────────────────────────────────────
 
 
-async def _get_or_create_filer(db: AsyncSession) -> str:
+async def _get_or_create_filer(db: AsyncSession, *, batch_id: str) -> str:
     """Find or create the Donald J. Trump canonical entity.
 
     Uses the graph store's name+embedding resolver first. If unresolved,
     creates a new PERSON canonical with ``surface_mode=OPEN`` (POTUS is
     a public official — the classic OPEN case).
+
+    RG3: pre-existing filer canonicals are NOT touched (stay
+    ``publication_state=published``). A brand-new filer canonical (the
+    theoretical first-run case) is stamped ``staged`` + ``batch_id``
+    per the bulk-ingest contract.
     """
     store = PgVectorStore()
     resolved = await store.resolve_entity(
@@ -217,6 +239,8 @@ async def _get_or_create_filer(db: AsyncSession) -> str:
         canonical_name_normalized=normalize_name(FILER_NAME),
         type=FILER_TYPE,
         surface_mode=SurfaceMode.OPEN.value,
+        publication_state=PublicationState.STAGED.value,
+        batch_id=batch_id,
     )
     db.add(filer)
     await db.flush()
@@ -233,12 +257,16 @@ async def _emit_row(
     filer_id: str,
     row: DisclosureRow,
     resolve_cache: dict[tuple[str, str], str],
+    batch_id: str,
 ) -> tuple[str, bool, bool, bool] | None:
     """Emit one edge (+ its citation) for one HIGH ledger row.
 
     Returns ``(relation, made_edge, made_citation, made_person_suppressed)``
     or ``None`` if the row's shape can't be turned into an edge (which
     still counts as a reconciliation gap the report will surface).
+
+    RG3: ``batch_id`` threads through every emitter so net-new edges +
+    net-new entities carry the run's grouping tag.
     """
     parsed = row.parsed or {}
     part = row.part
@@ -255,6 +283,7 @@ async def _emit_row(
             row=row,
             parsed=parsed,
             resolve_cache=resolve_cache,
+            batch_id=batch_id,
         )
 
     if part == Part.PART_1_POSITIONS.value:
@@ -265,6 +294,7 @@ async def _emit_row(
             row=row,
             parsed=parsed,
             resolve_cache=resolve_cache,
+            batch_id=batch_id,
         )
 
     if part == Part.PART_8_LIABILITIES.value:
@@ -275,6 +305,7 @@ async def _emit_row(
             row=row,
             parsed=parsed,
             resolve_cache=resolve_cache,
+            batch_id=batch_id,
         )
 
     # D3 (2026-08-06) — Part 7 transactions: Trump → issuer TRADED
@@ -287,6 +318,7 @@ async def _emit_row(
             row=row,
             parsed=parsed,
             resolve_cache=resolve_cache,
+            batch_id=batch_id,
         )
 
     # Parts 3 (agreements), 4 (comp), 9 (gifts) still not in scope.
@@ -307,6 +339,7 @@ async def _emit_asset(
     row: DisclosureRow,
     parsed: dict,
     resolve_cache: dict[tuple[str, str], str],
+    batch_id: str,
 ) -> tuple[str, bool, bool, bool] | None:
     """Emit ``holds_asset`` (always) + ``income_from`` (when income_band
     is present + non-trivial) for a Parts 2/5/6 row."""
@@ -328,6 +361,7 @@ async def _emit_asset(
         entity_type=tgt_type,
         surface_mode=SurfaceMode.OPEN.value,
         resolve_cache=resolve_cache,
+        batch_id=batch_id,
     )
     if tgt_id is None:
         return None
@@ -347,6 +381,7 @@ async def _emit_asset(
         target_id=tgt_id,
         relation=EdgeRelation.HOLDS_ASSET.value,
         edge_metadata=edge_meta,
+        batch_id=batch_id,
     )
     made_citation = await _upsert_citation(
         db,
@@ -372,6 +407,7 @@ async def _emit_asset(
             target_id=tgt_id,
             relation=EdgeRelation.INCOME_FROM.value,
             edge_metadata=income_meta,
+            batch_id=batch_id,
         )
         await _upsert_citation(
             db,
@@ -393,6 +429,7 @@ async def _emit_transaction(
     row: DisclosureRow,
     parsed: dict,
     resolve_cache: dict[tuple[str, str], str],
+    batch_id: str,
 ) -> tuple[str, bool, bool, bool] | None:
     """Emit a ``traded`` edge (Trump → issuer) for a Part 7 (annual) or
     278-T (periodic) HIGH row.
@@ -416,6 +453,7 @@ async def _emit_transaction(
         entity_type=tgt_type,
         surface_mode=SurfaceMode.OPEN.value,
         resolve_cache=resolve_cache,
+        batch_id=batch_id,
     )
     if tgt_id is None:
         return None
@@ -436,6 +474,7 @@ async def _emit_transaction(
         target_id=tgt_id,
         relation=EdgeRelation.TRADED.value,
         edge_metadata=edge_meta,
+        batch_id=batch_id,
     )
     made_citation = await _upsert_citation(db, edge_id=edge_id, doc=doc, row=row)
     return (EdgeRelation.TRADED.value, made_edge, made_citation, False)
@@ -452,6 +491,7 @@ async def _emit_position(
     row: DisclosureRow,
     parsed: dict,
     resolve_cache: dict[tuple[str, str], str],
+    batch_id: str,
 ) -> tuple[str, bool, bool, bool] | None:
     """Emit ``held_position`` for a Part 1 row.
 
@@ -477,6 +517,7 @@ async def _emit_position(
         entity_type=tgt_type,
         surface_mode=SurfaceMode.OPEN.value,
         resolve_cache=resolve_cache,
+        batch_id=batch_id,
     )
     if tgt_id is None:
         return None
@@ -490,6 +531,7 @@ async def _emit_position(
         target_id=tgt_id,
         relation=EdgeRelation.HELD_POSITION.value,
         edge_metadata=edge_meta,
+        batch_id=batch_id,
     )
     made_citation = await _upsert_citation(db, edge_id=edge_id, doc=doc, row=row)
     return (EdgeRelation.HELD_POSITION.value, made_edge, made_citation, False)
@@ -506,6 +548,7 @@ async def _emit_liability(
     row: DisclosureRow,
     parsed: dict,
     resolve_cache: dict[tuple[str, str], str],
+    batch_id: str,
 ) -> tuple[str, bool, bool, bool] | None:
     """Emit ``owes`` for a Part 8 row.
 
@@ -539,6 +582,7 @@ async def _emit_liability(
             entity_type=tgt_type,
             surface_mode=SurfaceMode.SUPPRESS.value,
             resolve_cache=resolve_cache,
+            batch_id=batch_id,
         )
         # Was it created NOW, or did it already exist?
         if tgt_id is not None:
@@ -555,6 +599,7 @@ async def _emit_liability(
             entity_type=tgt_type,
             surface_mode=SurfaceMode.OPEN.value,
             resolve_cache=resolve_cache,
+            batch_id=batch_id,
         )
     if tgt_id is None:
         return None
@@ -576,6 +621,7 @@ async def _emit_liability(
         target_id=tgt_id,
         relation=EdgeRelation.OWES.value,
         edge_metadata=edge_meta,
+        batch_id=batch_id,
     )
     made_citation = await _upsert_citation(db, edge_id=edge_id, doc=doc, row=row)
     return (
@@ -596,6 +642,7 @@ async def _resolve_or_create(
     entity_type: str,
     surface_mode: str,
     resolve_cache: dict[tuple[str, str], str],
+    batch_id: str,
 ) -> str | None:
     """Resolve ``surface_name`` in the graph store; on miss, create a
     new canonical with the given ``surface_mode``.
@@ -610,6 +657,12 @@ async def _resolve_or_create(
     fallback in :class:`PgVectorStore.resolve_entity` when the same
     issuer appears in many rows (typical in a Trump-annual: APPLE INC
     appears once per account × 8 accounts, roughly).
+
+    RG3: NET-NEW entities are stamped ``publication_state=staged`` +
+    ``batch_id``. PRE-EXISTING entities (both cache-hit and DB-hit
+    paths) are NOT touched — they keep whatever ``publication_state``
+    they already had (``published`` for the whole existing corpus,
+    per the RG1 migration default).
     """
     if not surface_name:
         return None
@@ -636,12 +689,14 @@ async def _resolve_or_create(
             resolve_cache[cache_key] = exact
             return exact
 
-    # New canonical.
+    # New canonical — bulk-disclosure emitter stamps staged + batch_id.
     ent = CanonicalEntity(
         canonical_name=surface_name,
         canonical_name_normalized=norm,
         type=entity_type,
         surface_mode=surface_mode,
+        publication_state=PublicationState.STAGED.value,
+        batch_id=batch_id,
     )
     db.add(ent)
     await db.flush()
@@ -656,10 +711,17 @@ async def _upsert_edge(
     target_id: str,
     relation: str,
     edge_metadata: dict,
+    batch_id: str,
 ) -> tuple[bool, str]:
     """Return ``(created, edge_id)``. Uniqueness on
     ``(source_id, target_id, relation)`` — re-running merges metadata
     into the existing edge rather than duplicating.
+
+    RG3: NEW edges are stamped ``publication_state=staged`` +
+    ``batch_id``. RE-RUN into an existing edge does NOT change either
+    field — the edge keeps its original publication_state / batch_id
+    (an already-published edge stays published; an already-staged edge
+    that spans multiple bulk-emit runs keeps its original batch tag).
     """
     existing = (
         await db.execute(
@@ -672,6 +734,7 @@ async def _upsert_edge(
     ).scalar_one_or_none()
     if existing is not None:
         # On re-run, merge new metadata (last-write-wins on scalar keys).
+        # publication_state + batch_id are left untouched — see docstring.
         merged = dict(existing.edge_metadata or {})
         merged.update(edge_metadata)
         existing.edge_metadata = merged
@@ -681,6 +744,8 @@ async def _upsert_edge(
         target_id=target_id,
         relation=relation,
         edge_metadata=edge_metadata,
+        publication_state=PublicationState.STAGED.value,
+        batch_id=batch_id,
     )
     db.add(edge)
     await db.flush()
@@ -895,7 +960,7 @@ def _split_part8_tail(raw_tail: str) -> tuple[str | None, str | None, str | None
 # ─── CLI entrypoint ─────────────────────────────────────────────────
 
 
-async def _run_all_for_latest_doc() -> None:  # pragma: no cover — CLI shim
+async def _run_all_for_latest_doc(batch_id: str) -> None:  # pragma: no cover — CLI shim
     """Emit edges for the most recently ingested disclosure_documents row."""
     import logging as _logging
 
@@ -912,12 +977,17 @@ async def _run_all_for_latest_doc() -> None:  # pragma: no cover — CLI shim
         if doc_id is None:
             print("no disclosure_documents rows found — run D1 ingester first")
             return
-    result = await emit_edges_for_doc(doc_id)
+    print(f"batch_id = {batch_id}")
+    result = await emit_edges_for_doc(doc_id, batch_id=batch_id)
     _print_summary(result)
 
 
-async def _run_all_docs() -> None:  # pragma: no cover — D3 CLI shim
-    """Emit edges for EVERY disclosure_documents row (annual + all 278-T)."""
+async def _run_all_docs(batch_id: str) -> None:  # pragma: no cover — D3 CLI shim
+    """Emit edges for EVERY disclosure_documents row (annual + all 278-T).
+
+    All docs in a single invocation share one ``batch_id`` — RG4 publish
+    lands the whole bulk pass atomically after scrutiny completes.
+    """
     import logging as _logging
 
     _logging.basicConfig(level=_logging.INFO)
@@ -933,12 +1003,13 @@ async def _run_all_docs() -> None:  # pragma: no cover — D3 CLI shim
             )
             .all()
         )
+    print(f"batch_id = {batch_id}")
     print(f"emitting for {len(doc_rows)} disclosure_documents:")
     for row in doc_rows:
         print(f"  {row.filed_date} {row.form_type} id={row.id}")
     for row in doc_rows:
         print(f"\n=== doc {row.id} ({row.form_type} filed {row.filed_date}) ===")
-        result = await emit_edges_for_doc(row.id)
+        result = await emit_edges_for_doc(row.id, batch_id=batch_id)
         _print_summary(result)
 
 
@@ -960,23 +1031,31 @@ def _print_summary(result: EmitSummary) -> None:
 
 
 def _entrypoint() -> None:  # pragma: no cover — CLI shim
-    """``python -m app.services.ingest.disclosure_emit [--all]``.
+    """``python -m app.services.ingest.disclosure_emit [--all] [--batch-id ID]``.
 
     Default: emit for the most recently ingested doc. ``--all``: emit
     for every disclosure_documents row (D3 uses this to cover annual
     Part 7 + every 278-T periodic report in one pass).
+
+    RG3: ``--batch-id`` groups this bulk ingest for RG4 atomic
+    publish/unpublish. Omitted → an opaque url-safe token is
+    generated in-CLI and stamped on every net-new row.
     """
     import argparse
     import asyncio
+    import secrets
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--all", action="store_true",
                     help="Emit for every disclosure_documents row.")
+    ap.add_argument("--batch-id", dest="batch_id", default=None,
+                    help="Bulk-ingest batch tag (auto-generated when omitted).")
     args = ap.parse_args()
+    batch_id = args.batch_id or f"bulk-{secrets.token_urlsafe(12)}"
     if args.all:
-        asyncio.run(_run_all_docs())
+        asyncio.run(_run_all_docs(batch_id))
     else:
-        asyncio.run(_run_all_for_latest_doc())
+        asyncio.run(_run_all_for_latest_doc(batch_id))
 
 
 if __name__ == "__main__":  # pragma: no cover

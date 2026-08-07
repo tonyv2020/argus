@@ -21,6 +21,7 @@ from app.services.graph.base import (
     empty_graph,
     normalize_name,
 )
+from app.services.read_gate import published_edge, published_entity
 
 
 def _vec_literal(embedding: list[float]) -> str:
@@ -106,10 +107,14 @@ class PgVectorStore(GraphStore):
         for _ in range(max(hops, 1)):
             if not frontier:
                 break
+            # RG2: only crawl published edges — staged edges are dark to
+            # the public read path even when the anchor is published.
             outbound = (
                 (
                     await session.execute(
-                        select(CanonicalEdge).where(CanonicalEdge.source_id.in_(frontier))
+                        select(CanonicalEdge)
+                        .where(CanonicalEdge.source_id.in_(frontier))
+                        .where(published_edge())
                     )
                 )
                 .scalars()
@@ -118,7 +123,9 @@ class PgVectorStore(GraphStore):
             inbound = (
                 (
                     await session.execute(
-                        select(CanonicalEdge).where(CanonicalEdge.target_id.in_(frontier))
+                        select(CanonicalEdge)
+                        .where(CanonicalEdge.target_id.in_(frontier))
+                        .where(published_edge())
                     )
                 )
                 .scalars()
@@ -148,21 +155,35 @@ class PgVectorStore(GraphStore):
         if not seen_nodes:
             return empty_graph()
 
+        # RG2: staged nodes never appear even if BFS surfaced them via a
+        # (defensive) published edge; belt-and-suspenders.
         nodes = (
             (
                 await session.execute(
-                    select(CanonicalEntity).where(CanonicalEntity.id.in_(seen_nodes))
+                    select(CanonicalEntity)
+                    .where(CanonicalEntity.id.in_(seen_nodes))
+                    .where(published_entity())
                 )
             )
             .scalars()
             .all()
         )
         edges = (
-            (await session.execute(select(CanonicalEdge).where(CanonicalEdge.id.in_(seen_edges))))
+            (
+                await session.execute(
+                    select(CanonicalEdge)
+                    .where(CanonicalEdge.id.in_(seen_edges))
+                    .where(published_edge())
+                )
+            )
             .scalars()
             .all()
         )
 
+        # RG2: dangling-edge guard — if a published edge points at a
+        # staged endpoint, the node filter above dropped that endpoint;
+        # drop the edge here too so the graph is closed under nodes.
+        node_id_set = {n.id for n in nodes}
         graph: CytoscapeGraph = {
             "nodes": [
                 {
@@ -185,6 +206,7 @@ class PgVectorStore(GraphStore):
                     }
                 }
                 for e in edges
+                if e.source_id in node_id_set and e.target_id in node_id_set
             ],
         }
         return graph

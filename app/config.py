@@ -43,5 +43,14 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-6"
 
+    # --- RG4 admin control surface (2026-08-07) --------------------------
+    # Shared secret required on every ``/api/admin/*`` call and on the
+    # ``include_staged=1`` preview flag. Env-injected via k8s Secret
+    # (see ``k8s/base/api.yaml`` — secretRef: ``argus-service-token``).
+    # Empty (unset) → admin endpoints refuse every call, and the
+    # preview flag is ignored even when set — the public read path can
+    # never opt into staged content.
+    argus_service_token: str = ""
+
 
 settings = Settings()

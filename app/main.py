@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db import get_db
 from app.models import CanonicalEntity, EntityAlias, SurfaceMode
 from app.services.graph.base import CytoscapeGraph, empty_graph
 from app.services.graph.pgvector_store import PgVectorStore
+from app.services.read_gate import (
+    is_published_entity,
+    maybe_published_edge,
+    maybe_published_entity,
+    published_edge,
+    published_entity,
+)
 
 
 def _public_label(ent: CanonicalEntity) -> str | None:
@@ -261,16 +270,22 @@ async def resolve(
 
 
 async def _entity_importance(db: AsyncSession, entity_id: str) -> int:
-    """Importance ~= edge count + citation count summed. Cheap proxy for node significance."""
+    """Importance ~= edge count + citation count summed. Cheap proxy for node significance.
+
+    RG2: staged edges MUST NOT inflate degree / citation counts / search ranking —
+    otherwise a staged batch would bump entities up the search order pre-publish.
+    """
     from sqlalchemy import func
 
     from app.models import CanonicalEdge, SourceCitation
 
     edge_count = (
         await db.execute(
-            select(func.count(CanonicalEdge.id)).where(
+            select(func.count(CanonicalEdge.id))
+            .where(
                 (CanonicalEdge.source_id == entity_id) | (CanonicalEdge.target_id == entity_id)
             )
+            .where(published_edge())
         )
     ).scalar_one() or 0
     citation_count = (
@@ -278,6 +293,7 @@ async def _entity_importance(db: AsyncSession, entity_id: str) -> int:
             select(func.count(SourceCitation.id))
             .join(CanonicalEdge, CanonicalEdge.id == SourceCitation.edge_id)
             .where((CanonicalEdge.source_id == entity_id) | (CanonicalEdge.target_id == entity_id))
+            .where(published_edge())
         )
     ).scalar_one() or 0
     return int(edge_count) + int(citation_count)
@@ -287,6 +303,13 @@ async def _entity_importance(db: AsyncSession, entity_id: str) -> int:
 async def search(
     q: str = Query(..., min_length=1, max_length=120),
     limit: int = Query(20, ge=1, le=50),
+    include_staged: bool = Query(
+        False,
+        description="RG4 preview flag: include staged entities. IGNORED unless "
+        "the request also carries a matching X-Argus-Service-Token header — the "
+        "public read path can never opt in.",
+    ),
+    x_argus_service_token: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Search canonical entities by name / alias — scrutiny-respecting + ranked.
@@ -313,15 +336,24 @@ async def search(
     like_any = f"%{q_norm}%"
     like_prefix = f"{q_norm}%"
 
+    # RG4: preview flag is honored only when the request also carries a
+    # matching service token. Public callers cannot opt in — the flag is
+    # silently downgraded to False.
+    preview = include_staged and _preview_ok(x_argus_service_token)
+    pub_entity = maybe_published_entity(preview)
+
     # Pull an over-sized candidate set so we can rank + trim. Cap each source
     # query so a hot-word query (matches thousands) doesn't scan the world.
     fetch_cap = min(limit * 6, 200)
 
+    # RG2: all three candidate queries share the same published-state gate
+    # (relaxed to always-true when RG4 preview is authorized).
     open_name_hits = (
         (
             await db.execute(
                 select(CanonicalEntity)
                 .where(CanonicalEntity.surface_mode == SurfaceMode.OPEN.value)
+                .where(pub_entity)
                 .where(CanonicalEntity.canonical_name_normalized.ilike(like_any))
                 .limit(fetch_cap)
             )
@@ -336,6 +368,7 @@ async def search(
                 select(CanonicalEntity)
                 .join(EntityAlias, EntityAlias.canonical_id == CanonicalEntity.id)
                 .where(CanonicalEntity.surface_mode == SurfaceMode.OPEN.value)
+                .where(pub_entity)
                 .where(EntityAlias.surface_name_normalized.ilike(like_any))
                 .limit(fetch_cap)
             )
@@ -349,6 +382,7 @@ async def search(
             await db.execute(
                 select(CanonicalEntity)
                 .where(CanonicalEntity.surface_mode == SurfaceMode.ALIAS.value)
+                .where(pub_entity)
                 .where(CanonicalEntity.public_alias.ilike(like_any))
                 .limit(fetch_cap)
             )
@@ -431,7 +465,17 @@ async def search(
 
 
 @app.get("/api/entities/{canonical_id}")
-async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_entity(
+    canonical_id: str,
+    include_staged: bool = Query(
+        False,
+        description="RG4 preview flag: include staged entity + staged edges. "
+        "IGNORED unless the request also carries a matching X-Argus-Service-Token "
+        "header — the public read path can never opt in.",
+    ),
+    x_argus_service_token: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
     """Return the canonical entity's dossier — sourced articles + connections-by-relation.
 
     Helen 2026-07-17 dossier: instead of the bare id/label/type/surface_mode, the
@@ -450,10 +494,20 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
 
     from app.models import CanonicalEdge, SourceCitation
 
+    # RG4: preview flag is silently downgraded to False for callers
+    # without a matching service-token header. Only privileged (in-pod
+    # workflow) callers can preview staged content.
+    preview = include_staged and _preview_ok(x_argus_service_token)
+
     ent = (
         await db.execute(select(CanonicalEntity).where(CanonicalEntity.id == canonical_id))
     ).scalar_one_or_none()
     if ent is None:
+        raise HTTPException(status_code=404, detail="entity not found")
+    # RG2: staged entity itself is dark to the public — 404 with the same
+    # shape as the surface_mode gates below (never leak that it exists).
+    # RG4 preview may skip this gate.
+    if not preview and not is_published_entity(ent):
         raise HTTPException(status_code=404, detail="entity not found")
     label = _public_label(ent)
     if label is None:
@@ -466,13 +520,18 @@ async def get_entity(canonical_id: str, db: AsyncSession = Depends(get_db)) -> d
     # non-naming connection topology.
     is_open = ent.surface_mode == SurfaceMode.OPEN.value
 
+    # RG2: even for a published node, staged edges (mid-batch bulk ingest)
+    # must not surface until the batch is published (relaxed under
+    # RG4 preview).
     edges = (
         (
             await db.execute(
-                select(CanonicalEdge).where(
+                select(CanonicalEdge)
+                .where(
                     (CanonicalEdge.source_id == canonical_id)
                     | (CanonicalEdge.target_id == canonical_id)
                 )
+                .where(maybe_published_edge(preview))
             )
         )
         .scalars()
@@ -688,7 +747,13 @@ async def get_entity_subgraph(
     ).scalar_one_or_none()
     if ent is None or _public_label(ent) is None:
         return empty_graph()
+    # RG2: subgraph of a staged entity = empty (same dark-until-published
+    # contract as the dossier 404).
+    if not is_published_entity(ent):
+        return empty_graph()
     store = PgVectorStore()
+    # RG2: the store honors the read-gate on its edge pull; staged edges +
+    # staged nodes never appear in the returned graph.
     graph = await store.get_entity_subgraph(db, canonical_id, hops=hops)
     # Rewrite labels + drop suppressed nodes before returning.
     node_ids = [n["data"]["id"] for n in graph["nodes"]]
@@ -803,4 +868,172 @@ async def flow_model1(
             }
             for r in summary.rows
         ],
+    }
+
+
+# ─── RG4 (2026-08-07) — admin control surface ─────────────────────────
+#
+# Publish + unpublish a bulk-disclosure batch atomically. Gated by
+# ``X-Argus-Service-Token`` (env-injected). PRECONDITION on publish:
+# every entity in the batch must carry a ``scrutiny_decision`` row —
+# publishing before privacy has run is refused with 409. See design
+# doc: ``helen-k3s/docs/argus-read-gate-hardening-design.md``.
+
+
+logger = logging.getLogger(__name__)
+
+
+def _preview_ok(token: str | None) -> bool:
+    """RG4: does this request qualify for the ``include_staged=1`` preview?
+
+    True ONLY when the server was configured with a token AND the caller
+    presented a matching header. An unset server token (empty string)
+    means: no one gets preview, regardless of what header they send —
+    fail-closed so a misconfigured cluster never accidentally opens the
+    preview to the public API.
+    """
+    if not settings.argus_service_token:
+        return False
+    return token == settings.argus_service_token
+
+
+async def require_service_token(
+    x_argus_service_token: str | None = Header(default=None),
+) -> str:
+    """FastAPI dependency: reject with 401 when the caller has NOT
+    presented a matching ``X-Argus-Service-Token`` header (or the
+    server was never configured with one)."""
+    if not _preview_ok(x_argus_service_token):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return x_argus_service_token or ""
+
+
+async def _batch_entities_missing_scrutiny(
+    db: AsyncSession, batch_id: str
+) -> list[tuple[str, str]]:
+    """Return ``[(canonical_id, canonical_name), ...]`` for every entity
+    in the given batch that has NO row in ``scrutiny_decisions``.
+
+    The publish precondition (spec §RG4): "cannot go live before
+    privacy has run." Any name-carrying entity that skipped scrutiny
+    is a potential fail-open leak, so publish is refused with 409
+    until every batch entity is decided.
+    """
+    from sqlalchemy import text
+
+    rows = (
+        await db.execute(
+            text(
+                "SELECT ce.id, ce.canonical_name FROM canonical_entities ce "
+                "LEFT JOIN scrutiny_decisions sd ON sd.canonical_id = ce.id "
+                "WHERE ce.batch_id = :b AND sd.id IS NULL "
+                "ORDER BY ce.canonical_name"
+            ),
+            {"b": batch_id},
+        )
+    ).all()
+    return [(r[0], r[1]) for r in rows]
+
+
+@app.post("/api/admin/batches/{batch_id}/publish")
+async def admin_publish_batch(
+    batch_id: str,
+    db: AsyncSession = Depends(get_db),
+    _token: str = Depends(require_service_token),
+) -> dict:
+    """Publish every ``staged`` entity + edge in ``batch_id`` atomically.
+
+    Refuses 409 when any batch entity lacks a ``scrutiny_decision`` row
+    (with the list of blocking canonicals in the detail payload — the
+    admin caller can look at what's outstanding). Idempotent: publishing
+    an already-published batch flips nothing but still returns counts of
+    zero (edges_published + entities_published) so the caller can tell
+    the batch was seen but no work was needed.
+    """
+    from sqlalchemy import text
+
+    missing = await _batch_entities_missing_scrutiny(db, batch_id)
+    if missing:
+        # Leak-safe: show only IDs + counts, not real names in the
+        # error body (a suppressed person's name in a 409 body defeats
+        # the whole privacy stack).
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "scrutiny_incomplete",
+                "batch_id": batch_id,
+                "missing_scrutiny_count": len(missing),
+                "missing_scrutiny_ids": [m[0] for m in missing[:20]],
+                "message": (
+                    f"{len(missing)} entities in batch {batch_id!r} lack a "
+                    "scrutiny_decision — run scrutiny before publish."
+                ),
+            },
+        )
+
+    edge_result = await db.execute(
+        text(
+            "UPDATE canonical_edges SET publication_state='published' "
+            "WHERE batch_id = :b AND publication_state='staged'"
+        ),
+        {"b": batch_id},
+    )
+    entity_result = await db.execute(
+        text(
+            "UPDATE canonical_entities SET publication_state='published' "
+            "WHERE batch_id = :b AND publication_state='staged'"
+        ),
+        {"b": batch_id},
+    )
+    await db.commit()
+    edges_published = edge_result.rowcount or 0
+    entities_published = entity_result.rowcount or 0
+    logger.info(
+        "RG4 admin_publish_batch batch_id=%s edges=%d entities=%d",
+        batch_id, edges_published, entities_published,
+    )
+    return {
+        "batch_id": batch_id,
+        "edges_published": edges_published,
+        "entities_published": entities_published,
+    }
+
+
+@app.post("/api/admin/batches/{batch_id}/unpublish")
+async def admin_unpublish_batch(
+    batch_id: str,
+    db: AsyncSession = Depends(get_db),
+    _token: str = Depends(require_service_token),
+) -> dict:
+    """Instant kill-switch: flip every published row in ``batch_id`` back
+    to ``staged``. No scrutiny precondition (unpublishing is a safety op —
+    always allowed to hide, even without scrutiny state). Idempotent.
+    """
+    from sqlalchemy import text
+
+    edge_result = await db.execute(
+        text(
+            "UPDATE canonical_edges SET publication_state='staged' "
+            "WHERE batch_id = :b AND publication_state='published'"
+        ),
+        {"b": batch_id},
+    )
+    entity_result = await db.execute(
+        text(
+            "UPDATE canonical_entities SET publication_state='staged' "
+            "WHERE batch_id = :b AND publication_state='published'"
+        ),
+        {"b": batch_id},
+    )
+    await db.commit()
+    edges_unpublished = edge_result.rowcount or 0
+    entities_unpublished = entity_result.rowcount or 0
+    logger.info(
+        "RG4 admin_unpublish_batch batch_id=%s edges=%d entities=%d",
+        batch_id, edges_unpublished, entities_unpublished,
+    )
+    return {
+        "batch_id": batch_id,
+        "edges_unpublished": edges_unpublished,
+        "entities_unpublished": entities_unpublished,
     }

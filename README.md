@@ -40,3 +40,37 @@ Cytoscape viz). It shares zero code — own repo, own DB, own deploy.
 Before any real-person node or edge surfaces, an automated agent classifies public vs private
 figure, applies a tiered bar (very-high for private, medium-high for public), and logs its reason
 (auditable). Sonnet-floor LLM. Design §5.4.
+
+## Read-gate + publication lifecycle (RG, 2026-08-07)
+
+Every canonical entity + edge carries a `publication_state` (`published` | `staged`) plus an
+optional `batch_id`. `published` rows are live on the public read path; `staged` rows are
+invisible to `/api/search`, `/api/entities/{id}` (404), `/api/entities/{id}/subgraph`,
+`/api/flow/model1`, `/api/flow/model2`, and the internal ranking-signal `_entity_importance`.
+
+The column default is `published` so the whole existing corpus stays live; only bulk-disclosure
+ingests (see `app/services/ingest/disclosure_emit.py`) stamp `staged` on net-new rows and pass a
+caller-supplied `batch_id` grouping tag. Steady-state emitters (news cooccurrence, FEC, LDA,
+USAspending) keep writing `published` via the column default.
+
+Admin operators publish a bulk batch atomically once scrutiny has run:
+
+```
+POST /api/admin/batches/{batch_id}/publish     (X-Argus-Service-Token required)
+POST /api/admin/batches/{batch_id}/unpublish   (kill-switch — same token)
+```
+
+`publish` refuses `409 {reason: "scrutiny_incomplete", missing_scrutiny_count, ...}` when any
+batch entity lacks a `scrutiny_decisions` row. `unpublish` has no precondition (a safety op is
+always allowed to hide). Both return `{batch_id, edges_(un)published, entities_(un)published}`
+and are idempotent.
+
+The privileged preview flag `?include_staged=1` on `/api/entities/{id}` and `/api/search` is
+silently ignored unless the caller also presents a matching `X-Argus-Service-Token` header —
+the public path can never opt into staged content.
+
+`publication_state` is orthogonal to `surface_mode` — both gates AND at read time. A
+`published` + `suppress` entity is still 404. The receipts / edge_metadata open-on-both-ends
+rule (D4) is untouched.
+
+Full operator guide: [`docs/read-gate.md`](docs/read-gate.md).
