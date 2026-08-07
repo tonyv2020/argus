@@ -48,6 +48,15 @@ spec:
             - secretRef:
                 name: argus-congress
                 optional: true
+            # RG4 (2026-08-07) — env-injects ARGUS_SERVICE_TOKEN for
+            # /api/admin/batches/{id}/{publish,unpublish} + the header-
+            # gated include_staged preview. `optional: true` so a
+            # cluster without the secret still boots (the token stays
+            # empty → admin endpoints refuse every call, preview flag
+            # is ignored — safe default).
+            - secretRef:
+                name: argus-service-token
+                optional: true
           ports:
             - containerPort: 8000
           readinessProbe:

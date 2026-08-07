@@ -38,3 +38,29 @@ def is_published_entity(ent: CanonicalEntity) -> bool:
     unit tests + fixtures usable without stamping every row.
     """
     return (ent.publication_state or _PUBLISHED) == _PUBLISHED
+
+
+# RG4 (2026-08-07) — preview-aware variants for the two endpoints that
+# accept ``?include_staged=1`` (search + dossier). Every other read path
+# uses the plain ``published_*`` gate — subgraph, flow, and importance
+# do NOT expose a preview flag (spec §RG4).
+
+
+def maybe_published_entity(include_staged: bool):
+    """SQLAlchemy predicate that becomes a no-op when the caller has
+    presented the service token AND asked for the preview.
+    """
+    if include_staged:
+        from sqlalchemy import true
+
+        return true()
+    return published_entity()
+
+
+def maybe_published_edge(include_staged: bool):
+    """Edge counterpart to :func:`maybe_published_entity`."""
+    if include_staged:
+        from sqlalchemy import true
+
+        return true()
+    return published_edge()
