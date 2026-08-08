@@ -322,8 +322,21 @@ async def search(
       Tier 1  EntityAlias.surface_name_normalized substring (open only).
       Tier 1  public_alias contains q (alias-mode only).
 
-    Within a tier: rank by node importance (edge_count + citation_count) desc,
-    then alphabetical by label for a stable ordering.
+    AF2 (2026-08-08) — disclosure-carrier bump: entities holding at
+    least one edge in the OGE disclosure-relation set (holds_asset /
+    income_from / held_position / owes / traded / party_to_agreement)
+    get ``+2`` on their effective tier. Rationale from the discovery
+    incident: "Donald J. Trump" (8 211 disclosure edges, importance
+    ~39 000) was tier-3 substring while "Trump" (concept, 0
+    disclosure, importance 1 990) was tier-5 exact — so a user
+    searching *trump* couldn't discover the disclosure-rich node.
+    Bumping the disclosure-carrier by two tiers lets importance
+    decide the top of the ranking as intended. Never touches
+    ``surface_mode``.
+
+    Within a tier (post-bump): rank by node importance
+    (edge_count + citation_count from the RG2-published-edge filter)
+    desc, then alphabetical by label for a stable ordering.
 
     Scrutiny (unchanged):
       * SUPPRESS entities are never returned.
@@ -440,27 +453,67 @@ async def search(
             continue
         dedup.setdefault(e.id, e)
 
-    # Rank tier desc, then importance desc, then label asc.
-    ranked: list[tuple[int, int, str, CanonicalEntity]] = []
+    # AF2 (2026-08-08): one bulk query to figure out which candidates
+    # carry at least one disclosure-relation published edge — feeds a
+    # +2 tier bump so disclosure-rich entities outrank bare stubs
+    # (see docstring for rationale).
+    disclosure_carriers: set[str] = set()
+    if dedup:
+        from app.models import CanonicalEdge, EdgeRelation
+
+        candidate_ids = list(dedup.keys())
+        _DISCLOSURE_RELATIONS = (
+            EdgeRelation.HOLDS_ASSET.value,
+            EdgeRelation.INCOME_FROM.value,
+            EdgeRelation.HELD_POSITION.value,
+            EdgeRelation.OWES.value,
+            EdgeRelation.TRADED.value,
+            EdgeRelation.PARTY_TO_AGREEMENT.value,
+        )
+        rows = (
+            await db.execute(
+                select(CanonicalEdge.source_id, CanonicalEdge.target_id)
+                .where(
+                    (CanonicalEdge.source_id.in_(candidate_ids))
+                    | (CanonicalEdge.target_id.in_(candidate_ids))
+                )
+                .where(CanonicalEdge.relation.in_(_DISCLOSURE_RELATIONS))
+                .where(published_edge())
+            )
+        ).all()
+        candidate_set = set(candidate_ids)
+        for src, tgt in rows:
+            if src in candidate_set:
+                disclosure_carriers.add(src)
+            if tgt in candidate_set:
+                disclosure_carriers.add(tgt)
+
+    # Rank effective_tier desc, then importance desc, then label asc.
+    ranked: list[tuple[int, int, int, str, CanonicalEntity]] = []
     for e in dedup.values():
         tier = _final_tier(e)
+        bump = 2 if e.id in disclosure_carriers else 0
         importance = await _entity_importance(db, e.id)
         label = _public_label(e) or ""
-        ranked.append((tier, importance, label.lower(), e))
-    ranked.sort(key=lambda t: (-t[0], -t[1], t[2]))
+        ranked.append((tier + bump, tier, importance, label.lower(), e))
+    ranked.sort(key=lambda t: (-t[0], -t[2], t[3]))
 
     out: list[dict] = []
-    for tier, importance, _label, e in ranked[:limit]:
-        out.append(
-            {
-                "id": e.id,
-                "label": _public_label(e),
-                "type": e.type,
-                "surface_mode": e.surface_mode,
-                "rank_tier": tier,
-                "importance": importance,
-            }
-        )
+    for effective_tier, base_tier, importance, _label, e in ranked[:limit]:
+        row = {
+            "id": e.id,
+            "label": _public_label(e),
+            "type": e.type,
+            "surface_mode": e.surface_mode,
+            "rank_tier": effective_tier,
+            "importance": importance,
+        }
+        # Only surface the boost delta when it applies — keeps the
+        # response schema backward-compat when nothing was boosted.
+        if effective_tier != base_tier:
+            row["base_tier"] = base_tier
+            row["disclosure_boosted"] = True
+        out.append(row)
     return {"q": q, "matched": len(out), "results": out}
 
 
