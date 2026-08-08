@@ -389,11 +389,21 @@ function renderPanel(entity) {
       : `<h2>In the news</h2>
          ${articles.length === 0
            ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No Tony Times articles cite this entity yet.</div>'
-           : `<ul>${articles.slice(0,25).map(a => `
+           : `<ul>${articles.slice(0,25).map(a => {
+               // AF1 (2026-08-08) — dead-link guard. Backend healer
+               // rewrites holo:// citations to /s/<slug> on every
+               // sweep, but until the slug lands upstream the URL
+               // stays holo://. Never render that as clickable —
+               // fall back to non-clickable text of the ref/URL.
+               const isLive = typeof a.url === 'string' && !a.url.startsWith('holo://');
+               const label = a.ref || a.url;
+               return `
              <li class="article">
-               <a href="${a.url}" target="_blank" rel="noopener">${a.ref || a.url}</a>
-             </li>
-           `).join('')}${articles.length > 25 ? `<li class="article" style="color:var(--muted);border:none;">+${articles.length - 25} more…</li>` : ''}</ul>`}
+               ${isLive
+                 ? `<a href="${a.url}" target="_blank" rel="noopener">${label}</a>`
+                 : `<span class="article-pending" title="Awaiting permalink">${label}</span>`}
+             </li>`;
+             }).join('')}${articles.length > 25 ? `<li class="article" style="color:var(--muted);border:none;">+${articles.length - 25} more…</li>` : ''}</ul>`}
       `}
     ${disclosureBlocks ? `<h2>Financial disclosure</h2><div class="disclosure-note">Cited to OGE 278e/278-T public filings; each row links to the source PDF page.</div>${disclosureBlocks}` : ''}
     <h2>Connections</h2>

@@ -7,7 +7,9 @@ Sequences (in order):
     4. USAspending ingest from registry
     5. LDA ingest from registry
     6. SEC EDGAR ingest from registry
-    7. Neo4j reproject
+    7. Heal any dead ``holo://news_item/<uuid>`` citation URLs whose
+       hollywood permalink_slug has now landed (AF1, 2026-08-08).
+    8. Neo4j reproject
 
 Each step is wrapped in a try/except so one failure doesn't stall the
 rest. Per-step counters roll into a single log line so operator log
@@ -26,6 +28,7 @@ import os
 from app.services.ingest import (
     congress_roster,
     fec,
+    heal_holo_citations,
     project_to_neo4j,
     sec_edgar,
     senate_lda,
@@ -117,7 +120,18 @@ async def run_sweep() -> dict[str, object]:
         logger.exception("sec_edgar failed")
         out["sec_edgar"] = "error"
 
-    # 7. Reproject the newly-landed edges to Neo4j.
+    # 7. Heal dead holo:// citations whose slug has now landed (AF1).
+    #    Idempotent — safe to run every sweep. Rows whose slug is
+    #    still missing on the hollywood side are left in place for
+    #    the next sweep.
+    try:
+        out["heal_holo_citations"] = await heal_holo_citations.heal_holo_citations()
+        logger.info("[heal_holo_citations] %s", out["heal_holo_citations"])
+    except Exception:
+        logger.exception("heal_holo_citations failed")
+        out["heal_holo_citations"] = "error"
+
+    # 8. Reproject the newly-landed edges to Neo4j.
     try:
         out["reproject"] = await project_to_neo4j.main_async()
         logger.info("[reproject] %s", out["reproject"])
