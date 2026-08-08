@@ -322,17 +322,27 @@ async def search(
       Tier 1  EntityAlias.surface_name_normalized substring (open only).
       Tier 1  public_alias contains q (alias-mode only).
 
-    AF2 (2026-08-08) — disclosure-carrier bump: entities holding at
-    least one edge in the OGE disclosure-relation set (holds_asset /
-    income_from / held_position / owes / traded / party_to_agreement)
-    get ``+2`` on their effective tier. Rationale from the discovery
-    incident: "Donald J. Trump" (8 211 disclosure edges, importance
-    ~39 000) was tier-3 substring while "Trump" (concept, 0
-    disclosure, importance 1 990) was tier-5 exact — so a user
-    searching *trump* couldn't discover the disclosure-rich node.
-    Bumping the disclosure-carrier by two tiers lets importance
-    decide the top of the ranking as intended. Never touches
-    ``surface_mode``.
+    AF2 (2026-08-08) — disclosure-filer bump: entities that are the
+    SOURCE (filer) of at least one edge in the OGE disclosure-relation
+    set (holds_asset / income_from / held_position / owes / traded /
+    party_to_agreement) get ``+2`` on their effective tier.
+
+    Filer-only (source, not target) is intentional: a disclosure
+    edge points from the person who filed the 278e/278-T to the
+    asset/counterparty they disclosed. Bumping BOTH sides would put
+    every wholly-owned asset (Trump Tower LLC, held stocks, etc.)
+    ahead of the filer they belong to — which was the first-cut of
+    AF2's failure mode. Source-side only lifts the disclosure
+    AGGREGATOR to the top, where the whole portfolio is
+    discoverable via a single click.
+
+    Rationale from the discovery incident: "Donald J. Trump"
+    (8 211 disclosure edges as filer, importance ~39 000) was
+    tier-3 substring while "Trump" (concept, 0 disclosure, importance
+    1 990) was tier-5 exact — so a user searching *trump* couldn't
+    reach the disclosure-rich node. Bumping the filer by two tiers
+    ties or beats the exact-match stubs, then importance decides
+    the top of the ranking. Never touches ``surface_mode``.
 
     Within a tier (post-bump): rank by node importance
     (edge_count + citation_count from the RG2-published-edge filter)
@@ -454,9 +464,18 @@ async def search(
         dedup.setdefault(e.id, e)
 
     # AF2 (2026-08-08): one bulk query to figure out which candidates
-    # carry at least one disclosure-relation published edge — feeds a
-    # +2 tier bump so disclosure-rich entities outrank bare stubs
-    # (see docstring for rationale).
+    # are FILERS of disclosure edges — feeds a +2 tier bump so the
+    # disclosure-rich filer outranks bare stubs (see docstring for
+    # rationale).
+    #
+    # Filer-only (source, not target): a disclosure edge points from
+    # the person who filed the 278e/278-T to the asset/counterparty
+    # they disclosed. If we bumped BOTH sides, every wholly-owned
+    # asset entity (Trump Tower LLC, Trump Media, an S&P 500 stock)
+    # would also boost and outrank the filer they belong to — which
+    # is what the first-cut of AF2 did wrong. Bumping the SOURCE
+    # side only puts the disclosure aggregator (the filer) at the
+    # top, where the whole portfolio is discoverable.
     disclosure_carriers: set[str] = set()
     if dedup:
         from app.models import CanonicalEdge, EdgeRelation
@@ -472,21 +491,15 @@ async def search(
         )
         rows = (
             await db.execute(
-                select(CanonicalEdge.source_id, CanonicalEdge.target_id)
-                .where(
-                    (CanonicalEdge.source_id.in_(candidate_ids))
-                    | (CanonicalEdge.target_id.in_(candidate_ids))
-                )
+                select(CanonicalEdge.source_id)
+                .where(CanonicalEdge.source_id.in_(candidate_ids))
                 .where(CanonicalEdge.relation.in_(_DISCLOSURE_RELATIONS))
                 .where(published_edge())
+                .distinct()
             )
         ).all()
-        candidate_set = set(candidate_ids)
-        for src, tgt in rows:
-            if src in candidate_set:
-                disclosure_carriers.add(src)
-            if tgt in candidate_set:
-                disclosure_carriers.add(tgt)
+        for (src,) in rows:
+            disclosure_carriers.add(src)
 
     # Rank effective_tier desc, then importance desc, then label asc.
     ranked: list[tuple[int, int, int, str, CanonicalEntity]] = []

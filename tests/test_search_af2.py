@@ -58,6 +58,29 @@ def test_search_disclosure_query_filters_by_published_edge() -> None:
     assert idx_pub > idx_rel, "disclosure carrier lookup must apply published_edge()"
 
 
+def test_search_disclosure_bump_is_source_only() -> None:
+    """Only the SOURCE (filer) side of a disclosure edge counts —
+    the target-side asset (Trump Tower LLC, an individual stock)
+    must NOT get the bump, else every wholly-owned asset outranks
+    the filer it belongs to (the first-cut AF2 failure mode).
+    """
+    src = inspect.getsource(search)
+    # The disclosure-carrier query selects only source_id …
+    assert "select(CanonicalEdge.source_id)" in src
+    # … and filters on source_id, not target_id.
+    assert "CanonicalEdge.source_id.in_(candidate_ids)" in src
+    # No target-side OR in the disclosure lookup: guard by grepping
+    # the same clause and asserting no "target_id.in_" appears in
+    # the disclosure-relation window.
+    win_start = src.index("_DISCLOSURE_RELATIONS = (")
+    win_end = src.index("for (src,) in rows:")
+    window = src[win_start:win_end]
+    assert "target_id.in_" not in window, (
+        "disclosure bump must be source-only — target_id.in_ was found "
+        "in the disclosure-relation lookup window"
+    )
+
+
 def test_search_response_surfaces_boost_transparency() -> None:
     """Boosted entities carry base_tier + disclosure_boosted so the
     caller can tell WHY a substring-match beats an exact-match."""
