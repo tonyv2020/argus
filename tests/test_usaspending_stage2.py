@@ -424,3 +424,165 @@ def test_backfill_docstring_documents_the_safety_gate():
     doc = usaspending.backfill_holds_contract_edges.__doc__ or ""
     assert "SAFETY" in doc.upper() or "probe" in doc.lower()
     assert "before" in doc.lower() and "delete" in doc.lower()
+
+
+# --- Follow-up (helen 2026-08-11): per-anchor broaden_agency_scope --------
+#
+# The narrow ``_TARGET_AGENCIES`` whitelist (ICE / BOP / USMS) is the
+# right scope for DETENTION-OPS anchors only. Non-detention anchors
+# in the registry (Palantir, Tesla, SpaceX, xAI, defense-tech
+# contractors) have zero awards in that whitelist and end up with
+# ``agencies_matched=0`` — the scheduled sweep re-errors them every
+# fire. Palantir was only corrected because helen ran that path by
+# hand with broaden=True; the sweep now does it automatically.
+
+
+@pytest.mark.asyncio
+async def test_ingest_from_registry_narrow_scope_for_detention_anchor(monkeypatch):
+    """A detention-industry anchor (e.g. 'GEO Group') must call
+    ``ingest_recipient_contracts`` with ``broaden_agency_scope=False``
+    — the narrow ICE/BOP/USMS whitelist is exactly what we want for
+    the accountability beat."""
+    calls: list[dict] = []
+
+    async def _fake_anchors(session, priority_domains=None):
+        return [
+            SimpleNamespace(
+                label="GEO Group",
+                usaspending_recipient_names=["GEO GROUP INC"],
+            ),
+        ]
+
+    async def _fake_ingest(**kwargs):
+        calls.append(kwargs)
+        return usaspending.UsaSpendingStats()
+
+    monkeypatch.setattr(
+        "app.services.anchor_registry.anchors_for_usaspending", _fake_anchors,
+    )
+    monkeypatch.setattr(usaspending, "ingest_recipient_contracts", _fake_ingest)
+
+    await usaspending.ingest_from_registry()
+    assert len(calls) == 1
+    assert calls[0]["display_label"] == "GEO Group"
+    assert calls[0]["broaden_agency_scope"] is False, (
+        f"detention anchor 'GEO Group' MUST keep the narrow "
+        f"whitelist; got broaden={calls[0]['broaden_agency_scope']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ingest_from_registry_broadens_for_non_detention_anchor(monkeypatch):
+    """A non-detention anchor (e.g. 'Palantir', 'Tesla', 'SpaceX')
+    must call with ``broaden_agency_scope=True`` — their real
+    awarding agencies are NASA/DoD/State/etc., NOT the detention
+    whitelist. This is the exact regression that made Palantir
+    return agencies_matched=0 until helen ran it by hand."""
+    calls: list[dict] = []
+
+    async def _fake_anchors(session, priority_domains=None):
+        return [
+            SimpleNamespace(
+                label="Palantir",
+                usaspending_recipient_names=["PALANTIR TECHNOLOGIES INC"],
+            ),
+            SimpleNamespace(
+                label="Tesla",
+                usaspending_recipient_names=["TESLA INC"],
+            ),
+            SimpleNamespace(
+                label="SpaceX",
+                usaspending_recipient_names=["SPACE EXPLORATION TECHNOLOGIES CORP"],
+            ),
+            SimpleNamespace(
+                label="xAI",
+                usaspending_recipient_names=["X AI CORP"],
+            ),
+        ]
+
+    async def _fake_ingest(**kwargs):
+        calls.append(kwargs)
+        return usaspending.UsaSpendingStats()
+
+    monkeypatch.setattr(
+        "app.services.anchor_registry.anchors_for_usaspending", _fake_anchors,
+    )
+    monkeypatch.setattr(usaspending, "ingest_recipient_contracts", _fake_ingest)
+
+    await usaspending.ingest_from_registry()
+    labels_broadened = {c["display_label"]: c["broaden_agency_scope"] for c in calls}
+    assert labels_broadened == {
+        "Palantir": True,
+        "Tesla": True,
+        "SpaceX": True,
+        "xAI": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ingest_from_registry_mixed_anchor_set_gets_per_anchor_scope(monkeypatch):
+    """A registry batch mixing detention + non-detention anchors
+    gets the RIGHT scope per anchor — no one-size-fits-all
+    decision."""
+    calls: list[dict] = []
+
+    async def _fake_anchors(session, priority_domains=None):
+        return [
+            SimpleNamespace(label="GEO Group",
+                              usaspending_recipient_names=["GEO GROUP INC"]),
+            SimpleNamespace(label="Palantir",
+                              usaspending_recipient_names=["PALANTIR TECHNOLOGIES INC"]),
+            SimpleNamespace(label="CoreCivic",
+                              usaspending_recipient_names=["CORECIVIC INC"]),
+            SimpleNamespace(label="Tesla",
+                              usaspending_recipient_names=["TESLA INC"]),
+            SimpleNamespace(label="Aventiv Technologies",
+                              usaspending_recipient_names=["AVENTIV TECHNOLOGIES LLC"]),
+        ]
+
+    async def _fake_ingest(**kwargs):
+        calls.append(kwargs)
+        return usaspending.UsaSpendingStats()
+
+    monkeypatch.setattr(
+        "app.services.anchor_registry.anchors_for_usaspending", _fake_anchors,
+    )
+    monkeypatch.setattr(usaspending, "ingest_recipient_contracts", _fake_ingest)
+
+    await usaspending.ingest_from_registry()
+    by_label = {c["display_label"]: c["broaden_agency_scope"] for c in calls}
+    assert by_label == {
+        "GEO Group": False,             # detention → narrow
+        "Palantir": True,               # non-detention → broaden
+        "CoreCivic": False,             # detention → narrow
+        "Tesla": True,                  # non-detention → broaden
+        "Aventiv Technologies": False,  # detention (prison telecom) → narrow
+    }
+
+
+@pytest.mark.asyncio
+async def test_caller_broaden_flag_still_force_broadens_even_detention(monkeypatch):
+    """The per-anchor decision is an OR with the caller flag — if
+    operators pass ``broaden_agency_scope=True`` explicitly, every
+    anchor gets broadened including detention (matches the
+    pre-hotfix caller-driven semantic; useful for one-off debug
+    sweeps)."""
+    calls: list[dict] = []
+
+    async def _fake_anchors(session, priority_domains=None):
+        return [
+            SimpleNamespace(label="GEO Group",
+                              usaspending_recipient_names=["GEO GROUP INC"]),
+        ]
+
+    async def _fake_ingest(**kwargs):
+        calls.append(kwargs)
+        return usaspending.UsaSpendingStats()
+
+    monkeypatch.setattr(
+        "app.services.anchor_registry.anchors_for_usaspending", _fake_anchors,
+    )
+    monkeypatch.setattr(usaspending, "ingest_recipient_contracts", _fake_ingest)
+
+    await usaspending.ingest_from_registry(broaden_agency_scope=True)
+    assert calls[0]["broaden_agency_scope"] is True

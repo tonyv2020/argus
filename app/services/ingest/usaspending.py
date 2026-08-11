@@ -434,9 +434,29 @@ async def ingest_from_registry(
     existing auto-seed path (P1.4 hotfix) creates the org canonical
     for anchors that hollywood.entity_tags hasn't seeded (Securus /
     Aventiv / STOP / GTL / Palantir / Tesla / SpaceX etc.).
+
+    Per-anchor agency scope (helen 2026-08-11): the narrow
+    ``_TARGET_AGENCIES`` whitelist (ICE / BOP / USMS) is the right
+    scope ONLY for the DETENTION-OPS anchors (the
+    ``DETENTION_INDUSTRY_RECIPIENTS`` set — GEO / CoreCivic / MTC /
+    LaSalle / GTL / Aventiv / STOP / Securus). Every OTHER registry
+    anchor (Palantir, Tesla, SpaceX, xAI, defense-tech contractors)
+    gets zero rows through the whitelist and returns
+    ``agencies_matched=0`` — the scheduled sweep re-errors them on
+    every fire. Their real awarding agencies are NASA / DoD / State
+    / etc., so they need ``broaden_agency_scope=True`` — accept
+    every sub-agency and use the actual string as the anchor label.
+    Palantir only produced the corrected 4.97B USD flow because helen
+    ran that path by hand; the sweep needs to do it automatically.
+
+    The caller's ``broaden_agency_scope`` still forces broadening
+    for ALL anchors when set — this per-anchor decision only opens
+    the scope for non-detention anchors when the caller hasn't
+    already opened it globally.
     """
     from app.services.anchor_registry import anchors_for_usaspending
 
+    detention_labels = frozenset(DETENTION_INDUSTRY_RECIPIENTS.keys())
     out: dict[str, UsaSpendingStats] = {}
     sm = get_sessionmaker()
     async with sm() as session:
@@ -445,13 +465,21 @@ async def ingest_from_registry(
         )
 
     for anchor in anchors:
+        # Detention-ops anchors keep the narrow ICE/BOP/USMS whitelist —
+        # anchor labels for THAT beat are always a detention agency,
+        # broadening would let non-detention DoD/DHS awards leak in
+        # and dilute the accountability signal. Non-detention anchors
+        # get broadening so their real awarding agencies surface.
+        per_anchor_broaden = (
+            broaden_agency_scope or anchor.label not in detention_labels
+        )
         try:
             out[anchor.label] = await ingest_recipient_contracts(
                 recipient_names=tuple(anchor.usaspending_recipient_names),
                 canonical_hint=anchor.label,
                 display_label=anchor.label,
                 max_awards=max_awards,
-                broaden_agency_scope=broaden_agency_scope,
+                broaden_agency_scope=per_anchor_broaden,
             )
         except Exception:
             logger.exception(
