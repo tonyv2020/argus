@@ -35,6 +35,29 @@ logger = logging.getLogger(__name__)
 _USA_BASE = "https://api.usaspending.gov/api/v2"
 _GEO_RECIPIENT_NAMES = ("GEO GROUP INC", "THE GEO GROUP INC", "GEO GROUP, INC.")
 
+# USAspending spending_by_award VALID SORT KEYS for the Contract-Award
+# mapping (award_type_codes A/B/C/D). Observed valid set from the API's
+# error surface + documented Field Lookups. If the ``sort`` in our
+# request body is NOT in this set, USAspending returns HTTP 400
+# "Sort value not found in Contract Award mappings" and the ingest
+# 400s for every recipient. helen 2026-08-11: a Stage 2 build shipped
+# with ``sort="Total Obligated Amount"`` (invalid) which caused every
+# post-backfill re-ingest to fail — since backfill did the delete
+# BEFORE the re-ingest, the graph got wiped and rebuilt to zero. The
+# hotfix reverts sort to "Award Amount" and adds the fail-before-
+# delete probe in ``backfill_holds_contract_edges``. A regression
+# test asserts the current sort is in this set.
+VALID_CONTRACT_SORT_KEYS: frozenset[str] = frozenset({
+    "Award ID",
+    "Recipient Name",
+    "Start Date",
+    "End Date",
+    "Award Amount",
+    "Awarding Agency",
+    "Awarding Sub Agency",
+    "Contract Award Type",
+})
+
 
 # P1 (2026-07-19) — detention-industry recipient anchors.  Each entry
 # names the canonical anchor and the recipient-name variants + the
@@ -502,9 +525,17 @@ async def ingest_recipient_contracts(
         ],
         "page": 1,
         "limit": min(100, max_awards),
-        # Sort by obligation too — the top-of-list should be the
-        # top-actually-paid contracts, not the top-ceiling ones.
-        "sort": "Total Obligated Amount",
+        # HOTFIX (helen 2026-08-11): "Total Obligated Amount" is NOT a
+        # valid ``sort`` value for the Contract-Award mapping of
+        # spending_by_award — the API returns 400
+        # "Sort value not found in Contract Award mappings". Sort BY
+        # the ceiling ("Award Amount", the API-valid contract sort key)
+        # — this only affects the ORDER we iterate results in; the
+        # edge WEIGHT is still computed from the net obligation via
+        # ``_award_net_obligation`` (row field or per-award detail
+        # fallback). ``VALID_CONTRACT_SORT_KEYS`` below documents the
+        # accepted set; a unit test asserts the current sort is in it.
+        "sort": "Award Amount",
         "order": "desc",
     }
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -574,6 +605,51 @@ async def ingest_recipient_contracts(
     return stats
 
 
+async def _probe_spending_by_award() -> None:
+    """Fail-before-delete safety gate (helen 2026-08-11 hotfix).
+
+    ONE minimal ``spending_by_award`` POST using the EXACT request
+    shape (same filters / fields / sort / order / page / limit) the
+    real ingest uses. If the API rejects our shape — invalid sort
+    key, bad field, whatever — this raises BEFORE any delete runs,
+    so a bad request can never wipe the graph again.
+
+    The prior Stage 2 build shipped with an invalid sort key
+    ("Total Obligated Amount" is not in the Contract-Award sort
+    mapping). Because the deletes ran first and the re-ingest 400'd
+    on every recipient, helen saw an empty holds_contract graph
+    until she hot-patched the pod and re-ingested.
+
+    Uses a well-known recipient anchor ("GEO GROUP INC") and
+    ``limit=1`` so the probe is cheap and predictable. A 2xx even
+    with zero results proves the API accepts the shape; only 4xx/5xx
+    or a transport error aborts the backfill.
+    """
+    body = {
+        "filters": {
+            "recipient_search_text": ["GEO GROUP INC"],
+            "award_type_codes": ["A", "B", "C", "D"],
+        },
+        "fields": [
+            "Award ID",
+            "Recipient Name",
+            "Awarding Agency",
+            "Awarding Sub Agency",
+            "generated_internal_id",
+            "Award Amount",
+            "Total Obligated Amount",
+        ],
+        "page": 1,
+        "limit": 1,
+        "sort": "Award Amount",
+        "order": "desc",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # Any HTTP error (4xx invalid sort/field, 5xx upstream) raises;
+        # the backfill caller catches upstream and aborts before delete.
+        await _post(client, "/search/spending_by_award/", body)
+
+
 @dataclass
 class BackfillStats:
     """Counters for the Stage-2 wipe-and-rebuild backfill."""
@@ -620,8 +696,32 @@ async def backfill_holds_contract_edges(
     Runs under a single session/transaction so a mid-backfill
     failure rolls back — the graph is either fully wiped-and-
     rebuilt or fully unchanged.
+
+    SAFETY GATE (helen 2026-08-11 hotfix): a probe POST to
+    ``spending_by_award`` runs BEFORE any delete. If the API rejects
+    the request shape (invalid sort/field/filter), the probe raises
+    and the backfill aborts BEFORE deleting anything. The prior
+    Stage 2 build had an invalid ``sort`` key ("Total Obligated
+    Amount" is not a Contract-Award sort key) and wiped every
+    HOLDS_CONTRACT edge before the re-ingest 400'd. The probe
+    closes that class of bug: a bad request can never wipe the
+    graph again — deletes happen only after we've proven the
+    downstream API can serve at least one recipient's page.
     """
     from sqlalchemy import delete
+
+    # SAFETY: probe the API surface BEFORE any destructive DB work.
+    # A raise here (invalid sort, 5xx, transport failure) exits the
+    # backfill without touching a single edge or citation.
+    try:
+        await _probe_spending_by_award()
+    except Exception:
+        logger.exception(
+            "usaspending backfill ABORTED — probe POST to spending_by_award "
+            "failed; NO edges or citations were deleted. Fix the request "
+            "shape (sort/fields/filters) and re-run."
+        )
+        raise
 
     stats = BackfillStats()
     sm = get_sessionmaker()

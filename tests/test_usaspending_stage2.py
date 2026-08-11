@@ -269,12 +269,37 @@ def test_spending_by_award_request_includes_total_obligated_amount_field():
     assert '"Total Obligated Amount"' in src
 
 
-def test_spending_by_award_sort_is_obligation_not_ceiling():
-    """Sort should be on the obligation, so top-of-list is top-actually-
-    paid, not top-ceiling. Guards against a future rebase re-introducing
-    the ceiling-sort."""
+def test_spending_by_award_sort_is_a_valid_contract_award_sort_key():
+    """HOTFIX regression (helen 2026-08-11): a Stage 2 build shipped
+    with ``sort="Total Obligated Amount"`` — NOT a valid Contract-
+    Award sort mapping — so USAspending returned HTTP 400 on every
+    recipient and the backfill wiped the graph before the re-ingest
+    even started. This test asserts the current sort is in
+    ``VALID_CONTRACT_SORT_KEYS`` so a future change re-introducing
+    an invalid key fails locally, not in prod-after-wipe.
+    """
     src = inspect.getsource(usaspending.ingest_recipient_contracts)
-    assert '"sort": "Total Obligated Amount"' in src
+    # Extract the actual sort literal from the body dict.
+    import re
+
+    m = re.search(r'"sort":\s*"([^"]+)"', src)
+    assert m is not None, "no sort key found in ingest_recipient_contracts body"
+    sort_key = m.group(1)
+    assert sort_key in usaspending.VALID_CONTRACT_SORT_KEYS, (
+        f"sort={sort_key!r} is NOT in VALID_CONTRACT_SORT_KEYS "
+        f"{sorted(usaspending.VALID_CONTRACT_SORT_KEYS)}. USAspending "
+        f"would return 400 'Sort value not found in Contract Award "
+        f"mappings' on every request. If USAspending adds a new sort "
+        f"key, add it to VALID_CONTRACT_SORT_KEYS explicitly (do not "
+        f"silence this test)."
+    )
+
+
+def test_valid_contract_sort_keys_excludes_the_pre_hotfix_wrong_value():
+    """Documents WHY the ``Total Obligated Amount`` key isn't valid
+    for the Contract-Award sort mapping — the exact failure mode
+    helen caught 2026-08-11 (wiped every holds_contract edge)."""
+    assert "Total Obligated Amount" not in usaspending.VALID_CONTRACT_SORT_KEYS
 
 
 def test_emit_contract_edge_no_longer_uses_plus_equals_on_weight():
@@ -317,3 +342,85 @@ def test_cli_dispatches_backfill_flag():
     src = inspect.getsource(usaspending.main)
     assert "--backfill-contracts" in src
     assert "backfill_holds_contract_edges" in src
+
+
+# --- HOTFIX (helen 2026-08-11): fail-before-delete safety gate ------------
+
+
+def test_probe_exists_and_uses_valid_sort_key():
+    """The probe MUST use the same sort key as the real ingest — else
+    it validates the API surface against the wrong shape and lets a
+    real-ingest failure through. Also asserts the probe uses a valid
+    sort key (belt with the ingest-side assertion)."""
+    assert hasattr(usaspending, "_probe_spending_by_award")
+    assert inspect.iscoroutinefunction(usaspending._probe_spending_by_award)
+    src = inspect.getsource(usaspending._probe_spending_by_award)
+    import re
+
+    m = re.search(r'"sort":\s*"([^"]+)"', src)
+    assert m is not None, "probe request body missing a sort key"
+    assert m.group(1) in usaspending.VALID_CONTRACT_SORT_KEYS
+
+
+@pytest.mark.asyncio
+async def test_probe_raises_on_http_error(monkeypatch):
+    """When USAspending returns non-2xx, the probe raises. This is
+    what makes the backfill's fail-before-delete gate work."""
+    async def _fake_post(client, path, body):
+        # Simulate USAspending's 400 for a bad sort key.
+        request = httpx.Request("POST", "http://x")
+        response = httpx.Response(400, request=request,
+                                   text='{"detail":"Sort value not found in Contract Award mappings"}')
+        raise httpx.HTTPStatusError(
+            "Client error '400 Bad Request'", request=request, response=response,
+        )
+
+    import httpx  # local import so the fake_post closure captures it
+    monkeypatch.setattr(usaspending, "_post", _fake_post)
+    with pytest.raises(httpx.HTTPStatusError):
+        await usaspending._probe_spending_by_award()
+
+
+@pytest.mark.asyncio
+async def test_backfill_aborts_before_delete_when_probe_fails(monkeypatch):
+    """The critical hotfix behavior. If the probe raises, backfill
+    MUST return/raise WITHOUT deleting a single edge or citation.
+    The prior bug wiped the graph BEFORE the re-ingest failed;
+    this test proves the new ordering closes that.
+
+    We patch the probe to raise + patch get_sessionmaker so any
+    accidental DB access shows up as a test failure (the session
+    factory is called ONLY inside the section AFTER the probe).
+    """
+    async def _boom():
+        raise RuntimeError("probe rejected — invalid sort")
+
+    monkeypatch.setattr(usaspending, "_probe_spending_by_award", _boom)
+
+    session_factory_calls: list[str] = []
+
+    def _fake_sm():
+        session_factory_calls.append("touched")
+        raise AssertionError(
+            "backfill touched get_sessionmaker AFTER a probe failure — "
+            "the fail-before-delete gate is broken; deletes would run"
+        )
+
+    monkeypatch.setattr(usaspending, "get_sessionmaker", _fake_sm)
+
+    with pytest.raises(RuntimeError, match="probe rejected"):
+        await usaspending.backfill_holds_contract_edges()
+
+    assert session_factory_calls == [], (
+        "backfill must not open a session (and therefore must not run any "
+        "DB DELETE) when the API probe fails"
+    )
+
+
+def test_backfill_docstring_documents_the_safety_gate():
+    """The safety gate is only worth the paper it's printed on if
+    operators know it exists. Regression against dropping the gate
+    silently in a future refactor."""
+    doc = usaspending.backfill_holds_contract_edges.__doc__ or ""
+    assert "SAFETY" in doc.upper() or "probe" in doc.lower()
+    assert "before" in doc.lower() and "delete" in doc.lower()
