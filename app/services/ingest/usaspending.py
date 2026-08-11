@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func as sa_func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_sessionmaker
@@ -140,6 +140,68 @@ async def _post(client: httpx.AsyncClient, path: str, body: dict) -> dict:
     return r.json()
 
 
+async def _get(client: httpx.AsyncClient, path: str) -> dict:
+    """One GET to api.usaspending.gov (award detail endpoint)."""
+    r = await client.get(f"{_USA_BASE}{path}")
+    r.raise_for_status()
+    return r.json()
+
+
+# Stage 2 (helen 2026-08-11) — the ~$89B GEO / ~$58B CoreCivic edge
+# weights that were driving Cassandra's outline-declines were sourced
+# from USAspending's "Award Amount" field, which for contracts is the
+# CEILING (current award value including all option years). The
+# authoritative "how much has actually been obligated" number is
+# ``total_obligation`` on the award-detail endpoint, or the
+# ``Total Obligated Amount`` field when ``spending_by_award`` returns
+# it. We prefer the row-level field (one HTTP round-trip per page)
+# and fall back to the per-award detail fetch when the row is missing
+# it. Both values verify against the "Obligated Amount" figure shown
+# on the public https://www.usaspending.gov/award/<id> page.
+_ROW_OBLIGATION_KEYS: tuple[str, ...] = (
+    "Total Obligated Amount",
+    "total_obligation",
+    "obligated_amount",
+)
+
+
+async def _award_net_obligation(
+    client: httpx.AsyncClient, row: dict
+) -> float | None:
+    """Return the award's net federal-action obligation in USD, or None.
+
+    Prefers the ``Total Obligated Amount`` (or equivalent) field the
+    ``spending_by_award`` search returns when it's in the ``fields``
+    list; falls back to the authoritative award-detail endpoint's
+    ``total_obligation`` per-award when the search omitted it. The
+    fallback is O(N) HTTP calls in a bad case but yields the same
+    value the public USAspending award page shows, so operators can
+    verify against usaspending.gov by clicking the citation URL.
+    """
+    for k in _ROW_OBLIGATION_KEYS:
+        v = row.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    award_id = row.get("generated_internal_id") or row.get("Award ID")
+    if not award_id:
+        return None
+    try:
+        detail = await _get(client, f"/awards/{award_id}/")
+    except Exception:
+        return None
+    for k in ("total_obligation", "obligated_amount"):
+        v = detail.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
 async def _find_or_create_canonical(
     session: AsyncSession,
     surface_name: str,
@@ -205,7 +267,26 @@ async def _emit_contract_edge(
     amount: float | None,
     award_id: str,
 ) -> tuple[str, bool]:
-    """Create or reuse a HOLDS_CONTRACT edge + attach the USAspending award citation."""
+    """Create or reuse a HOLDS_CONTRACT edge + attach the USAspending award
+    citation. IDEMPOTENT per (edge, award_id) — Stage 2 (helen 2026-08-11).
+
+    The pre-Stage-2 code did ``edge.weight = (edge.weight or 0) + amount``
+    on every ingest of the same award, so scheduled sweeps ballooned the
+    weights over time — one root cause of the $89B GEO / $58B CoreCivic
+    artefacts. Also re-added a SourceCitation for the same award_id per
+    run, producing duplicate citation rows.
+
+    Fixed shape: a per-award idempotency key derived from the existing
+    (edge_id, kind=USASPENDING_AWARD, citation_ref=award_id) triple —
+    if we've already recorded THIS award for THIS edge, we skip both
+    the weight update and the citation insert. First-sighting = weight
+    gets the (net-obligation) amount added ONCE + citation inserted.
+
+    New edges are created with weight=0 and then take the amount via
+    the same first-sighting path, so the create + reuse branches share
+    identical accumulation semantics — no drift.
+    """
+    reused = False
     existing = (
         await session.execute(
             select(CanonicalEdge).where(
@@ -215,29 +296,41 @@ async def _emit_contract_edge(
             )
         )
     ).scalar_one_or_none()
-    reused = False
     if existing is None:
         edge = CanonicalEdge(
             source_id=src_canonical,
             target_id=dst_canonical,
             relation=EdgeRelation.HOLDS_CONTRACT.value,
-            weight=float(amount or 0.0),
+            weight=0.0,
         )
         session.add(edge)
         await session.flush()
     else:
         edge = existing
-        edge.weight = float((edge.weight or 0.0) + (amount or 0.0))
         reused = True
-    citation_url = f"https://www.usaspending.gov/award/{award_id}"
-    session.add(
-        SourceCitation(
-            edge_id=edge.id,
-            kind=SourceKind.USASPENDING_AWARD.value,
-            citation_url=citation_url,
-            citation_ref=award_id,
+
+    # Per-award idempotency: (edge_id, kind, award_id) is the unique
+    # identity of "this award has been counted on this edge". Repeat
+    # runs of the same ingest hit this branch and become no-ops.
+    citation_exists = (
+        await session.execute(
+            select(SourceCitation).where(
+                SourceCitation.edge_id == edge.id,
+                SourceCitation.kind == SourceKind.USASPENDING_AWARD.value,
+                SourceCitation.citation_ref == award_id,
+            )
         )
-    )
+    ).scalar_one_or_none()
+    if citation_exists is None:
+        edge.weight = float((edge.weight or 0.0) + float(amount or 0.0))
+        session.add(
+            SourceCitation(
+                edge_id=edge.id,
+                kind=SourceKind.USASPENDING_AWARD.value,
+                citation_url=f"https://www.usaspending.gov/award/{award_id}",
+                citation_ref=award_id,
+            )
+        )
     return edge.id, reused
 
 
@@ -397,11 +490,21 @@ async def ingest_recipient_contracts(
             "Awarding Agency",
             "Awarding Sub Agency",
             "generated_internal_id",
+            # Stage 2 (helen 2026-08-11): switched from "Award Amount"
+            # (contract CEILING including all option years) to
+            # "Total Obligated Amount" (net federal-action obligations,
+            # matches the "Obligated Amount" figure on usaspending.gov's
+            # public award page). Keep "Award Amount" in the fields
+            # list so operators can still see the ceiling in raw dumps,
+            # but the edge weight is computed from the obligation.
             "Award Amount",
+            "Total Obligated Amount",
         ],
         "page": 1,
         "limit": min(100, max_awards),
-        "sort": "Award Amount",
+        # Sort by obligation too — the top-of-list should be the
+        # top-actually-paid contracts, not the top-ceiling ones.
+        "sort": "Total Obligated Amount",
         "order": "desc",
     }
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -440,11 +543,16 @@ async def ingest_recipient_contracts(
                         source_id=matched,
                     )
                     del top_agency  # captured for future use but unused today
+                    # Stage 2 (helen 2026-08-11): use NET OBLIGATIONS as
+                    # the edge weight, not the CEILING. Falls back to the
+                    # per-award detail endpoint when spending_by_award
+                    # omitted "Total Obligated Amount".
+                    obligation = await _award_net_obligation(client, r)
                     _, reused = await _emit_contract_edge(
                         session,
                         geo_canonical,
                         agency_canonical,
-                        r.get("Award Amount"),
+                        obligation,
                         str(award_id),
                     )
                     if reused:
@@ -466,17 +574,162 @@ async def ingest_recipient_contracts(
     return stats
 
 
-def main() -> None:  # noqa: C901  — CLI dispatcher, straight-line
-    """CLI entrypoint — python -m app.services.ingest.usaspending [anchor|--all].
+@dataclass
+class BackfillStats:
+    """Counters for the Stage-2 wipe-and-rebuild backfill."""
 
-    Default runs the full detention-industry recipient set (§P1).  Pass
-    an anchor label (``GEO Group`` / ``CoreCivic`` / ``Management &
-    Training Corp`` / ``LaSalle Corrections``) to run only that one.
+    holds_contract_edges_before: int = 0
+    usaspending_citations_before: int = 0
+    holds_contract_edges_deleted: int = 0
+    usaspending_citations_deleted: int = 0
+    holds_contract_edges_after: int = 0
+    usaspending_citations_after: int = 0
+    ingest_results: dict | None = None
+
+
+async def backfill_holds_contract_edges(
+    max_awards: int = 200,
+) -> BackfillStats:
+    """Stage 2 (helen 2026-08-11) wipe-and-rebuild for HOLDS_CONTRACT edges.
+
+    The pre-Stage-2 code accumulated weights on every re-ingest AND
+    used the contract CEILING instead of net obligations, so every
+    HOLDS_CONTRACT edge in prod is wrong (GEO $89B, CoreCivic $58B).
+    Fixing the code alone would leave those historical values
+    frozen — the +=-accumulation stops but never reverses. This
+    backfill is the corrective:
+
+      1. count existing HOLDS_CONTRACT edges + their
+         USASPENDING_AWARD citations (so operators can validate the
+         delete counts match).
+      2. DELETE every USASPENDING_AWARD SourceCitation attached to
+         a HOLDS_CONTRACT edge.
+      3. DELETE every HOLDS_CONTRACT CanonicalEdge (CASCADE on
+         source_citations.edge_id makes step 2 redundant on Postgres
+         but the explicit delete keeps the counts sound on databases
+         where CASCADE isn't configured the same way).
+      4. Re-run ``ingest_from_registry`` with the new obligation-
+         based code + idempotent _emit_contract_edge, producing
+         corrected edges from scratch.
+
+    Idempotent by design: a second run of this backfill is safe
+    (deletes are conditional on rows existing; the re-ingest is
+    idempotent per (edge, award_id)). Safe to run repeatedly while
+    tuning.
+
+    Runs under a single session/transaction so a mid-backfill
+    failure rolls back — the graph is either fully wiped-and-
+    rebuilt or fully unchanged.
+    """
+    from sqlalchemy import delete
+
+    stats = BackfillStats()
+    sm = get_sessionmaker()
+    async with sm() as session:
+        # Pre-counts.
+        stats.holds_contract_edges_before = int(
+            (
+                await session.execute(
+                    select(sa_func.count(CanonicalEdge.id)).where(
+                        CanonicalEdge.relation == EdgeRelation.HOLDS_CONTRACT.value
+                    )
+                )
+            ).scalar_one()
+            or 0
+        )
+        stats.usaspending_citations_before = int(
+            (
+                await session.execute(
+                    select(sa_func.count(SourceCitation.id)).where(
+                        SourceCitation.kind == SourceKind.USASPENDING_AWARD.value
+                    )
+                )
+            ).scalar_one()
+            or 0
+        )
+
+        # Explicit citation delete first (safe if ON DELETE CASCADE
+        # would also handle it — the count is what we report to helen).
+        cit_del = await session.execute(
+            delete(SourceCitation).where(
+                SourceCitation.kind == SourceKind.USASPENDING_AWARD.value,
+                SourceCitation.edge_id.in_(
+                    select(CanonicalEdge.id).where(
+                        CanonicalEdge.relation == EdgeRelation.HOLDS_CONTRACT.value
+                    )
+                ),
+            )
+        )
+        stats.usaspending_citations_deleted = int(cit_del.rowcount or 0)
+
+        edge_del = await session.execute(
+            delete(CanonicalEdge).where(
+                CanonicalEdge.relation == EdgeRelation.HOLDS_CONTRACT.value
+            )
+        )
+        stats.holds_contract_edges_deleted = int(edge_del.rowcount or 0)
+        await session.commit()
+
+    # Re-ingest fresh with the new obligation-based code. Uses the
+    # registry path so every anchor in anchor_registry.usaspending_
+    # recipient_names gets a run — matches what the scheduled sweep does.
+    stats.ingest_results = await ingest_from_registry(max_awards=max_awards)
+
+    async with sm() as session:
+        stats.holds_contract_edges_after = int(
+            (
+                await session.execute(
+                    select(sa_func.count(CanonicalEdge.id)).where(
+                        CanonicalEdge.relation == EdgeRelation.HOLDS_CONTRACT.value
+                    )
+                )
+            ).scalar_one()
+            or 0
+        )
+        stats.usaspending_citations_after = int(
+            (
+                await session.execute(
+                    select(sa_func.count(SourceCitation.id)).where(
+                        SourceCitation.kind == SourceKind.USASPENDING_AWARD.value
+                    )
+                )
+            ).scalar_one()
+            or 0
+        )
+    return stats
+
+
+def main() -> None:  # noqa: C901  — CLI dispatcher, straight-line
+    """CLI entrypoint — python -m app.services.ingest.usaspending [anchor|--all|--backfill-contracts].
+
+    Modes:
+      * default (or ``--all``) — the full detention-industry recipient
+        set (§P1) using the new obligation-based emitter.
+      * anchor label (``GEO Group`` / ``CoreCivic`` / …) — one recipient.
+      * ``--backfill-contracts`` — Stage 2 wipe-and-rebuild: delete
+        every existing HOLDS_CONTRACT edge + its USASPENDING_AWARD
+        citations, then re-ingest via the registry with the new code.
+        Fixes historical +=-accumulation and ceiling-vs-obligation
+        drift in one shot. See ``backfill_holds_contract_edges``
+        docstring for the safety story.
     """
     import sys
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     arg = " ".join(sys.argv[1:]).strip() or "--all"
+    if arg in ("--backfill-contracts", "backfill-contracts"):
+        stats = asyncio.run(backfill_holds_contract_edges())
+        logger.info(
+            "usaspending backfill done: %d holds_contract edges wiped "
+            "(%d citations), %d edges rebuilt (%d citations)",
+            stats.holds_contract_edges_deleted,
+            stats.usaspending_citations_deleted,
+            stats.holds_contract_edges_after,
+            stats.usaspending_citations_after,
+        )
+        for label, s in (stats.ingest_results or {}).items():
+            logger.info("[%s] %s", label, s)
+        return
     if arg in ("--all", "all", ""):
         results = asyncio.run(ingest_detention_industry_contracts())
         for label, stats in results.items():
@@ -493,7 +746,7 @@ def main() -> None:  # noqa: C901  — CLI dispatcher, straight-line
         logger.info("[%s] usaspending ingest done: %s", arg, stats)
     else:
         logger.error(
-            "unknown anchor %r; choose from %s or --all",
+            "unknown anchor %r; choose from %s or --all or --backfill-contracts",
             arg,
             sorted(DETENTION_INDUSTRY_RECIPIENTS),
         )
