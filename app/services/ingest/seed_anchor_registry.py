@@ -778,10 +778,216 @@ _ENERGY_INFRA: tuple[SeedRow, ...] = (
 )
 
 
+# ─── Carceral extraction beat (Tony 2026-08-12 arc) ────────────────
+#
+# Cassandra's new HARM investigation mode: prison/jail EXTRACTION
+# companies — phone/video vendors + commissary + food-service.
+# Ground truth (helen 2026-08-12): these barely touch federal
+# money-flow (their revenue = fees paid by incarcerated + families +
+# STATE/COUNTY DOC/jail contracts, not USAspending). Argus HAS their
+# LOBBYING (Senate LDA) + limited FEC for the one company with a
+# real federal PAC (ARAMARK). The rest are PE-owned privates + surface
+# via LDA lobbying only.
+#
+# Seeded as organizations so the anchor_registry-driven ingest picks
+# them up for LDA + (when available) FEC. PE-owner entities added
+# too — key thread in Cassandra's carceral columns is "who owns
+# the extraction machine + how they profit + how they lobby to
+# protect the fee structure" (FCC Martha-Wright-Reed rate-cap fight,
+# etc.).
+#
+# FEC verification 2026-08-12 (live /v1/committees/?q=):
+#   ARAMARK      → C00157677  ARAMARK SERVICES, INC. PAC (real; food+commissary)
+#   Others: NO CORPORATE PAC. Confirmed for Securus/Aventiv/ViaPath/
+#   GTL/Keefe/TKC/Trinity/Union Supply/Centric/ABL/Platinum
+#   Equity/American Securities (the PE firm — NOT "American
+#   Securities Association" trade PAC)/HIG Capital (NOT "Highland
+#   Capital Management" defunct 2018). The absence of a federal PAC
+#   is itself the story: these entities' political influence works
+#   through LDA-registered LOBBYING + state/county contracting,
+#   not federal PAC contributions.
+
+_CARCERAL_EXTRACTION: tuple[SeedRow, ...] = (
+    # Prison food + commissary supply (large; ARAMARK is the marquee).
+    SeedRow(
+        label="ARAMARK",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        # Verified live 2026-08-12 via /v1/committees/?q=aramark.
+        fec_committee_ids=("C00157677",),
+        sec_cik=1144215,
+        usaspending_recipient_names=(
+            "ARAMARK CORRECTIONAL SERVICES LLC",
+            "ARAMARK SERVICES INC",
+            "ARAMARK CORPORATION",
+            "ARAMARK",
+        ),
+        lda_client_names=("Aramark", "ARAMARK Corporation"),
+        name_variants=("ARAMARK",),
+        notes="Aramark Correctional Services — major prison food + commissary supply. Marquee carceral-food harm target.",
+    ),
+    SeedRow(
+        label="Trinity Services Group",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        usaspending_recipient_names=(
+            "TRINITY SERVICES GROUP INC",
+            "TRINITY SERVICES GROUP",
+            "TRINITY SERVICES",
+        ),
+        lda_client_names=("Trinity Services Group",),
+        name_variants=("TRINITY SERVICES",),
+        notes="Prison + jail food service + commissary. Private; H.I.G.-owned via TKC Holdings.",
+    ),
+    SeedRow(
+        label="Keefe Group",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        usaspending_recipient_names=(
+            "KEEFE GROUP LLC",
+            "KEEFE COMMISSARY NETWORK LLC",
+            "KEEFE SUPPLY COMPANY",
+            "KEEFE GROUP",
+        ),
+        lda_client_names=("Keefe Group",),
+        name_variants=("KEEFE GROUP", "KEEFE COMMISSARY"),
+        notes="Prison commissary supply — largest in US. Subsidiary of TKC Holdings.",
+    ),
+    SeedRow(
+        label="TKC Holdings",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        usaspending_recipient_names=(
+            "TKC HOLDINGS INC",
+            "TKC HOLDINGS",
+        ),
+        lda_client_names=("TKC Holdings",),
+        name_variants=("TKC HOLDINGS",),
+        notes="Parent of Keefe Group + Trinity Services Group. H.I.G. Capital-owned.",
+    ),
+    SeedRow(
+        label="Union Supply Group",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        usaspending_recipient_names=(
+            "UNION SUPPLY COMPANY INC",
+            "UNION SUPPLY GROUP",
+            "UNION SUPPLY",
+        ),
+        lda_client_names=("Union Supply Group",),
+        name_variants=("UNION SUPPLY",),
+        notes="Prison commissary supply. Private (Advantage Capital-owned).",
+    ),
+    SeedRow(
+        label="Centric Group",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        usaspending_recipient_names=(
+            "CENTRIC GROUP LLC",
+            "CENTRIC GROUP",
+        ),
+        lda_client_names=("Centric Group",),
+        name_variants=("CENTRIC GROUP",),
+        notes="Prison commissary supply (Keefe sibling under Bass Family Trust originally).",
+    ),
+    SeedRow(
+        label="ABL Management",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        usaspending_recipient_names=(
+            "ABL MANAGEMENT INC",
+            "ABL MANAGEMENT",
+        ),
+        lda_client_names=("ABL Management",),
+        name_variants=("ABL MANAGEMENT",),
+        notes="Jail food-service. Private.",
+    ),
+    # Prison-tech / video (Aventiv + ViaPath sit under _PRISON_TELECOM
+    # already; JPay is an Aventiv subsidiary + ICSolutions a smaller
+    # regional player).
+    SeedRow(
+        label="JPay",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        usaspending_recipient_names=(
+            "JPAY LLC",
+            "JPAY INC",
+            "JPAY",
+        ),
+        lda_client_names=("JPay",),
+        name_variants=("JPAY",),
+        notes="Prison money transfer + email + video. Aventiv/Securus subsidiary.",
+    ),
+    SeedRow(
+        label="ICSolutions",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        usaspending_recipient_names=(
+            "ICSOLUTIONS INC",
+            "INMATE CALLING SOLUTIONS",
+            "ICSOLUTIONS",
+        ),
+        lda_client_names=("ICSolutions",),
+        name_variants=("ICSOLUTIONS", "INMATE CALLING SOLUTIONS"),
+        notes="Regional prison-telecom (owned by Keefe Group).",
+    ),
+    # PE owners — the ownership thread. All privately held / individual
+    # persons; no federal corporate PAC in FEC (verified 2026-08-12).
+    # Persons carry LAST,FIRST in name_variants for the FEC individual-
+    # contributor path (Schedule A).
+    SeedRow(
+        label="Platinum Equity",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        usaspending_recipient_names=(
+            "PLATINUM EQUITY LLC",
+            "PLATINUM EQUITY",
+        ),
+        lda_client_names=("Platinum Equity",),
+        name_variants=("PLATINUM EQUITY",),
+        notes="Tom Gores's PE firm; owns Securus/Aventiv via investment vehicles.",
+    ),
+    SeedRow(
+        label="Tom Gores",
+        entity_type="person",
+        priority_domain="carceral_extraction",
+        name_variants=("Gores, Thomas T.", "Gores, Tom", "GORES, THOMAS"),
+        surface_mode="open",
+        notes="Founder + CEO of Platinum Equity. Public figure. Individual-contributor path (Schedule A).",
+    ),
+    SeedRow(
+        label="American Securities",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        usaspending_recipient_names=(
+            "AMERICAN SECURITIES LLC",
+            "AMERICAN SECURITIES CAPITAL PARTNERS",
+        ),
+        lda_client_names=("American Securities",),
+        name_variants=("AMERICAN SECURITIES",),
+        notes="PE firm; owned ViaPath (GTL) via portfolio. NOT the 'American Securities Association' trade PAC.",
+    ),
+    SeedRow(
+        label="H.I.G. Capital",
+        entity_type="organization",
+        priority_domain="carceral_extraction",
+        usaspending_recipient_names=(
+            "H.I.G. CAPITAL LLC",
+            "HIG CAPITAL LLC",
+            "H.I.G. CAPITAL",
+        ),
+        lda_client_names=("H.I.G. Capital",),
+        name_variants=("HIG CAPITAL", "H.I.G. CAPITAL"),
+        notes="PE firm; owns TKC Holdings (Keefe + Trinity Services). NOT 'Highland Capital Management' defunct 2018.",
+    ),
+)
+
+
 _ALL_SEED: tuple[SeedRow, ...] = (
     _DETENTION_OPERATORS + _PRISON_TELECOM + _SURVEILLANCE + _MUSK_NETWORK
     + _PARTY_COMMITTEES
     + _DEFENSE_PRIME + _GOVTECH_FEDERAL + _PHARMA_HEALTH + _ENERGY_INFRA
+    + _CARCERAL_EXTRACTION
 )
 
 
