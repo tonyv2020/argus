@@ -392,6 +392,16 @@ _DEFENSE_PRIME: tuple[SeedRow, ...] = (
         label="Lockheed Martin",
         entity_type="organization",
         priority_domain="defense_prime",
+        # Batch-1 contribution-accuracy fix (helen 2026-08-12) — every
+        # anchor here now carries the external FEC committee_id so the
+        # sweep uses the O(1) external-ID path (committee_id -> straight
+        # to /committee/<id>/schedules/schedule_b/) instead of the
+        # fuzzy name-search path. The initial Batch-1 fuzzy pass
+        # captured $101K for Lockheed vs the ~$4M/cycle a top defense
+        # prime actually gives — a fragment, not a leak. External-ID
+        # keying captures the full PAC. All IDs confirmed live via
+        # /v1/committees/?q=<name>.
+        fec_committee_ids=("C00303024",),  # LOCKHEED MARTIN CORPORATION EMPLOYEES' POLITICAL ACTION COMMITTEE
         sec_cik=936468,
         usaspending_recipient_names=(
             "LOCKHEED MARTIN CORPORATION",
@@ -400,10 +410,8 @@ _DEFENSE_PRIME: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Lockheed Martin",),
         name_variants=(
-            "LOCKHEED MARTIN EMPLOYEES POLITICAL ACTION COMMITTEE",
-            "LOCKHEED MARTIN CORPORATION EMPLOYEES POLITICAL ACTION COMMITTEE",
-            "LOCKHEED MARTIN CORPORATION PAC",
-            "LOCKHEED MARTIN PAC",
+            "LOCKHEED MARTIN",
+            "LOCKHEED",
         ),
         notes="Top DoD prime contractor. Batch 1 broadening 2026-08-12.",
     ),
@@ -411,6 +419,10 @@ _DEFENSE_PRIME: tuple[SeedRow, ...] = (
         label="RTX (Raytheon)",
         entity_type="organization",
         priority_domain="defense_prime",
+        # C00097568 = EMPLOYEES OF RTX CORPORATION POLITICAL ACTION
+        # COMMITTEE (current active PAC 2026 cycle). Legacy Raytheon
+        # Technologies PAC C00035683 is dormant post-merger.
+        fec_committee_ids=("C00097568",),
         sec_cik=101829,
         usaspending_recipient_names=(
             "RTX CORPORATION",
@@ -420,10 +432,8 @@ _DEFENSE_PRIME: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("RTX Corporation", "Raytheon Company"),
         name_variants=(
-            "RAYTHEON COMPANY POLITICAL ACTION COMMITTEE",
-            "RTX CORPORATION POLITICAL ACTION COMMITTEE",
-            "RAYTHEON POLITICAL ACTION COMMITTEE",
-            "RTX PAC",
+            "RAYTHEON",
+            "RTX",
         ),
         notes="RTX = Raytheon Technologies (2020 merger of UTC + Raytheon).",
     ),
@@ -431,6 +441,10 @@ _DEFENSE_PRIME: tuple[SeedRow, ...] = (
         label="Boeing",
         entity_type="organization",
         priority_domain="defense_prime",
+        # C00142711 = THE BOEING COMPANY PAC. Initial fuzzy pass
+        # returned NO MATCH because 'boeing company political action'
+        # doesn't match — the real name is 'THE BOEING COMPANY PAC'.
+        fec_committee_ids=("C00142711",),
         sec_cik=12927,
         usaspending_recipient_names=(
             "THE BOEING COMPANY",
@@ -439,15 +453,14 @@ _DEFENSE_PRIME: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("The Boeing Company",),
         name_variants=(
-            "THE BOEING COMPANY POLITICAL ACTION COMMITTEE",
-            "BOEING COMPANY POLITICAL ACTION COMMITTEE",
-            "BOEING PAC",
+            "BOEING",
         ),
     ),
     SeedRow(
         label="General Dynamics",
         entity_type="organization",
         priority_domain="defense_prime",
+        fec_committee_ids=("C00078451",),  # GENERAL DYNAMICS CORPORATION PAC
         sec_cik=40533,
         usaspending_recipient_names=(
             "GENERAL DYNAMICS CORPORATION",
@@ -457,14 +470,14 @@ _DEFENSE_PRIME: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("General Dynamics Corporation",),
         name_variants=(
-            "GENERAL DYNAMICS CORPORATION POLITICAL ACTION COMMITTEE",
-            "GENERAL DYNAMICS PAC",
+            "GENERAL DYNAMICS",
         ),
     ),
     SeedRow(
         label="Northrop Grumman",
         entity_type="organization",
         priority_domain="defense_prime",
+        fec_committee_ids=("C00088591",),  # EMPLOYEES OF NORTHROP GRUMMAN CORPORATION PAC
         sec_cik=1133421,
         usaspending_recipient_names=(
             "NORTHROP GRUMMAN CORPORATION",
@@ -473,15 +486,14 @@ _DEFENSE_PRIME: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Northrop Grumman Corporation",),
         name_variants=(
-            "NORTHROP GRUMMAN CORPORATION POLITICAL ACTION COMMITTEE",
-            "NORTHROP GRUMMAN POLITICAL ACTION COMMITTEE",
-            "NORTHROP GRUMMAN PAC",
+            "NORTHROP GRUMMAN",
         ),
     ),
     SeedRow(
         label="L3Harris",
         entity_type="organization",
         priority_domain="defense_prime",
+        fec_committee_ids=("C00100321",),  # L3HARRIS TECHNOLOGIES, INC. PAC
         sec_cik=202058,
         usaspending_recipient_names=(
             "L3HARRIS TECHNOLOGIES INC",
@@ -490,9 +502,7 @@ _DEFENSE_PRIME: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("L3Harris Technologies",),
         name_variants=(
-            "L3HARRIS TECHNOLOGIES POLITICAL ACTION COMMITTEE",
-            "L3HARRIS PAC",
-            "L3 TECHNOLOGIES POLITICAL ACTION COMMITTEE",
+            "L3HARRIS",
         ),
         notes="L3Harris formed 2019 by L3 Technologies + Harris Corp merger.",
     ),
@@ -504,6 +514,7 @@ _GOVTECH_FEDERAL: tuple[SeedRow, ...] = (
         label="Booz Allen Hamilton",
         entity_type="organization",
         priority_domain="govtech_federal",
+        fec_committee_ids=("C00709816",),  # BOOZ ALLEN HAMILTON INC. PAC (BOOZ ALLEN PAC)
         sec_cik=1443669,
         usaspending_recipient_names=(
             "BOOZ ALLEN HAMILTON INC",
@@ -512,15 +523,14 @@ _GOVTECH_FEDERAL: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Booz Allen Hamilton",),
         name_variants=(
-            "BOOZ ALLEN HAMILTON INC. POLITICAL ACTION COMMITTEE",
-            "BOOZ ALLEN HAMILTON POLITICAL ACTION COMMITTEE",
-            "BOOZ ALLEN PAC",
+            "BOOZ ALLEN HAMILTON",
         ),
     ),
     SeedRow(
         label="Leidos",
         entity_type="organization",
         priority_domain="govtech_federal",
+        fec_committee_ids=("C00546234",),  # LEIDOS INC. POLITICAL ACTION COMMITTEE
         sec_cik=1336920,
         usaspending_recipient_names=(
             "LEIDOS INC",
@@ -529,15 +539,14 @@ _GOVTECH_FEDERAL: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Leidos",),
         name_variants=(
-            "LEIDOS POLITICAL ACTION COMMITTEE",
-            "LEIDOS INC POLITICAL ACTION COMMITTEE",
-            "LEIDOS PAC",
+            "LEIDOS",
         ),
     ),
     SeedRow(
         label="SAIC",
         entity_type="organization",
         priority_domain="govtech_federal",
+        fec_committee_ids=("C00300418",),  # SCIENCE APPLICATIONS INTERNATIONAL CORPORATION VOLUNTARY PAC
         sec_cik=1571123,
         usaspending_recipient_names=(
             "SCIENCE APPLICATIONS INTERNATIONAL CORPORATION",
@@ -546,15 +555,18 @@ _GOVTECH_FEDERAL: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Science Applications International Corporation",),
         name_variants=(
-            "SCIENCE APPLICATIONS INTERNATIONAL CORPORATION POLITICAL ACTION COMMITTEE",
-            "SAIC POLITICAL ACTION COMMITTEE",
-            "SAIC PAC",
+            "SAIC",
         ),
     ),
     SeedRow(
         label="Accenture Federal Services",
         entity_type="organization",
         priority_domain="govtech_federal",
+        # No FEC committee — Accenture PLC (Irish parent) does not
+        # register a federal corporate PAC. Live 2026-08-12 lookup
+        # returned NO MATCH for 'accenture llp' + 'accenture federal'.
+        # Ingest still contributes contract-side edges; contribution
+        # side is legitimately empty.
         usaspending_recipient_names=(
             "ACCENTURE FEDERAL SERVICES LLC",
             "ACCENTURE FEDERAL SERVICES",
@@ -562,15 +574,15 @@ _GOVTECH_FEDERAL: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Accenture", "Accenture Federal Services"),
         name_variants=(
-            "ACCENTURE LLP POLITICAL ACTION COMMITTEE",
-            "ACCENTURE PAC",
+            "ACCENTURE",
         ),
-        notes="Accenture Federal Services is the US-federal-focused sub.",
+        notes="Accenture Federal Services is the US-federal-focused sub. No federal PAC.",
     ),
     SeedRow(
         label="Maximus",
         entity_type="organization",
         priority_domain="govtech_federal",
+        fec_committee_ids=("C00343707",),  # MAXIMUS INC. POLITICAL ACTION COMMITTEE (MAXPAC)
         sec_cik=1032220,
         usaspending_recipient_names=(
             "MAXIMUS INC",
@@ -579,9 +591,7 @@ _GOVTECH_FEDERAL: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Maximus",),
         name_variants=(
-            "MAXIMUS INC POLITICAL ACTION COMMITTEE",
-            "MAXIMUS POLITICAL ACTION COMMITTEE",
-            "MAXIMUS PAC",
+            "MAXIMUS",
         ),
         notes="Major CMS/HHS contractor (call centers, benefits admin).",
     ),
@@ -593,6 +603,7 @@ _PHARMA_HEALTH: tuple[SeedRow, ...] = (
         label="Pfizer",
         entity_type="organization",
         priority_domain="pharma_health",
+        fec_committee_ids=("C00016683",),  # PFIZER INC. PAC
         sec_cik=78003,
         usaspending_recipient_names=(
             "PFIZER INC",
@@ -601,15 +612,14 @@ _PHARMA_HEALTH: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Pfizer",),
         name_variants=(
-            "PFIZER INC POLITICAL ACTION COMMITTEE",
-            "PFIZER INC. POLITICAL ACTION COMMITTEE",
-            "PFIZER PAC",
+            "PFIZER",
         ),
     ),
     SeedRow(
         label="McKesson",
         entity_type="organization",
         priority_domain="pharma_health",
+        fec_committee_ids=("C00108035",),  # MCKESSON CORPORATION EMPLOYEES POLITICAL FUND
         sec_cik=927653,
         usaspending_recipient_names=(
             "MCKESSON CORPORATION",
@@ -618,15 +628,14 @@ _PHARMA_HEALTH: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("McKesson Corporation",),
         name_variants=(
-            "MCKESSON CORPORATION EMPLOYEES POLITICAL FUND",
-            "MCKESSON CORPORATION POLITICAL ACTION COMMITTEE",
-            "MCKESSON PAC",
+            "MCKESSON",
         ),
     ),
     SeedRow(
         label="Centene",
         entity_type="organization",
         priority_domain="pharma_health",
+        fec_committee_ids=("C00397851",),  # CENTENE CORPORATION PAC
         sec_cik=1071739,
         usaspending_recipient_names=(
             "CENTENE CORPORATION",
@@ -635,8 +644,7 @@ _PHARMA_HEALTH: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Centene Corporation",),
         name_variants=(
-            "CENTENE CORPORATION POLITICAL ACTION COMMITTEE",
-            "CENTENE PAC",
+            "CENTENE",
         ),
         notes="Largest Medicaid managed-care contractor.",
     ),
@@ -644,6 +652,7 @@ _PHARMA_HEALTH: tuple[SeedRow, ...] = (
         label="Humana",
         entity_type="organization",
         priority_domain="pharma_health",
+        fec_committee_ids=("C00271007",),  # HUMANA INC. POLITICAL ACTION COMMITTEE
         sec_cik=49071,
         usaspending_recipient_names=(
             "HUMANA INC",
@@ -652,9 +661,7 @@ _PHARMA_HEALTH: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Humana",),
         name_variants=(
-            "HUMANA INC POLITICAL ACTION COMMITTEE",
-            "HUMANA INC. POLITICAL ACTION COMMITTEE",
-            "HUMANA PAC",
+            "HUMANA",
         ),
         notes="TRICARE East region contractor + Medicare Advantage.",
     ),
@@ -662,6 +669,7 @@ _PHARMA_HEALTH: tuple[SeedRow, ...] = (
         label="UnitedHealth Group",
         entity_type="organization",
         priority_domain="pharma_health",
+        fec_committee_ids=("C00274431",),  # UNITEDHEALTH GROUP INCORPORATED PAC
         sec_cik=731766,
         usaspending_recipient_names=(
             "UNITEDHEALTH GROUP INCORPORATED",
@@ -671,15 +679,17 @@ _PHARMA_HEALTH: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("UnitedHealth Group", "Optum"),
         name_variants=(
-            "UNITEDHEALTH GROUP INCORPORATED POLITICAL ACTION COMMITTEE",
-            "UNITED HEALTH GROUP INCORPORATED POLITICAL ACTION COMMITTEE",
-            "UNITEDHEALTH PAC",
+            "UNITEDHEALTH",
         ),
     ),
     SeedRow(
         label="Moderna",
         entity_type="organization",
         priority_domain="pharma_health",
+        # No FEC committee — Moderna (founded 2010, IPO 2018) has no
+        # federal corporate PAC registered as of 2026-08-12 live lookup.
+        # Contract-side ingest still fires; contribution side legitimately
+        # empty until they register one.
         sec_cik=1682852,
         usaspending_recipient_names=(
             "MODERNA INC",
@@ -690,11 +700,9 @@ _PHARMA_HEALTH: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Moderna",),
         name_variants=(
-            "MODERNA INC POLITICAL ACTION COMMITTEE",
-            "MODERNA POLITICAL ACTION COMMITTEE",
-            "MODERNA PAC",
+            "MODERNA",
         ),
-        notes="Major BARDA/HHS covid-vaccine contractor.",
+        notes="Major BARDA/HHS covid-vaccine contractor. No federal PAC.",
     ),
 )
 
@@ -704,6 +712,7 @@ _ENERGY_INFRA: tuple[SeedRow, ...] = (
         label="ExxonMobil",
         entity_type="organization",
         priority_domain="energy_infra",
+        fec_committee_ids=("C00121368",),  # EXXON MOBIL CORPORATION POLITICAL ACTION COMMITTEE
         sec_cik=34088,
         usaspending_recipient_names=(
             "EXXON MOBIL CORPORATION",
@@ -712,15 +721,14 @@ _ENERGY_INFRA: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("ExxonMobil",),
         name_variants=(
-            "EXXONMOBIL POLITICAL ACTION COMMITTEE",
-            "EXXON MOBIL POLITICAL ACTION COMMITTEE",
-            "EXXONMOBIL PAC",
+            "EXXON",
         ),
     ),
     SeedRow(
         label="Chevron",
         entity_type="organization",
         priority_domain="energy_infra",
+        fec_committee_ids=("C00035006",),  # CHEVRON EMPLOYEES POLITICAL ACTION COMMITTEE
         sec_cik=93410,
         usaspending_recipient_names=(
             "CHEVRON U.S.A. INC",
@@ -730,15 +738,14 @@ _ENERGY_INFRA: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Chevron",),
         name_variants=(
-            "CHEVRON EMPLOYEES POLITICAL ACTION COMMITTEE",
-            "CHEVRON POLITICAL ACTION COMMITTEE",
-            "CHEVRON PAC",
+            "CHEVRON",
         ),
     ),
     SeedRow(
         label="Bechtel",
         entity_type="organization",
         priority_domain="energy_infra",
+        fec_committee_ids=("C00103697",),  # BECHTEL GROUP, INC. POLITICAL ACTION COMMITTEE
         usaspending_recipient_names=(
             "BECHTEL NATIONAL INC",
             "BECHTEL CORPORATION",
@@ -747,9 +754,7 @@ _ENERGY_INFRA: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Bechtel Corporation",),
         name_variants=(
-            "BECHTEL GROUP INC POLITICAL ACTION COMMITTEE",
-            "BECHTEL POLITICAL ACTION COMMITTEE",
-            "BECHTEL PAC",
+            "BECHTEL",
         ),
         notes="Private; major DoE weapons-complex + civil-infra prime.",
     ),
@@ -757,6 +762,7 @@ _ENERGY_INFRA: tuple[SeedRow, ...] = (
         label="Fluor",
         entity_type="organization",
         priority_domain="energy_infra",
+        fec_committee_ids=("C00034132",),  # FLUOR CORPORATION POLITICAL ACTION COMMITTEE (FLUOR PAC)
         sec_cik=1124198,
         usaspending_recipient_names=(
             "FLUOR CORPORATION",
@@ -766,9 +772,7 @@ _ENERGY_INFRA: tuple[SeedRow, ...] = (
         ),
         lda_client_names=("Fluor Corporation",),
         name_variants=(
-            "FLUOR CORPORATION PUBLIC AFFAIRS COMMITTEE",
-            "FLUOR CORPORATION POLITICAL ACTION COMMITTEE",
-            "FLUOR PAC",
+            "FLUOR",
         ),
     ),
 )

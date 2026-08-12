@@ -818,5 +818,244 @@ async def ingest_individual_contributors_from_registry(
     return out
 
 
+# ─── Batch-1 contribution-accuracy fix (helen 2026-08-12) ─────────────
+#
+# Corporate PACs (Chevron, Lockheed, Boeing, etc.) give to hundreds of
+# recipient committees + candidates. flow_model1's party attribution
+# only counts contributions whose RECIPIENT has a ``party`` alias
+# (source_system='party', surface_name='Republican'|'Democratic').
+# Congress-member canonicals already get the party alias via
+# congress_roster (P5.2); the 4 party campaign committees (NRSC/NRCC/
+# DSCC/DCCC) get it via anchor_registry+notes. Everything ELSE — the
+# hundreds of leadership PACs, joint fundraisers, state parties, PACs-
+# of-PACs that a corporate PAC's Schedule B lands in — is unclassified,
+# so flow_model1 drops most of the captured giving on the floor.
+#
+# ``enrich_recipient_party_aliases`` closes the gap: for each canonical
+# with source_system='fec.committee' but NO party alias yet, fetch
+# /committees/{id}/, read the FEC ``party`` field, and add the alias.
+# FEC party codes: 'REP' → 'Republican', 'DEM' → 'Democratic',
+# 'DFL' → 'Democratic' (Democratic-Farmer-Labor). Everything else
+# (LIB / GRE / IND / blank / ungoverned) is skipped — flow_model1
+# only queries R and D.
+
+
+_FEC_PARTY_MAP: dict[str, str] = {
+    "REP": "Republican",
+    "DEM": "Democratic",
+    "DFL": "Democratic",  # Democratic-Farmer-Labor (Minnesota)
+}
+
+
+async def _lookup_fec_party(
+    client: httpx.AsyncClient, fec_id: str
+) -> str | None:
+    """Return the mapped party name for an FEC committee or candidate
+    id, or None. FEC committee ids start with 'C'; candidate ids start
+    with 'H' / 'S' / 'P' (House / Senate / Presidential). Everything
+    else (empty, 'unknown-…', unrecognized) is skipped.
+
+    Two-hop path for committees whose party is blank: many corporate-PAC
+    recipient committees are CANDIDATE PRINCIPAL CAMPAIGN COMMITTEES
+    (C-prefixed) whose FEC ``party`` field is empty; the party actually
+    lives on the LINKED CANDIDATE record. If the committee response
+    carries ``candidate_ids`` (or a legacy ``candidate_id``), follow to
+    /candidate/<id>/ and try again. This is the fix for the Boeing/
+    Northrop/L3Harris undercapture — their PAC disbursements land
+    on member campaign committees, and without the two-hop follow the
+    party attribution stops at the empty committee record.
+    """
+    if not fec_id:
+        return None
+    prefix = fec_id[0].upper()
+    if prefix == "C":
+        path = f"/committee/{fec_id}/"
+    elif prefix in ("H", "S", "P"):
+        path = f"/candidate/{fec_id}/"
+    else:
+        return None
+    try:
+        payload = await _fec_get(client, path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "FEC %s lookup failed (fail-open): %s", fec_id, exc,
+        )
+        return None
+    results = (payload or {}).get("results") or []
+    if not results:
+        return None
+    d = results[0]
+    raw = (d.get("party") or "").upper().strip()
+    party = _FEC_PARTY_MAP.get(raw)
+    if party is not None:
+        return party
+    # Two-hop follow: committee → candidate → party.
+    if prefix == "C":
+        candidate_ids = d.get("candidate_ids") or []
+        legacy = d.get("candidate_id")
+        if legacy and legacy not in candidate_ids:
+            candidate_ids = list(candidate_ids) + [legacy]
+        for cand_id in candidate_ids[:2]:  # bounded — 1-2 candidates per committee is typical
+            try:
+                cpayload = await _fec_get(client, f"/candidate/{cand_id}/")
+            except Exception:
+                continue
+            cres = (cpayload or {}).get("results") or []
+            if not cres:
+                continue
+            craw = (cres[0].get("party") or "").upper().strip()
+            cparty = _FEC_PARTY_MAP.get(craw)
+            if cparty is not None:
+                return cparty
+    return None
+
+
+@dataclass
+class PartyEnrichStats:
+    """Counters for one party-classification enrichment pass."""
+
+    committees_scanned: int = 0
+    already_classified: int = 0
+    api_lookups: int = 0
+    aliases_added: int = 0
+    aliases_skipped_no_party: int = 0
+    errors: int = 0
+
+
+async def enrich_recipient_party_aliases(
+    max_lookups: int = 500,
+) -> PartyEnrichStats:
+    """Party-classify recipient canonicals so flow_model1 sees full
+    R/D giving instead of the tiny fraction currently attributed.
+
+    Selects canonicals with an ``EntityAlias`` where
+    ``source_system='fec.committee'`` (recipients that came out of a
+    Schedule B disbursement + were upserted as PAC/committee/candidate
+    canonicals) that DO NOT already carry a
+    ``source_system='party'`` alias. For each, fetches
+    ``/committee/<id>/``, reads the FEC ``party`` field, and if it
+    maps to Republican or Democratic, upserts the party alias.
+
+    Bounded by ``max_lookups`` so a first-pass run over a fresh
+    corporate-PAC ingestion doesn't blow the FEC key's daily quota.
+    Reruns are idempotent — already-classified canonicals are skipped
+    at the SQL layer (no API call).
+    """
+    stats = PartyEnrichStats()
+    sm = get_sessionmaker()
+
+    async with sm() as session:
+        # Find every canonical whose alias came out of an FEC ingest
+        # path AND that does NOT already carry a party alias.
+        # Recipients from Schedule B disbursements land with
+        # source_system='fec.disbursement.recipient'; PACs upserted
+        # from committee lookups land with source_system='fec.committee'.
+        subq = (
+            select(EntityAlias.canonical_id)
+            .where(EntityAlias.source_system == "party")
+        )
+        rows = (
+            await session.execute(
+                select(EntityAlias.canonical_id, EntityAlias.source_id)
+                .where(
+                    EntityAlias.source_system.in_((
+                        "fec.committee",
+                        "fec.disbursement.recipient",
+                    )),
+                    ~EntityAlias.canonical_id.in_(subq),
+                )
+            )
+        ).all()
+        # ALSO fetch the set of source_ids already used as
+        # (source_system='party') keys — the ix_aliases_source unique
+        # index (source_system, source_id) requires per-source_id
+        # uniqueness across ALL canonicals. Historical FEC recipients
+        # may have proliferated multiple canonicals under the same
+        # committee_id, so skipping by "canonical has no party alias"
+        # alone is not sufficient — we'd hit an IntegrityError on the
+        # 2nd insert for the same committee.
+        used_party_source_ids = set(
+            (
+                await session.execute(
+                    select(EntityAlias.source_id).where(
+                        EntityAlias.source_system == "party"
+                    )
+                )
+            ).scalars().all()
+        )
+
+    # De-dupe per canonical (one canonical may have both a
+    # fec.committee alias + a fec.disbursement.recipient alias); take
+    # the first fec_id seen. Then filter out any fec_id already used
+    # as a party source_id upstream.
+    seen_canonical: set[str] = set()
+    unique_rows: list[tuple[str, str]] = []
+    for canonical_id, fec_id in rows:
+        if canonical_id in seen_canonical:
+            continue
+        seen_canonical.add(canonical_id)
+        if fec_id in used_party_source_ids:
+            # Some OTHER canonical already carries a party alias
+            # keyed on this fec_id — skip; the unique index would
+            # trip a rollback and we can't help either canonical
+            # from this side (upstream merge/dedup is the fix).
+            continue
+        unique_rows.append((canonical_id, fec_id))
+    stats.committees_scanned = len(unique_rows)
+    if not unique_rows:
+        return stats
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for canonical_id, fec_id in unique_rows[:max_lookups]:
+            try:
+                party = await _lookup_fec_party(client, fec_id)
+                stats.api_lookups += 1
+            except Exception:
+                logger.exception(
+                    "party lookup errored for fec_id %s", fec_id
+                )
+                stats.errors += 1
+                continue
+            if party is None:
+                stats.aliases_skipped_no_party += 1
+                continue
+            # Upsert the party alias.
+            async with sm() as session:
+                # Recheck for race — another sweep may have added it.
+                existing = (
+                    await session.execute(
+                        select(EntityAlias.id).where(
+                            EntityAlias.canonical_id == canonical_id,
+                            EntityAlias.source_system == "party",
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    stats.already_classified += 1
+                    continue
+                session.add(
+                    EntityAlias(
+                        canonical_id=canonical_id,
+                        source_system="party",
+                        # source_id must be unique across all party
+                        # aliases (index ix_aliases_source is
+                        # unique(source_system, source_id)). Use the
+                        # committee_id / candidate_id — deterministic
+                        # per recipient, matches the congress_roster
+                        # pattern of keying party aliases by the
+                        # per-canonical external id (bioguide there,
+                        # committee_id / candidate_id here).
+                        source_id=fec_id,
+                        surface_name=party,  # 'Republican' | 'Democratic'
+                        surface_name_normalized=party.lower(),
+                        confidence=0.99,
+                    )
+                )
+                await session.commit()
+                stats.aliases_added += 1
+
+    return stats
+
+
 if __name__ == "__main__":
     main()
