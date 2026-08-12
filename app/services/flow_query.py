@@ -81,6 +81,27 @@ class FlowRow:
     # top_citations_per_side arg on model1_flow (default 4).
     top_contract_citations: list[CitationRef] = field(default_factory=list)
     top_contribution_citations: list[CitationRef] = field(default_factory=list)
+    # BROADEN-LAND (Tony 2026-08-12): support cited-floor framing on
+    # the hollywood side. ``contrib_total`` above is the PARTY-CLASSIFIED
+    # attribution (recipients matching _party_recipient_ids for the
+    # queried party). Party classification is bounded by FEC-quota-
+    # limited enrichment, so it's typically 30-80% of the real captured
+    # giving. Cassandra frames it as an HONEST FLOOR ("at least $X in
+    # cited [party]-aligned contributions") — never a total — and needs
+    # both numbers to say so without overclaiming.
+    #
+    # ``contrib_total_captured`` = sum of every contributes_to weight
+    # from every source attributed to this entity (party-classified +
+    # unclassified) — the "total captured" number.
+    #
+    # ``has_corporate_pac`` = at least one affiliated_with source of
+    # this entity's contribs is a type='pac' canonical (as opposed to
+    # only individual-person affiliates like Peter Thiel → Palantir).
+    # Hollywood's data-quality gate rejects individual-only rows so
+    # personal giving never gets published as if it were corporate PAC
+    # money-flow.
+    contrib_total_captured: float = 0.0
+    has_corporate_pac: bool = False
 
 
 @dataclass
@@ -371,6 +392,20 @@ async def model1_flow(
             top_per_side=top_citations_per_side,
         )
 
+    # BROADEN-LAND (Tony 2026-08-12): attach contrib_total_captured
+    # (all-targets contribution sum, not party-filtered) + has_corporate_pac
+    # (true iff at least one affiliated source of this entity's contribs is
+    # a type='pac' canonical). These support the hollywood-side cited-floor
+    # framing + the $250K/real-corporate-PAC data-quality gate. Bounded to
+    # the top-``limit`` rows same as citations, so the extra cost is O(top)
+    # queries regardless of contributor-set size.
+    if rows:
+        await _attach_captured_and_pac_flag(
+            session,
+            rows,
+            org_to_pacs=org_to_pacs,
+        )
+
     return FlowSummary(
         party=party,
         rows=rows,
@@ -378,6 +413,86 @@ async def model1_flow(
         total_contract=sum(r.contract_total for r in rows),
         n_contributors=len(rows),
     )
+
+
+async def _attach_captured_and_pac_flag(
+    session: AsyncSession,
+    rows: list[FlowRow],
+    *,
+    org_to_pacs: dict[str, set[str]],
+) -> None:
+    """Populate ``contrib_total_captured`` + ``has_corporate_pac`` on
+    each row in place.
+
+    ``contrib_total_captured`` = sum of every contributes_to weight
+    from {entity} ∪ {its affiliated PACs} — NOT party-filtered. This
+    is the total giving Argus has actually captured for the entity's
+    money-flow, before flow_model1's party attribution filter drops
+    the unclassified portion. Cassandra frames the classified figure
+    (``contrib_total``) as a FLOOR against this captured total in her
+    cited-floor language ("at least $X classified of $Y total captured").
+
+    ``has_corporate_pac`` = at least one entity in {entity + its
+    affiliated PACs} has ``CanonicalEntity.type = 'pac'``. False =
+    contributions come only from an individual-person affiliate (e.g.
+    Peter Thiel → Palantir via the P16 executive affiliation seed);
+    hollywood's data-quality gate rejects individual-only rows so
+    personal giving never gets published as corporate PAC money-flow.
+    """
+    if not rows:
+        return
+
+    # Build per-entity source set (entity + affiliated PACs), same
+    # walk _attach_top_citations uses for contribution citations.
+    entity_source_ids: dict[str, set[str]] = {}
+    all_sources: set[str] = set()
+    for r in rows:
+        srcs = {r.entity_id} | org_to_pacs.get(r.entity_id, set())
+        entity_source_ids[r.entity_id] = srcs
+        all_sources |= srcs
+
+    if not all_sources:
+        for r in rows:
+            r.contrib_total_captured = 0.0
+            r.has_corporate_pac = False
+        return
+
+    # Total captured contribs per source (no party filter).
+    stmt = (
+        select(
+            CanonicalEdge.source_id,
+            func.sum(CanonicalEdge.weight).label("captured"),
+        )
+        .where(
+            CanonicalEdge.relation == EdgeRelation.CONTRIBUTES_TO.value,
+            CanonicalEdge.source_id.in_(all_sources),
+            published_edge(),
+        )
+        .group_by(CanonicalEdge.source_id)
+    )
+    captured_by_source = {
+        row.source_id: float(row.captured or 0.0)
+        for row in (await session.execute(stmt)).all()
+    }
+
+    # Entity types (for the corporate-PAC test) — pull once for all
+    # sources.
+    type_stmt = select(CanonicalEntity.id, CanonicalEntity.type).where(
+        CanonicalEntity.id.in_(all_sources)
+    )
+    types = {
+        row.id: row.type
+        for row in (await session.execute(type_stmt)).all()
+    }
+
+    for r in rows:
+        srcs = entity_source_ids[r.entity_id]
+        r.contrib_total_captured = sum(
+            captured_by_source.get(s, 0.0) for s in srcs
+        )
+        r.has_corporate_pac = any(
+            types.get(s) == "pac" for s in srcs
+        )
 
 
 async def _attach_top_citations(
