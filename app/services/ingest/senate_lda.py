@@ -51,7 +51,16 @@ from app.services.graph.base import normalize_name
 
 logger = logging.getLogger(__name__)
 
-_LDA_BASE = "https://lda.senate.gov/api/v1"
+# Base URL migration (Tony/helen 2026-08-12 carceral Track A phase 2):
+# lda.senate.gov returned 301 Moved Permanently → lda.gov on every
+# request during the carceral sweep (17 errors), blocking new LDA
+# ingestion for the fresh carceral anchors. The redirect target is
+# the new https://lda.gov host — swap the base URL rather than
+# follow-redirects since redirect chains double the request count +
+# lose query params on some POSTs. Existing lobbies edges (Securus 9
+# / Aventiv 3 / ViaPath 2) were pre-migration and remain queryable
+# unchanged.
+_LDA_BASE = "https://lda.gov/api/v1"
 
 # Default client anchor — the GEO Group, matching argus's other GEO-Group-scoped
 # passes (:mod:`.fec`, :mod:`.usaspending`). Override via
@@ -63,7 +72,7 @@ _DEFAULT_CLIENT_NAME = "The GEO Group"
 # Filings are addressable at /filings/public/filing/<uuid>/ ; the JSON payload
 # also carries a ``filing_document_url`` which points at a PDF (if disclosed).
 # We citation-URL the public-record page (stable) rather than the PDF (may 404).
-_FILING_URL_TEMPLATE = "https://lda.senate.gov/filings/public/filing/{uuid}/"
+_FILING_URL_TEMPLATE = "https://lda.gov/filings/public/filing/{uuid}/"
 
 
 @dataclass
@@ -81,11 +90,12 @@ class SenateLdaStats:
 
 
 async def _lda_get(client: httpx.AsyncClient, path: str, **params) -> dict:
-    """One GET to lda.senate.gov; returns parsed JSON. Raises on non-2xx.
+    """One GET to the LDA public API (``_LDA_BASE``); returns parsed
+    JSON. Raises on non-2xx.
 
     Handles 429 with exponential backoff (2s, 4s, 8s, up to 5 attempts)
-    honouring a Retry-After header when present. lda.senate.gov throttles
-    aggressively on a multi-anchor sweep — see
+    honouring a Retry-After header when present. The LDA public API
+    throttles aggressively on a multi-anchor sweep — see
     ``helen-k3s/docs/argus-coverage-expansion-design.md`` rate-limits.
     """
     import asyncio
