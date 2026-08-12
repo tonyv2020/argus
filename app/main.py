@@ -946,6 +946,15 @@ async def flow_model1(
                     {"kind": c.kind, "url": c.url, "ref": c.ref}
                     for c in r.top_contribution_citations
                 ],
+                # BROADEN-LAND (Tony 2026-08-12): cited-floor framing
+                # support. contrib_usd (above) is PARTY-CLASSIFIED —
+                # the floor Cassandra cites. contrib_usd_captured is
+                # the total-captured (unclassified + classified) so
+                # the block can say "at least $X classified of $Y
+                # total captured". has_corporate_pac gates out
+                # individual-only attribution (Palantir via Thiel).
+                "contrib_usd_captured": r.contrib_total_captured,
+                "has_corporate_pac": r.has_corporate_pac,
             }
             for r in summary.rows
         ],
