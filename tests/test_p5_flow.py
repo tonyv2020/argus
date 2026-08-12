@@ -56,11 +56,20 @@ def test_all_seed_includes_party_committees() -> None:
 
 
 def test_usaspending_broaden_flag_wired_through_dispatcher() -> None:
-    """`ingest_from_registry(broaden_agency_scope=True)` must thread
-    the flag into `ingest_recipient_contracts` — else per-anchor
-    calls don't broaden and Tesla/SpaceX NASA/DoD contracts miss."""
+    """``ingest_from_registry`` computes a PER-ANCHOR broaden flag
+    (helen 2026-08-11 followup) — detention-ops anchors keep the
+    narrow ICE/BOP/USMS whitelist, non-detention anchors get
+    broaden=True so Palantir/Tesla/SpaceX/xAI etc. land their real
+    NASA/DoD/State awards. The caller's ``broaden_agency_scope``
+    still force-broadens everyone when True — a per-anchor OR."""
     src = inspect.getsource(usaspending.ingest_from_registry)
-    assert "broaden_agency_scope=broaden_agency_scope" in src
+    # Per-anchor decision variable + call-site wiring.
+    assert "per_anchor_broaden" in src
+    assert "broaden_agency_scope=per_anchor_broaden" in src
+    # And the detention-vs-non-detention decision keys off the
+    # existing DETENTION_INDUSTRY_RECIPIENTS set.
+    assert "detention_labels" in src
+    assert "DETENTION_INDUSTRY_RECIPIENTS" in src
 
 
 def test_usaspending_broadened_mode_accepts_any_sub_agency() -> None:
