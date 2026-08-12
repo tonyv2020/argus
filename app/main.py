@@ -931,6 +931,21 @@ async def flow_model1(
                 "entity_label": r.entity_label,
                 "contrib_usd": r.contrib_total,
                 "contract_usd": r.contract_total,
+                # E1 award-grade citations (Tony directive 2026-08-12):
+                # per-entity top-N SourceCitation refs so downstream
+                # consumers (hollywood_gen.agents.blog.argus_research)
+                # can surface real usaspending/fec URLs alongside the
+                # entity deep-link. Additive + back-compat: existing
+                # consumers that ignore these keys see no change in
+                # behavior. Empty lists for entities with no citations.
+                "top_contract_citations": [
+                    {"kind": c.kind, "url": c.url, "ref": c.ref}
+                    for c in r.top_contract_citations
+                ],
+                "top_contribution_citations": [
+                    {"kind": c.kind, "url": c.url, "ref": c.ref}
+                    for c in r.top_contribution_citations
+                ],
             }
             for r in summary.rows
         ],
