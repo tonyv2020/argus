@@ -52,11 +52,17 @@ def test_client_name_matches_tolerates_missing_client_block() -> None:
 def test_filing_url_template_points_at_public_record_page() -> None:
     """The citation URL must be the stable /filings/public/filing/<uuid>/ page,
     NOT the PDF URL — PDFs can 404 when a filing is amended, the record page
-    stays live."""
+    stays live.
+
+    Base URL migrated from ``lda.senate.gov`` → ``lda.gov`` in the
+    2026-08-12 carceral Track A phase 2 sweep (the old host started
+    301-redirecting, breaking ingestion of the fresh carceral anchors).
+    """
     uuid = "bf5d8bd9-79a9-46cf-a148-25a58c6abe8b"
     url = _FILING_URL_TEMPLATE.format(uuid=uuid)
-    assert url == f"https://lda.senate.gov/filings/public/filing/{uuid}/"
+    assert url == f"https://lda.gov/filings/public/filing/{uuid}/"
     assert not url.endswith(".pdf")
+    assert "lda.senate.gov" not in url
 
 
 def test_stats_starts_at_all_zero_counters() -> None:
