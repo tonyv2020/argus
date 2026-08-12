@@ -864,6 +864,11 @@ async def _lookup_fec_party(
     Northrop/L3Harris undercapture — their PAC disbursements land
     on member campaign committees, and without the two-hop follow the
     party attribution stops at the empty committee record.
+
+    Retries once on 429 (Too Many Requests) with a 60-second sleep —
+    FEC's public rate limit is 1000/hour on standard keys, so bulk
+    enrichment runs can transiently hit the throttle. Fail-open on
+    any other error so the enrichment doesn't abort mid-batch.
     """
     if not fec_id:
         return None
@@ -874,12 +879,28 @@ async def _lookup_fec_party(
         path = f"/candidate/{fec_id}/"
     else:
         return None
-    try:
-        payload = await _fec_get(client, path)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(
-            "FEC %s lookup failed (fail-open): %s", fec_id, exc,
-        )
+    payload = None
+    for attempt in range(2):
+        try:
+            payload = await _fec_get(client, path)
+            break
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429 and attempt == 0:
+                logger.info(
+                    "FEC 429 on %s — sleeping 60s + retrying once", path,
+                )
+                await asyncio.sleep(60.0)
+                continue
+            logger.debug(
+                "FEC %s lookup failed (fail-open): %s", fec_id, exc,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "FEC %s lookup failed (fail-open): %s", fec_id, exc,
+            )
+            return None
+    if payload is None:
         return None
     results = (payload or {}).get("results") or []
     if not results:
@@ -924,6 +945,7 @@ class PartyEnrichStats:
 
 async def enrich_recipient_party_aliases(
     max_lookups: int = 500,
+    per_call_sleep_s: float = 0.5,
 ) -> PartyEnrichStats:
     """Party-classify recipient canonicals so flow_model1 sees full
     R/D giving instead of the tiny fraction currently attributed.
@@ -1007,6 +1029,15 @@ async def enrich_recipient_party_aliases(
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         for canonical_id, fec_id in unique_rows[:max_lookups]:
+            # Rate-limit-friendly pacing (helen 2026-08-12 finalize):
+            # FEC public API allows 1000 calls/hr on standard keys;
+            # a 0.5s per-call sleep caps us at 7200/hr — well over the
+            # limit BUT we also retry-once-with-60s-sleep in
+            # _lookup_fec_party for any 429 we hit, so the effective
+            # steady-state stays under the ceiling. Set per_call_sleep_s
+            # higher (e.g. 4.0) for guaranteed-under-quota bulk runs.
+            if per_call_sleep_s > 0:
+                await asyncio.sleep(per_call_sleep_s)
             try:
                 party = await _lookup_fec_party(client, fec_id)
                 stats.api_lookups += 1
