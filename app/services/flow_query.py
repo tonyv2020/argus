@@ -24,7 +24,7 @@ Framing (spec §5): correlation, not causation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,18 +34,53 @@ from app.models import (
     CanonicalEntity,
     EdgeRelation,
     EntityAlias,
+    SourceCitation,
 )
 from app.services.read_gate import published_edge
 
 
+@dataclass(frozen=True)
+class CitationRef:
+    """One primary-source citation surfaced alongside a FlowRow.
+
+    E1 award-grade enrichment (Tony directive 2026-08-12): Model 1
+    contrib/contract sums have always been backed by real SourceCitation
+    rows (usaspending_award for contracts, fec_filing for contributions
+    via affiliated PACs). Before E1 those citations lived only inside
+    the graph and never surfaced through the flow API — so
+    hollywood_gen.agents.blog.argus_research could only offer Cassandra
+    entity deep-links, never the primary-source URLs her decline rule
+    correctly wants. This dataclass is the shape the API surfaces so
+    her SAFE CITATION MENU can carry them.
+    """
+
+    kind: str  # e.g. "usaspending_award" | "fec_filing"
+    url: str
+    ref: str | None = None  # award id / fec txn id / permalink slug
+
+
 @dataclass
 class FlowRow:
-    """One contributor + their aggregated contrib/contract $."""
+    """One contributor + their aggregated contrib/contract $ +, since E1,
+    a bounded list of the top underlying primary-source citations for
+    each side of the correlation (so Cassandra can cite the actual
+    award / FEC filing URL, not just the Argus entity deep-link).
+    """
 
     entity_id: str
     entity_label: str
     contrib_total: float
     contract_total: float
+    # E1 award-grade citations. Populated from real SourceCitation rows
+    # on the same edges whose weights sum to the totals above (contract
+    # rows come from holds_contract edges; contribution rows come from
+    # contributes_to edges reached via the entity's affiliated_with
+    # PACs — the same PAC walk model1_flow uses to attribute contrib
+    # totals, so citations + totals are consistent by construction).
+    # Deduped by url; ranked by edge weight desc; capped by the
+    # top_citations_per_side arg on model1_flow (default 4).
+    top_contract_citations: list[CitationRef] = field(default_factory=list)
+    top_contribution_citations: list[CitationRef] = field(default_factory=list)
 
 
 @dataclass
@@ -178,6 +213,7 @@ async def model1_flow(
     party: str,
     agency_relation: str = "holds_contract",
     limit: int = 100,
+    top_citations_per_side: int = 4,
 ) -> FlowSummary:
     """P5.3 Model 1 — INFLUENCE flow.
 
@@ -187,7 +223,14 @@ async def model1_flow(
       2. Find every entity that CONTRIBUTES_TO one of those recipients
          (sum contributes_to weight per contributor).
       3. Sum contract $ (agency-filtered by relation) per contributor.
-      4. Emit per-contributor rows + rollup.
+      4. E1 (Tony directive 2026-08-12) — for the top-``limit`` rows,
+         pull the top-``top_citations_per_side`` underlying
+         SourceCitations for each side (usaspending_award for
+         contracts; fec_filing for contributions, via the same
+         affiliated_with PAC walk used to attribute contrib totals).
+         Ranked by edge weight desc; deduped by URL. This is the
+         hop that unlocks award-grade Cassandra columns.
+      5. Emit per-contributor rows + rollup.
     """
     recipient_ids = await _party_recipient_ids(session, party)
     if not recipient_ids:
@@ -222,6 +265,10 @@ async def model1_flow(
     # ZERO OUT the PAC entry so the aggregate isn't double-counted.
     # Attributed rows carry the ORIGINAL PAC's contribs on the org id.
     pac_ids = list(contribs.keys())
+    # E1: build org_to_pacs mapping alongside the attribution walk so
+    # the citation-gather step below can reach each org's contributes_to
+    # edges via the same PAC set the totals came from (consistency).
+    org_to_pacs: dict[str, set[str]] = {}
     if pac_ids:
         # RG2: PAC → sponsor org attribution must not follow staged edges.
         pac_to_org = (
@@ -238,6 +285,7 @@ async def model1_flow(
             if pac_amt > 0:
                 contribs[org_id] = contribs.get(org_id, 0.0) + pac_amt
                 contribs.pop(pac_id, None)
+            org_to_pacs.setdefault(org_id, set()).add(pac_id)
 
     # Exclude congress-member canonicals from the contributor set —
     # the bridge (link_committees_to_candidates) creates a legit edge
@@ -307,6 +355,22 @@ async def model1_flow(
     rows.sort(key=lambda r: (r.contract_total, r.contrib_total), reverse=True)
     rows = rows[:limit]
 
+    # E1: gather top-N primary-source citations for exactly the rows we
+    # will return (bounds the extra query cost to O(top-limit rows), not
+    # the whole contributor set). Each entity gets a
+    # top_contract_citations list from its own holds_contract edges and
+    # a top_contribution_citations list from the same PAC set the
+    # contrib_total was attributed through.
+    if rows and top_citations_per_side > 0:
+        await _attach_top_citations(
+            session,
+            rows,
+            org_to_pacs=org_to_pacs,
+            recipient_ids=recipient_ids,
+            agency_relation=agency_relation,
+            top_per_side=top_citations_per_side,
+        )
+
     return FlowSummary(
         party=party,
         rows=rows,
@@ -314,6 +378,158 @@ async def model1_flow(
         total_contract=sum(r.contract_total for r in rows),
         n_contributors=len(rows),
     )
+
+
+async def _attach_top_citations(
+    session: AsyncSession,
+    rows: list[FlowRow],
+    *,
+    org_to_pacs: dict[str, set[str]],
+    recipient_ids: set[str],
+    agency_relation: str,
+    top_per_side: int,
+) -> None:
+    """Populate ``top_contract_citations`` + ``top_contribution_citations``
+    on each row in place.
+
+    Design notes:
+      * Reuses the SAME edge sets model1_flow summed for the totals —
+        contract citations from ``holds_contract`` edges out of the
+        entity, contribution citations from ``contributes_to`` edges
+        out of {entity} ∪ {its PACs} into the party recipient set.
+        Any consistency divergence between totals and citations would
+        undermine the whole trust story ("if the ledger sum comes from
+        edges A, B, C, its citations MUST be A's, B's, C's citations
+        — not the neighbour's").
+      * Ranks citations by owning-edge weight desc (biggest awards +
+        biggest contributions first). Ties break arbitrarily by URL
+        order — good enough for a "top receipts" surface.
+      * Deduplicates by citation URL: FEC individual-contribution URLs
+        repeat across many edges; the reader wants one clickable page
+        per unique receipt.
+      * Only surfaces PUBLISHED edges (``published_edge()``), so RG2's
+        staged-batch invariant continues to hold.
+    """
+    entity_ids = [r.entity_id for r in rows]
+
+    # ---- contract citations: holds_contract edges out of the entity ----
+    contract_edges = (
+        await session.execute(
+            select(
+                CanonicalEdge.id,
+                CanonicalEdge.source_id,
+                CanonicalEdge.weight,
+            ).where(
+                CanonicalEdge.relation == agency_relation,
+                CanonicalEdge.source_id.in_(entity_ids),
+                published_edge(),
+            )
+        )
+    ).all()
+    # Group edges per entity, weight-sorted desc; keep a lookup for
+    # citations by edge id.
+    entity_contract_edges: dict[str, list[tuple[str, float]]] = {}
+    for edge_id, src_id, weight in contract_edges:
+        entity_contract_edges.setdefault(src_id, []).append((edge_id, float(weight or 0.0)))
+    for eid in entity_contract_edges:
+        entity_contract_edges[eid].sort(key=lambda t: t[1], reverse=True)
+
+    contract_edge_ids = [e for _, edges in entity_contract_edges.items() for e, _ in edges]
+    contract_citations_by_edge: dict[str, list[SourceCitation]] = {}
+    if contract_edge_ids:
+        cs = (
+            await session.execute(
+                select(SourceCitation).where(
+                    SourceCitation.edge_id.in_(contract_edge_ids),
+                )
+            )
+        ).scalars().all()
+        for c in cs:
+            contract_citations_by_edge.setdefault(c.edge_id, []).append(c)
+
+    # ---- contribution citations: contributes_to edges out of {entity ∪ its PACs} ----
+    # Build the source-set for each entity (self + affiliated PACs) so
+    # the SAME edges that summed to contrib_total surface the citations.
+    entity_contrib_source_ids: dict[str, set[str]] = {}
+    all_contrib_sources: set[str] = set()
+    for r in rows:
+        srcs = {r.entity_id} | org_to_pacs.get(r.entity_id, set())
+        entity_contrib_source_ids[r.entity_id] = srcs
+        all_contrib_sources |= srcs
+
+    contrib_edges = []
+    if all_contrib_sources and recipient_ids:
+        contrib_edges = (
+            await session.execute(
+                select(
+                    CanonicalEdge.id,
+                    CanonicalEdge.source_id,
+                    CanonicalEdge.weight,
+                ).where(
+                    CanonicalEdge.relation == EdgeRelation.CONTRIBUTES_TO.value,
+                    CanonicalEdge.source_id.in_(all_contrib_sources),
+                    CanonicalEdge.target_id.in_(recipient_ids),
+                    published_edge(),
+                )
+            )
+        ).all()
+    # Group per contribution-source (which is a PAC or the entity
+    # itself), weight-sorted desc.
+    source_contrib_edges: dict[str, list[tuple[str, float]]] = {}
+    for edge_id, src_id, weight in contrib_edges:
+        source_contrib_edges.setdefault(src_id, []).append((edge_id, float(weight or 0.0)))
+    for src_id in source_contrib_edges:
+        source_contrib_edges[src_id].sort(key=lambda t: t[1], reverse=True)
+
+    contrib_edge_ids = [e for edges in source_contrib_edges.values() for e, _ in edges]
+    contrib_citations_by_edge: dict[str, list[SourceCitation]] = {}
+    if contrib_edge_ids:
+        cs = (
+            await session.execute(
+                select(SourceCitation).where(
+                    SourceCitation.edge_id.in_(contrib_edge_ids),
+                )
+            )
+        ).scalars().all()
+        for c in cs:
+            contrib_citations_by_edge.setdefault(c.edge_id, []).append(c)
+
+    def _dedupe_and_cap(cits_ordered: list[SourceCitation]) -> list[CitationRef]:
+        seen: set[str] = set()
+        out: list[CitationRef] = []
+        for c in cits_ordered:
+            key = c.citation_url
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(CitationRef(kind=c.kind, url=c.citation_url, ref=c.citation_ref))
+            if len(out) >= top_per_side:
+                break
+        return out
+
+    for row in rows:
+        # Contract side: walk this entity's edges in weight order,
+        # append each edge's citations in insertion order.
+        contract_ordered: list[SourceCitation] = []
+        for edge_id, _ in entity_contract_edges.get(row.entity_id, []):
+            contract_ordered.extend(contract_citations_by_edge.get(edge_id, []))
+        row.top_contract_citations = _dedupe_and_cap(contract_ordered)
+
+        # Contribution side: same pattern, but iterate over ALL of the
+        # entity's contribution sources (self + affiliated PACs),
+        # weight-sorted, and pick citations from those edges.
+        contrib_ordered_all: list[tuple[float, SourceCitation]] = []
+        for src_id in entity_contrib_source_ids.get(row.entity_id, set()):
+            for edge_id, weight in source_contrib_edges.get(src_id, []):
+                for c in contrib_citations_by_edge.get(edge_id, []):
+                    contrib_ordered_all.append((weight, c))
+        # Sort across all sources by owning-edge weight desc so the
+        # highest-value receipts come first regardless of which PAC
+        # they were on.
+        contrib_ordered_all.sort(key=lambda t: t[0], reverse=True)
+        row.top_contribution_citations = _dedupe_and_cap(
+            [c for _, c in contrib_ordered_all]
+        )
 
 
 # ---------------------------------------------------------------------------
