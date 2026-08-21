@@ -234,6 +234,95 @@ spec:
             requests: {memory: "512Mi", cpu: "200m"}
             limits: {memory: "3Gi", cpu: "1000m"}
 ---
+# ─── DESTRUCTIVE: rebuild Peter Thiel's contribution weights ───────────
+#
+# The pre-P1.6 `fec.ingest_individual_contributor` added a citation and
+# re-added the dollars on EVERY run, so the PUBLISHED figures are
+# inflated (Saving Arizona reads $140,000,000 against a true
+# $20,000,000). The dry-run opens SET TRANSACTION READ ONLY and prints
+# exactly which citation rows it would drop and what each weight would
+# become; the apply replays that plan. Unsuspend only after reading it:
+#
+#   kubectl -n argus patch job argus-p16-fec-repair-apply \
+#     -p '{"spec":{"suspend":false}}'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p16-fec-repair-dryrun
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p16-fec-repair
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p16-fec-repair
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: fec-repair-dryrun
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.fec_individual
+            - --donor
+            - thiel
+            - --repair
+          envFrom:
+            - secretRef:
+                name: argus-env
+            - secretRef:
+                name: argus-fec
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p16-fec-repair-apply
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p16-fec-repair
+spec:
+  suspend: true          # DESTRUCTIVE — touches PUBLISHED rows
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p16-fec-repair
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: fec-repair-apply
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.fec_individual
+            - --donor
+            - thiel
+            - --repair
+            - --apply
+          envFrom:
+            - secretRef:
+                name: argus-env
+            - secretRef:
+                name: argus-fec
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
+---
 # ─── DESTRUCTIVE: fragment collapse + mis-type repair ──────────────────
 #
 # The dry-run opens SET TRANSACTION READ ONLY, so a stray write raises

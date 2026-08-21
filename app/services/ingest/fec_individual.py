@@ -946,6 +946,7 @@ async def plan_repair(
     *,
     rows: dict[str, dict] | None = None,
     max_rows_per_period: int = 4000,
+    read_only: bool = True,
 ) -> RepairPlan:
     """Classify every citation on the donor's contribution edges.
 
@@ -999,6 +1000,8 @@ async def plan_repair(
             )
 
     async with sm() as session:
+        if read_only:
+            await session.execute(text("set transaction read only"))
         edges = (
             await session.execute(
                 select(CanonicalEdge).where(
@@ -1151,8 +1154,13 @@ async def apply_repair(plan: RepairPlan) -> dict:
 
 
 async def run_repair(donor_key: str, apply: bool) -> dict:
-    """Plan (always) and apply (only with ``apply=True``)."""
-    plan = await plan_repair(donor_key)
+    """Plan (always) and apply (only with ``apply=True``).
+
+    The dry-run is read-only at the TRANSACTION level, the same
+    guarantee ``dedup_pass`` and ``domain_merge`` give: a stray write
+    raises 25006 rather than touching live published data.
+    """
+    plan = await plan_repair(donor_key, read_only=not apply)
     report: dict = {
         "mode": "apply" if apply else "dry-run",
         "donor": plan.donor,
@@ -1171,6 +1179,7 @@ async def run_repair(donor_key: str, apply: bool) -> dict:
         ],
         "deferred": plan.edges_deferred,
     }
+    report["dry_run_transaction_read_only"] = not apply
     if apply:
         report["apply"] = await apply_repair(plan)
         sm = get_sessionmaker()
