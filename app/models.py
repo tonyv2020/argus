@@ -121,6 +121,9 @@ class SourceKind(StrEnum):
     SENATE_LDA = "senate_lda"
     # P5.1 — roll-call vote citations pointing at clerk/Congress.gov URLs.
     CONGRESS_VOTE = "congress_vote"
+    # P1.5 (2026-08-21) — roster edges cited to the member's Biographical
+    # Directory entry, sourced from unitedstates/congress-legislators.
+    CONGRESS_ROSTER = "congress_roster"
     CORPORATE_REGISTRY = "corporate_registry"
     # D2 (2026-08-05) — financial-disclosure citations point at the archived
     # OGE PDF at a specific page (source_url includes ``#page=<n>``); the
