@@ -303,3 +303,67 @@ def test_public_gate_uses_published_string_literal() -> None:
     """Guards against a rename that would silently invert the gate."""
     src = inspect.getsource(published_entity)
     assert '"published"' in src or "PUBLISHED" in src
+
+
+# ─── RG1 × Neo4j projection (P1.5, 2026-08-21) ──────────────────────────
+
+
+def test_projection_excludes_staged_rows() -> None:
+    """The read gate has to hold in the PROJECTION too.
+
+    `publication_state` gates the API read path, but the Neo4j
+    projection swept every row in Postgres — so a staged batch would
+    land in a Cypher-reachable graph before anyone published it, exactly
+    the bypass the D2 suppress gate closes for privacy. Staged rows are
+    excluded from the projectable set (and therefore pruned if an older
+    sweep wrote them), and project on the sweep after publish.
+    """
+    from app.services.ingest.project_to_neo4j import (
+        projectable_edge_ids,
+        projectable_entity_ids,
+    )
+
+    class _Ent:
+        def __init__(self, eid, mode="open", state="published"):
+            self.id, self.surface_mode, self.publication_state = eid, mode, state
+
+    class _Edge:
+        def __init__(self, eid, state="published"):
+            self.id, self.publication_state = eid, state
+
+    entities = [
+        _Ent("live"),
+        _Ent("aliased", "alias"),
+        _Ent("suppressed", "suppress"),
+        _Ent("staged", "open", "staged"),
+        _Ent("staged_and_suppressed", "suppress", "staged"),
+    ]
+    assert projectable_entity_ids(entities) == {"live", "aliased"}
+    assert projectable_edge_ids(
+        [_Edge("e_live"), _Edge("e_staged", "staged")]
+    ) == {"e_live"}
+
+
+def test_project_entity_refuses_a_staged_canonical() -> None:
+    """Defense-in-depth: the gate lives in the projection layer too, so a
+    caller that builds its own sweep still cannot write a staged row."""
+    import inspect
+
+    from app.services.graph.neo4j_projection import Neo4jProjection
+
+    src = inspect.getsource(Neo4jProjection.project_entity)
+    assert "PublicationState.STAGED.value" in src
+    edge_src = inspect.getsource(Neo4jProjection.project_edge)
+    assert "PublicationState.STAGED.value" in edge_src
+
+
+def test_projection_stats_separate_staged_from_uncited() -> None:
+    """Telemetry honesty: a staged edge is held back by the read gate,
+    not missing a receipt. Counting it as `edges_skipped_no_citation`
+    made a correctly-gated 928-edge batch read as 928 uncited edges in
+    the sweep log."""
+    from app.services.ingest.project_to_neo4j import ProjectionStats
+
+    stats = ProjectionStats()
+    assert stats.edges_skipped_staged == 0
+    assert stats.entities_skipped_staged == 0

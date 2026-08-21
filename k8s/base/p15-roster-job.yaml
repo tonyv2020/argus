@@ -1,0 +1,208 @@
+# P1.5 — Congressional roster + contribution resolution + fragment merge.
+#
+# STAGED, NOT PUBLISHED. Every net-new entity and every edge these jobs
+# create carries publication_state=staged + the batch_id below, so
+# nothing reaches the public read path until an operator runs
+#   POST /api/admin/batches/<batch_id>/publish
+# The batch_id is passed at apply time so a re-run gets a fresh tag.
+#
+# A Job's pod template is immutable, so pin the image + batch at apply
+# time rather than editing a live Job:
+#
+#   TAG=p15-roster-$(git rev-parse --short=12 HEAD)
+#   BATCH=p15-roster-$(date -u +%Y%m%dT%H%M%SZ)
+#   sed -e "s|argus/api:latest|argus/api:${TAG}|" -e "s|__BATCH_ID__|${BATCH}|" \
+#     k8s/base/p15-roster-job.yaml | kubectl -n argus apply -f -
+#
+# Order matters: roster (identities + aliases) → money-link (needs the
+# fec.candidate aliases) → scrutiny (publish precondition). The merge
+# job is separate and DESTRUCTIVE — see the bottom of this file.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p15-roster
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p15-roster
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p15-roster
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: roster
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.congress_roster
+            - --batch-id
+            - __BATCH_ID__
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "2Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p15-money-link
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p15-money-link
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p15-money-link
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: money-link
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.congress_money_link
+            - --batch-id
+            - __BATCH_ID__
+          envFrom:
+            - secretRef:
+                name: argus-env
+            # FEC_API_KEY — only needed for the optional --api-fallback.
+            - secretRef:
+                name: argus-fec
+                optional: true
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "2Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p15-scrutiny
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p15-scrutiny
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p15-scrutiny
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: scrutiny
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          # Scoped to the batch: decides ONLY entities this ingest
+          # created that have no verdict yet. Members carry a bioguide /
+          # fec.candidate alias, so the verdict is the deterministic
+          # hard-signal path (public official) — no LLM call.
+          command:
+            - python
+            - -m
+            - app.services.ingest.run_scrutiny
+            - --batch-id
+            - __BATCH_ID__
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "2Gi", cpu: "1000m"}
+---
+# DRY-RUN of the fragment merge. Read-only at the transaction level
+# (SET TRANSACTION READ ONLY) — a stray write raises 25006.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p15-merge-dryrun
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p15-merge-dryrun
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p15-merge-dryrun
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: merge
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.congress_person_merge
+            - --dry-run
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "1Gi", cpu: "200m"}
+            limits: {memory: "4Gi", cpu: "1000m"}
+---
+# DESTRUCTIVE — merges live published fragments onto the member. Stays
+# suspended until an operator reviews the dry-run report:
+#
+#   kubectl -n argus patch job argus-p15-merge-apply \
+#     --type=merge -p '{"spec":{"suspend":false}}'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p15-merge-apply
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p15-merge-apply
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p15-merge-apply
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: merge
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.congress_person_merge
+            - --apply
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "1Gi", cpu: "200m"}
+            limits: {memory: "4Gi", cpu: "1000m"}

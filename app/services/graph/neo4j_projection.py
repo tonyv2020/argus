@@ -18,7 +18,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import CanonicalEdge, CanonicalEntity, SourceCitation, SurfaceMode
+from app.models import (
+    CanonicalEdge,
+    CanonicalEntity,
+    PublicationState,
+    SourceCitation,
+    SurfaceMode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +87,21 @@ class Neo4jProjection:
                           Cypher-level readers cannot leak a real name
                           through the graph either.
 
+        Read-gate (RG1): a ``publication_state=staged`` canonical is not
+        projected either, whatever its surface_mode.
+
         The public API's own render layer already enforces the same
         contract; this is defense-in-depth so a Cypher query that
         bypasses the API layer cannot see a suppressed real name.
         """
         if not self.available:
+            return False
+        if canonical.publication_state == PublicationState.STAGED.value:
+            # RG1 read-gate (P1.5, 2026-08-21): a staged canonical is not
+            # live content. Projecting it would put an unpublished row in
+            # a Cypher-reachable graph — the same class of bypass the D2
+            # suppress gate closes. It projects on the sweep after an
+            # operator publishes the batch.
             return False
         mode = canonical.surface_mode or SurfaceMode.OPEN.value
         if mode == SurfaceMode.SUPPRESS.value:
@@ -163,8 +179,16 @@ class Neo4jProjection:
         return n_nodes, n_rels
 
     async def project_edge(self, session: AsyncSession, edge: CanonicalEdge) -> bool:
-        """MERGE a canonical edge — gated on the edge having ≥1 SourceCitation."""
+        """MERGE a canonical edge — gated on ≥1 SourceCitation AND on the
+        edge being published.
+
+        Read-gate (RG1, P1.5 2026-08-21): a ``staged`` edge belongs to an
+        unpublished batch. It projects on the sweep after an operator
+        publishes the batch, never before.
+        """
         if not self.available:
+            return False
+        if edge.publication_state == PublicationState.STAGED.value:
             return False
         citations = (
             (await session.execute(select(SourceCitation).where(SourceCitation.edge_id == edge.id)))
