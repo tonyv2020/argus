@@ -90,7 +90,11 @@ from app.models import (
     SurfaceMode,
 )
 from app.services.graph.base import normalize_name
-from app.services.ingest.dedup_pass import _name_is_evidence
+from app.services.ingest.dedup_pass import (
+    _drop_self_loops,
+    _existing_self_loops,
+    _name_is_evidence,
+)
 from app.services.ingest.domain_anchors import (
     AUTHORITATIVE_NAMESPACES,
     SEC_OWNER_NAMESPACE,
@@ -616,6 +620,10 @@ class ApplyStats:
     aliases_repointed: int = 0
     scrutiny_repointed: int = 0
     retyped: int = 0
+    #: Self-loops the merge itself created — an A→B edge whose endpoints
+    #: became the same node — and the citations that went with them.
+    self_loops_dropped: int = 0
+    self_loop_citations_dropped: int = 0
     refusals: list[dict] = field(default_factory=list)
 
 
@@ -626,6 +634,13 @@ async def apply_plan(plan: MergePlan) -> ApplyStats:
     for pair in plan.pairs:
         async with sm() as session:
             try:
+                # A fragment that already had an edge TO its anchor turns
+                # that edge into a self-loop the moment the two become one
+                # node. Reuse the P2 guard: drop the loops this merge
+                # created, and leave the 30-odd pre-existing ones (a
+                # company that lobbies in-house is genuinely its own LDA
+                # registrant) exactly as they are.
+                preexisting = await _existing_self_loops(session, pair.anchor_id)
                 result = await merge_two_canonicals(
                     session, keep_id=pair.anchor_id, drop_id=pair.fragment_id
                 )
@@ -640,8 +655,13 @@ async def apply_plan(plan: MergePlan) -> ApplyStats:
                         }
                     )
                     continue
+                loops, loop_cites = await _drop_self_loops(
+                    session, pair.anchor_id, preexisting
+                )
                 await session.commit()
                 stats.merged += 1
+                stats.self_loops_dropped += loops
+                stats.self_loop_citations_dropped += loop_cites
                 stats.edges_repointed += result.edges_repointed
                 stats.edges_collided_summed += result.edges_collided_summed
                 stats.citations_reparented += result.citations_reparented
@@ -740,12 +760,22 @@ async def check_invariants(session: AsyncSession) -> dict:
     }
 
 
-def _check_postconditions(before: dict, after: dict) -> dict:
-    """Machine-checked postconditions — what helen reads first."""
+def _check_postconditions(
+    before: dict, after: dict, self_loop_citations_dropped: int = 0
+) -> dict:
+    """Machine-checked postconditions — what helen reads first.
+
+    ``citations_preserved`` allows for exactly the citations that went
+    with a self-loop this merge created: an article that mentioned two
+    names for one company cannot cite that company's tie to itself.
+    Nothing else may lose a receipt.
+    """
     out = {
         "uncited_edges_still_zero": after["uncited_edges"] == 0,
         "no_orphan_citations": after["orphan_citations"] == 0,
-        "citations_preserved": after["citations"] >= before["citations"],
+        "citations_preserved": (
+            after["citations"] >= before["citations"] - self_loop_citations_dropped
+        ),
         "no_protected_node_lost": all(
             after["surface_mode_counts"].get(mode, 0)
             == before["surface_mode_counts"].get(mode, 0)
@@ -816,7 +846,7 @@ async def run(domain: str, apply: bool) -> dict:
             after = await check_invariants(session)
         report["invariants_after"] = after
         report["postconditions"] = _check_postconditions(
-            report["invariants_before"], after
+            report["invariants_before"], after, stats.self_loop_citations_dropped
         )
     return report
 

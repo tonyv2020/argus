@@ -341,3 +341,36 @@ def test_mergeable_types_are_type_specific() -> None:
     assert EntityType.CONCEPT.value not in mergeable_types_for(
         EntityType.PERSON.value
     )
+
+
+def test_merge_drops_the_self_loops_it_creates_but_not_the_others() -> None:
+    """A fragment that already had an edge TO its anchor turns that edge
+    into a self-loop the moment the two become one node — the live merge
+    made one (`AXON --mentioned_with--> Axon Enterprise`). The ~30
+    pre-existing loops are real: a company that lobbies in-house IS its
+    own LDA registrant, and they are none of this pass's business."""
+    import inspect
+
+    from app.services.ingest import domain_merge
+
+    src = inspect.getsource(domain_merge.apply_plan)
+    assert "_existing_self_loops" in src
+    assert "_drop_self_loops" in src
+    # The pre-existing set must be read BEFORE the merge, or every loop
+    # looks pre-existing.
+    assert src.index("_existing_self_loops") < src.index("merge_two_canonicals")
+
+
+def test_citations_postcondition_allows_only_the_self_loop_receipts() -> None:
+    """An article that mentioned two names for one company cannot cite
+    that company's tie to itself. Nothing else may lose a receipt."""
+    from app.services.ingest.domain_merge import _check_postconditions
+
+    before = {
+        "citations": 100, "uncited_edges": 0, "orphan_citations": 0,
+        "surface_mode_counts": {"suppress": 1, "alias": 1},
+        "scrutiny_rows": 5, "entities": 10, "anchored_canonicals": 3,
+    }
+    after = dict(before, citations=99, entities=9)
+    assert _check_postconditions(before, after, 1)["citations_preserved"]
+    assert not _check_postconditions(before, after, 0)["citations_preserved"]
