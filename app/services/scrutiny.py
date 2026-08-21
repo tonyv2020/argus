@@ -111,6 +111,13 @@ class ScrutinyVerdict:
 _PUBLIC_SOURCE_SYSTEMS = {
     "fec.committee",
     "fec.candidate",
+    # P1.5 (2026-08-21): a bioguide id IS the definitive public-official
+    # signal — it is a sitting member of Congress's entry in the
+    # Biographical Directory. Without it, a member whose FEC candidate id
+    # is missing from the dataset (2 of the 537 current members) falls
+    # through to the LLM path and, with no Anthropic key configured,
+    # fail-closes to SUPPRESS — a public official hidden by accident.
+    "bioguide",
     "senate.lda.registrant",
     "corporate.registry.officer",
     "corporate.registry.exec",

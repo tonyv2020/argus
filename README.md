@@ -75,6 +75,46 @@ rule (D4) is untouched.
 
 Full operator guide: [`docs/read-gate.md`](docs/read-gate.md).
 
+## P1.5 Congressional roster (2026-08-21)
+
+`unitedstates/congress-legislators` is the authoritative crosswalk
+(bioguide id + FEC candidate ids + party/state/chamber + name variants)
+that makes all 537 current members first-class canonical people, so FEC
+money and roll-call votes attribute to the **person** rather than to a
+campaign-committee string.
+
+```
+python -m app.services.ingest.congress_roster      --batch-id p15-...
+python -m app.services.ingest.congress_money_link  --batch-id p15-...
+python -m app.services.ingest.run_scrutiny         --batch-id p15-...
+python -m app.services.ingest.congress_person_merge --dry-run   # --apply writes
+kubectl -n argus apply -f k8s/base/p15-roster-job.yaml           # see header
+```
+
+- **`congress_roster`** — external-ID-first resolution (bioguide →
+  fec.candidate → a fail-closed exact-name fallback), name-variant
+  aliases in the `congress.legislators` namespace, and a cited
+  `held_position` member → chamber edge.
+- **`congress_money_link`** — joins `contributes_to` to the member via
+  FEC's own candidate-committee linkage bulk file (`ccl<yy>.zip`):
+  committee id → candidate id → member canonical. Every hop is an
+  external id; names never enter the join. A committee shared by two
+  sitting members is refused, not guessed.
+- **`congress_person_merge`** — collapses fragmented news-person nodes
+  onto the member, reusing the P2 merge machinery. Dry-run by default.
+
+**Read-gate:** `--batch-id` stamps every net-new entity and every edge
+these passes create `publication_state=staged`. Nothing is public until
+an operator runs `POST /api/admin/batches/{batch_id}/publish`, which
+still refuses while any batch entity lacks a scrutiny verdict.
+
+**Fail-closed on privacy:** a member identity is never attached to a
+`suppress`/`alias` node, no fragment merge ever straddles `surface_mode`
+(or `publication_state`), and the roster pass **never rewrites an
+existing canonical's `surface_mode`** — members already sitting on a
+protected node are reported for an operator decision, not silently
+opened.
+
 ## P2 dedup/merge pass (2026-08-21)
 
 `app/services/ingest/dedup_pass.py` is a re-runnable, idempotent fragmentation

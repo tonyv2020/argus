@@ -17,7 +17,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_sessionmaker
@@ -189,16 +189,78 @@ async def run_scrutiny_sweep(
     return stats
 
 
+async def run_scrutiny_batch(batch_id: str, limit: int | None = None) -> ScrutinySweepStats:
+    """RG4 — decide every entity in one staged batch that has no verdict yet.
+
+    ``POST /api/admin/batches/{batch_id}/publish`` refuses 409 while any
+    entity in the batch lacks a ``scrutiny_decisions`` row, so a staged
+    ingest has to run this before it can go live.
+
+    Strictly scoped to ``batch_id``: it can only ever touch rows this
+    ingest created. Pre-existing published canonicals — including any
+    member already sitting on a ``suppress``/``alias`` node — are outside
+    the batch and are never re-decided here, so the pass can neither
+    relax nor tighten a live protection by accident.
+    """
+    stats = ScrutinySweepStats()
+    sm = get_sessionmaker()
+    async with sm() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT ce.id FROM canonical_entities ce "
+                    "LEFT JOIN scrutiny_decisions sd ON sd.canonical_id = ce.id "
+                    "WHERE ce.batch_id = :b AND sd.id IS NULL "
+                    "ORDER BY ce.canonical_name"
+                ),
+                {"b": batch_id},
+            )
+        ).all()
+    pending = [r[0] for r in rows]
+    if limit is not None:
+        pending = pending[:limit]
+    logger.info(
+        "scrutiny batch %s: %d entities awaiting a verdict", batch_id, len(pending)
+    )
+    for cid in pending:
+        try:
+            async with sm() as session:
+                verdict = await scrutinize_and_log(session, cid)
+                await session.commit()
+            stats.persons_examined += 1
+            if verdict.decision.value == "surface":
+                stats.kept_open += 1
+            elif verdict.decision.value == "suppress":
+                stats.suppressed += 1
+            else:
+                stats.aliased += 1
+        except Exception as exc:  # noqa: BLE001
+            stats.errors += 1
+            logger.exception("scrutiny row failed canonical=%s: %s", cid, exc)
+    return stats
+
+
 def main() -> None:
-    """CLI entrypoint — python -m app.services.ingest.run_scrutiny [--geo-only] [--limit N]."""
+    """CLI entrypoint — python -m app.services.ingest.run_scrutiny
+    [--geo-only] [--batch-id ID] [--limit N]."""
     import argparse
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--geo-only", action="store_true")
+    parser.add_argument(
+        "--batch-id",
+        default=None,
+        help="Decide only the entities in this staged batch that have no "
+             "verdict yet (the publish precondition). Never touches rows "
+             "outside the batch.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
-    stats = asyncio.run(run_scrutiny_sweep(limit=args.limit, geo_group_only=args.geo_only))
+    if args.batch_id:
+        stats = asyncio.run(run_scrutiny_batch(args.batch_id, limit=args.limit))
+    else:
+        stats = asyncio.run(run_scrutiny_sweep(limit=args.limit, geo_group_only=args.geo_only))
     logger.info("scrutiny sweep done: %s", stats)
 
 
