@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import logging
 import os
@@ -111,15 +112,17 @@ def _is_true(raw: str | None) -> bool:
 
 
 def _tag(blob: str, tag: str) -> str | None:
-    """First ``<tag>…</tag>`` value in ``blob``, or None.
+    """First ``<tag>…</tag>`` value in ``blob``, unescaped, or None.
 
     A regex rather than an XML parse on purpose: these documents are
     small, the shape is fixed by SEC's schema, and several historical
     filings carry malformed entities that make a strict parser throw on
-    documents a regex reads correctly.
+    documents a regex reads correctly. The trade-off is that entities
+    are not decoded for us, so do it here — filers really do type
+    ``COO &amp; CFO`` into ``officerTitle``.
     """
     m = re.search(rf"<{tag}>(.*?)</{tag}>", blob, re.S)
-    return m.group(1).strip() if m else None
+    return html.unescape(m.group(1)).strip() if m else None
 
 
 @dataclass(frozen=True)
@@ -414,9 +417,13 @@ async def _emit_position_edge(
     else:
         edge = existing
         stats.edges_reused += 1
-        # The relationship flags are as-of the LATEST filing we have seen.
-        # Filings are walked newest-first, so only fill what is missing.
-        if not edge.edge_metadata.get("source"):
+        # The relationship flags are as-of the LATEST filing that names
+        # this person. Refresh when we are looking at one at least as
+        # recent as what is stored, so a promotion (director → director
+        # + CEO) or a departure correction lands. Comparing ISO dates as
+        # strings is safe and keeps the write idempotent.
+        stored = edge.edge_metadata or {}
+        if str(filing["date"]) >= str(stored.get("latest_filing_date") or ""):
             edge.edge_metadata = metadata
 
     already = (

@@ -118,6 +118,20 @@ def test_ten_percent_owner_is_not_a_position() -> None:
     assert owner.holds_position is False
 
 
+def test_officer_title_entities_are_decoded() -> None:
+    """The parser is a regex, so XML entities are not decoded for us —
+    and filers really do type ``COO &amp; CFO`` into ``officerTitle``.
+    Left raw it lands verbatim in the edge metadata."""
+    doc = parse_ownership_document(
+        SANKAR_FORM4.replace(
+            "<officerTitle>See Remarks</officerTitle>",
+            "<officerTitle>COO &amp; CFO</officerTitle>",
+        )
+    )
+    assert doc is not None
+    assert doc.owners[0].officer_title == "COO & CFO"
+
+
 def test_unparsable_document_returns_none_not_empty() -> None:
     """An error body or an XSL-rendered HTML page must be SKIPPED. If it
     returned an empty filing the caller could not tell 'no owners' from

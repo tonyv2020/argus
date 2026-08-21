@@ -62,7 +62,7 @@ spec:
                 name: argus-env
           resources:
             requests: {memory: "512Mi", cpu: "200m"}
-            limits: {memory: "2Gi", cpu: "1000m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -104,7 +104,7 @@ spec:
                 name: argus-env
           resources:
             requests: {memory: "512Mi", cpu: "200m"}
-            limits: {memory: "2Gi", cpu: "1000m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -144,7 +144,7 @@ spec:
                 name: argus-env
           resources:
             requests: {memory: "512Mi", cpu: "200m"}
-            limits: {memory: "2Gi", cpu: "1000m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -186,7 +186,7 @@ spec:
                 name: argus-fec
           resources:
             requests: {memory: "512Mi", cpu: "200m"}
-            limits: {memory: "2Gi", cpu: "1000m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -232,7 +232,7 @@ spec:
                 name: argus-env
           resources:
             requests: {memory: "512Mi", cpu: "200m"}
-            limits: {memory: "2Gi", cpu: "1000m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
 ---
 # ─── DESTRUCTIVE: fragment collapse + mis-type repair ──────────────────
 #
@@ -276,7 +276,7 @@ spec:
                 name: argus-env
           resources:
             requests: {memory: "512Mi", cpu: "200m"}
-            limits: {memory: "2Gi", cpu: "1000m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -313,4 +313,4 @@ spec:
                 name: argus-env
           resources:
             requests: {memory: "512Mi", cpu: "200m"}
-            limits: {memory: "2Gi", cpu: "1000m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
