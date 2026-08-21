@@ -241,18 +241,24 @@ THIEL = DonorIdentity(
     label="Peter Thiel",
     last_name="THIEL",
     first_names=frozenset({"PETER"}),
-    # Verified against live Schedule A on 2026-08-21: Thiel's reported
-    # employer across cycles is Thiel Capital, Clarium Capital (his
-    # pre-2011 hedge fund — filers also typed CLARIUM CAPITOL and
-    # CALRIUM CAPITAL), Founders Fund, or Facebook (he sat on that
-    # board). The ``PRESIDENT``/``CHAIRMAN`` occupation appears with the
-    # employer field swapped, which the joined blob still matches.
+    # Verified against live Schedule A on 2026-08-21, then WIDENED after
+    # the first live run surfaced 14 in-state near-misses (the
+    # ``no_affiliation_match_in_state`` bucket exists exactly so these
+    # are visible rather than silently lost):
+    #   * ``CLARIUM`` appears bare ("CLARIUM / FINANCE") and misspelled
+    #     three ways — CLARIUM, CALRIUM, CLARIAM, CLARIUM CAPITOL. The
+    #     word is a coined name, so matching it alone is safe.
+    #   * ``PAYPAL`` — Thiel co-founded it and filed as its CEO in the
+    #     mid-2000s cycles.
+    # Occupation and employer are matched against ONE joined blob because
+    # filers routinely swap the two fields.
     affiliation_patterns=(
         r"THIEL CAPITAL",
-        r"C[AL]{2}RIUM\s+CAPIT[AO]L",
+        r"C[AL]{2}RI[AU]M",
         r"FOUNDERS FUND",
         r"PALANTIR",
         r"FACEBOOK",
+        r"PAYPAL",
     ),
     states=frozenset({"CA", "FL", "NY"}),
     search_queries=("THIEL, PETER",),
@@ -294,7 +300,11 @@ class IndividualContribStats:
     edges_reused: int = 0
     citations_created: int = 0
     citations_skipped_already_cited: int = 0
-    total_contributed: float = 0.0
+    #: Dollars this RUN newly cited. Not the donor's total — a re-run
+    #: cites nothing new and reports 0. The donor's total is
+    #: ``contributed_total`` below, summed over every accepted row.
+    new_dollars_cited: float = 0.0
+    contributed_total: float = 0.0
     entities_staged: int = 0
     edges_staged: int = 0
     affiliation_edges_created: int = 0
@@ -596,7 +606,7 @@ async def _emit_contribution(
     )
     edge.weight = float((edge.weight or 0.0) + amount)
     stats.citations_created += 1
-    stats.total_contributed += amount
+    stats.new_dollars_cited += amount
 
 
 async def _emit_employer_affiliation(
@@ -850,6 +860,9 @@ async def ingest_donor(
     )
     stats.by_committee = sorted(
         per_committee.values(), key=lambda c: -c["amount"]
+    )
+    stats.contributed_total = round(
+        sum(c["amount"] for c in stats.by_committee), 2
     )
     return stats
 

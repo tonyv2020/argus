@@ -55,9 +55,15 @@ def _row(**kw) -> dict:
         # Filer typed the occupation into the employer field and vice
         # versa — the joined blob still matches.
         ("THIEL, PETER", "PRESIDENT", "THIEL CAPITAL, LLC", "WEST HOLLYWOOD"),
-        # Live misspellings of Clarium seen in the corpus.
+        # Live misspellings of Clarium seen in the corpus, plus the
+        # bare form ("CLARIUM / FINANCE") and PayPal, which he filed as
+        # CEO of in the mid-2000s cycles. All four were in the
+        # `no_affiliation_match_in_state` bucket on the first live run.
         ("THIEL, PETER", "CLARIUM CAPITOL", "INVESTMENTS", "SAN FRANCISCO"),
         ("THIEL, PETER", "CALRIUM CAPITAL", "EXECUTIVE", "SAN FRANCISCO"),
+        ("THIEL, PETER", "CLARIAM CAPITAL", "PRESIDENT", "SAN FRANCISCO"),
+        ("THIEL, PETER", "CLARIUM", "FINANCE", "SAN FRANCISCO"),
+        ("THIEL, PETER", "PAYPAL", "CEO", "SAN FRANCISCO"),
     ],
 )
 def test_accepts_the_real_donor(name, employer, occupation, city) -> None:
@@ -137,9 +143,13 @@ def test_refuses_a_real_private_person_with_the_exact_same_name(
 def test_near_miss_in_state_gets_its_own_bucket() -> None:
     """A row that is probably our donor but reports an employer we have
     not declared must be REFUSED and made visible, not quietly dropped —
-    it is the operator's cue to widen the declaration."""
+    it is the operator's cue to widen the declaration. This exact row is
+    live (``THIEL, PETER A. | LOS ANGELES CA | SELF EMPLOYED /
+    INVESTOR``); "self employed" is not evidence of anything, so it
+    stays refused and reported."""
     check = check_identity(
         _row(
+            contributor_name="THIEL, PETER A.",
             contributor_city="LOS ANGELES",
             contributor_state="CA",
             contributor_employer="SELF EMPLOYED",
@@ -149,6 +159,16 @@ def test_near_miss_in_state_gets_its_own_bucket() -> None:
     )
     assert not check.accepted
     assert check.reason == "no_affiliation_match_in_state"
+
+
+def test_an_unfilled_employer_is_never_evidence() -> None:
+    """"INFORMATION REQUESTED" is the filer saying they do not know."""
+    for blob in ("INFO REQUESTED", "INFORMATION REQUESTED PER BEST EFFORTS"):
+        check = check_identity(
+            _row(contributor_employer=None, contributor_occupation=blob),
+            THIEL,
+        )
+        assert not check.accepted
 
 
 def test_state_clause_refuses_an_affiliated_row_from_a_foreign_state() -> None:
@@ -207,6 +227,17 @@ def test_thiel_is_registered_and_sweeps_multiple_cycles() -> None:
     assert DONOR_IDENTITIES["thiel"] is THIEL
     assert 2022 in THIEL.two_year_periods
     assert len(THIEL.two_year_periods) >= 4
+
+
+def test_run_stats_distinguish_new_dollars_from_the_donor_total() -> None:
+    """A re-run cites nothing new, so a "total" that only counts NEW
+    citations reports $0 for a donor who has given $50M. The two numbers
+    are different questions and get different fields."""
+    from app.services.ingest.fec_individual import IndividualContribStats
+
+    s = IndividualContribStats()
+    assert hasattr(s, "new_dollars_cited")
+    assert hasattr(s, "contributed_total")
 
 
 def test_memo_code_constant_matches_fec() -> None:
