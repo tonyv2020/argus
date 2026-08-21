@@ -5,10 +5,12 @@
 # transaction with `SET TRANSACTION READ ONLY`, so any stray write raises
 # 25006 instead of mutating the corpus.
 #
-#   kubectl -n argus create job dedup-dryrun-$(date +%s) \
-#     --from=cronjob/... is NOT used here — apply this file and read logs:
+# A Job's pod template is immutable, so pin the image at apply time rather
+# than editing a live Job:
 #
-#   kubectl -n argus apply -f k8s/base/dedup-job.yaml
+#   TAG=p2-dedup-$(git rev-parse --short=12 HEAD)
+#   sed "s|argus/api:latest|argus/api:${TAG}|" k8s/base/dedup-job.yaml \
+#     | kubectl -n argus apply -f -
 #   kubectl -n argus logs job/argus-dedup-dryrun -f
 #
 # The LIVE job is `suspend: true`. It only runs after helen reviews the
@@ -37,7 +39,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: dedup
-          image: registry.lan/argus/api:local
+          image: registry.lan/argus/api:latest
           imagePullPolicy: Always
           command:
             - python
@@ -82,7 +84,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: dedup
-          image: registry.lan/argus/api:local
+          image: registry.lan/argus/api:latest
           imagePullPolicy: Always
           command:
             - python
