@@ -46,9 +46,15 @@ class ProjectionStats:
     """Counters for the projection sweep."""
 
     entities_projected: int = 0
+    #: Entities the projection layer REFUSED — suppressed (privacy) or
+    #: staged (read-gate). Not an error; the refusal is the feature.
     entities_failed: int = 0
+    entities_skipped_staged: int = 0
     edges_projected: int = 0
     edges_skipped_no_citation: int = 0
+    #: Edges held back by the read gate — they project on the first sweep
+    #: after their batch is published.
+    edges_skipped_staged: int = 0
     edges_failed: int = 0
     stale_nodes_pruned: int = 0
     stale_rels_pruned: int = 0
@@ -111,6 +117,8 @@ async def project_all(session: AsyncSession, projection: Neo4jProjection) -> Pro
     for e in entities:
         if await projection.project_entity(session, e):
             stats.entities_projected += 1
+        elif e.publication_state == PublicationState.STAGED.value:
+            stats.entities_skipped_staged += 1
         else:
             stats.entities_failed += 1
     await session.commit()
@@ -120,6 +128,11 @@ async def project_all(session: AsyncSession, projection: Neo4jProjection) -> Pro
         result = await projection.project_edge(session, edge)
         if result:
             stats.edges_projected += 1
+        elif edge.publication_state == PublicationState.STAGED.value:
+            # Read-gate refusal, not a missing receipt. Counting it as
+            # "no citation" made a correctly-gated batch look like 928
+            # uncited edges in the sweep log.
+            stats.edges_skipped_staged += 1
         else:
             # Distinguish citation-gate skip from actual failure via a follow-up read.
             stats.edges_skipped_no_citation += 1

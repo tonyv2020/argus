@@ -355,3 +355,15 @@ def test_project_entity_refuses_a_staged_canonical() -> None:
     assert "PublicationState.STAGED.value" in src
     edge_src = inspect.getsource(Neo4jProjection.project_edge)
     assert "PublicationState.STAGED.value" in edge_src
+
+
+def test_projection_stats_separate_staged_from_uncited() -> None:
+    """Telemetry honesty: a staged edge is held back by the read gate,
+    not missing a receipt. Counting it as `edges_skipped_no_citation`
+    made a correctly-gated 928-edge batch read as 928 uncited edges in
+    the sweep log."""
+    from app.services.ingest.project_to_neo4j import ProjectionStats
+
+    stats = ProjectionStats()
+    assert stats.edges_skipped_staged == 0
+    assert stats.entities_skipped_staged == 0
