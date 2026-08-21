@@ -198,6 +198,11 @@ def build_merge_plan(
         member = members[member_id]
         for norm in sorted(norms):
             if len(owners[norm]) > 1:
+                if not person_name_is_evidence(norm):
+                    # A single-token variant ("Robert", "M") is refused by
+                    # the evidence rule anyway; logging every node that
+                    # happens to carry it buries the real ambiguities.
+                    continue
                 for node in by_norm.get(norm, ()):
                     if node.id in members:
                         continue

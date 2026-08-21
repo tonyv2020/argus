@@ -186,3 +186,25 @@ def test_surname_only_variant_never_produces_a_pair() -> None:
     frag = _n("f1", "Sanders", "sanders", edge_count=12)
     plan = _plan(_MEMBER, [frag], {"bernard sanders", "sanders"})
     assert plan.pairs == []
+
+
+def test_ambiguous_review_list_excludes_single_token_variants() -> None:
+    """The roster emits bare "first" and "last" variants. Those are
+    refused by the evidence rule regardless, so logging every node that
+    happens to share one would bury the real ambiguities — the review
+    list only carries variants that would otherwise have been evidence."""
+    m1 = _n("m1", "Robert Garcia", "robert garcia")
+    m2 = _n("m2", "Robert Aderholt", "robert aderholt")
+    noise = _n("f1", "Robert", "robert", edge_count=4)
+    by_norm = {
+        "robert garcia": [m1],
+        "robert aderholt": [m2],
+        "robert": [noise],
+    }
+    plan = build_merge_plan(
+        {"m1": m1, "m2": m2},
+        {"m1": {"robert garcia", "robert"}, "m2": {"robert aderholt", "robert"}},
+        by_norm,
+    )
+    assert plan.pairs == []
+    assert plan.skipped_by_reason == {}
