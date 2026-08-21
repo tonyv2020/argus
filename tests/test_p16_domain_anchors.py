@@ -111,6 +111,7 @@ def _cand(**kw) -> NameMatchCandidate:
         "surface_mode": SurfaceMode.OPEN.value,
         "publication_state": "published",
         "namespaces": frozenset(),
+        "norm": "palantir technologies",
     }
     base.update(kw)
     return NameMatchCandidate(**base)
@@ -160,6 +161,48 @@ def test_name_match_refuses_a_person_node_for_an_org_anchor() -> None:
     )
     assert not ok
     assert reason.startswith("type_mismatch")
+
+
+def test_an_lda_client_id_the_anchor_recognises_is_not_foreign() -> None:
+    """LDA mints a new client id per REGISTRATION, so an anchor cannot
+    enumerate its own client ids in advance — it declares recognising
+    patterns instead. Treating such a node as foreign is what made the
+    first live run refuse the real ``Clearview AI`` (5 cited edges) and
+    mint a second, empty one."""
+    cand = _cand(
+        name="Clearview AI", norm="clearview ai",
+        namespaces=frozenset({"senate_lda.client"}),
+    )
+    clearview = next(
+        a for a in SURVEILLANCE_ANCHORS if a.label == "Clearview AI"
+    )
+    ok, reason = anchor_name_match_allowed(cand, clearview)
+    assert ok, reason
+
+
+def test_an_lda_client_id_on_an_unrecognised_name_is_still_foreign() -> None:
+    """The escape hatch is exactly as wide as the declared patterns."""
+    cand = _cand(
+        name="Some Other Client", norm="some other client",
+        namespaces=frozenset({"senate_lda.client"}),
+    )
+    clearview = next(
+        a for a in SURVEILLANCE_ANCHORS if a.label == "Clearview AI"
+    )
+    ok, reason = anchor_name_match_allowed(cand, clearview)
+    assert not ok
+    assert reason == "foreign_external_id:senate_lda.client"
+
+
+def test_a_cik_is_never_claimable_by_name() -> None:
+    """Only ``senate_lda.client`` is claimable. A CIK, a UEI or an FEC id
+    on a name-matched node still names a different real entity."""
+    for ns in ("sec.cik", USASPENDING_UEI_NAMESPACE, "fec.candidate"):
+        ok, reason = anchor_name_match_allowed(
+            _cand(namespaces=frozenset({ns})), PALANTIR
+        )
+        assert not ok, ns
+        assert reason.startswith("foreign_external_id")
 
 
 def test_name_match_refuses_concept_for_a_person_anchor() -> None:

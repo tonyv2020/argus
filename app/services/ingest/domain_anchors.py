@@ -57,6 +57,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -367,6 +368,33 @@ class NameMatchCandidate:
     publication_state: str
     #: Authoritative id namespaces already on the node.
     namespaces: frozenset[str] = frozenset()
+    #: Normalized canonical name — needed to decide whether an LDA
+    #: client id on this node belongs to the anchor.
+    norm: str = ""
+
+
+def claimable_namespaces(cand: NameMatchCandidate, spec: AnchorSpec) -> set[str]:
+    """Authoritative namespaces on ``cand`` that are NOT foreign to ``spec``.
+
+    ``senate_lda.client`` is the one namespace an anchor cannot enumerate
+    in advance: LDA mints a new client id per REGISTRATION, so the
+    anchor declares recognising PATTERNS instead of ids (see
+    ``AnchorSpec.lda_client_patterns``). A node the LDA ingester created
+    from a client record whose name matches one of those patterns is
+    carrying THIS anchor's LDA id, not a foreign one.
+
+    Measured consequence of getting this wrong (live, 2026-08-21):
+    without this, the ``Clearview AI`` node holding 5 real cited edges
+    is refused as "foreign_external_id:senate_lda.client" and the pass
+    mints a SECOND, empty Clearview AI — precisely the fragmentation
+    P1.6 exists to remove.
+    """
+    claimable: set[str] = set()
+    if "senate_lda.client" in cand.namespaces and any(
+        re.search(p, cand.norm) for p in spec.lda_client_patterns
+    ):
+        claimable.add("senate_lda.client")
+    return claimable
 
 
 def anchor_name_match_allowed(
@@ -387,10 +415,11 @@ def anchor_name_match_allowed(
       news-tag pipeline routinely types a company as a concept — the
       documented ``organization``/``concept`` mis-typing the P2 dedup
       pass already merges.
-    * The node must carry NO authoritative external id. Unlike the
-      roster's fallback (which tolerates the member's own bioguide), an
-      anchor's own ids were already tried in the id-keyed step above, so
-      any id left on a name-matched node is by definition foreign.
+    * The node must carry no authoritative external id **that this
+      anchor cannot claim**. The anchor's own declared ids were already
+      tried in the id-keyed step above, so anything left is foreign —
+      except an LDA client id the anchor's patterns recognise, which is
+      its own (see :func:`claimable_namespaces`).
     """
     if cand.surface_mode != SurfaceMode.OPEN.value:
         return False, "surface_mode_not_open"
@@ -401,8 +430,9 @@ def anchor_name_match_allowed(
         allowed_types.add(EntityType.CONCEPT.value)
     if cand.type not in allowed_types:
         return False, f"type_mismatch:{cand.type}"
-    if cand.namespaces:
-        return False, f"foreign_external_id:{sorted(cand.namespaces)[0]}"
+    foreign = cand.namespaces - claimable_namespaces(cand, spec)
+    if foreign:
+        return False, f"foreign_external_id:{sorted(foreign)[0]}"
     return True, "ok"
 
 
@@ -465,13 +495,19 @@ async def _name_candidates(
 ) -> list[NameMatchCandidate]:
     """Every canonical whose normalized name equals ``norm``, decorated
     with the authoritative id namespaces it already carries."""
+    # Column-scoped so the 1024-dim ``embedding`` never loads.
     rows = (
         await session.execute(
-            select(CanonicalEntity).where(
-                CanonicalEntity.canonical_name_normalized == norm
-            )
+            select(
+                CanonicalEntity.id,
+                CanonicalEntity.canonical_name,
+                CanonicalEntity.canonical_name_normalized,
+                CanonicalEntity.type,
+                CanonicalEntity.surface_mode,
+                CanonicalEntity.publication_state,
+            ).where(CanonicalEntity.canonical_name_normalized == norm)
         )
-    ).scalars().all()
+    ).all()
     out: list[NameMatchCandidate] = []
     for ent in rows:
         namespaces = (
@@ -490,6 +526,7 @@ async def _name_candidates(
                 surface_mode=ent.surface_mode,
                 publication_state=ent.publication_state,
                 namespaces=frozenset(namespaces),
+                norm=ent.canonical_name_normalized,
             )
         )
     return out

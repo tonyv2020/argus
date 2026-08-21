@@ -455,8 +455,23 @@ async def _load(
         ).all()
     )
 
+    # COLUMN-SCOPED, not ``select(CanonicalEntity)``. The ORM entity
+    # pulls the 1024-dim pgvector ``embedding`` for all 62k canonicals —
+    # ~0.5 GB of raw floats before Python object overhead, which OOM-
+    # killed this job at its 2 GiB limit on the first live run.
     nodes: dict[str, Node] = {}
-    for ent in (await session.execute(select(CanonicalEntity))).scalars():
+    for ent in (
+        await session.execute(
+            select(
+                CanonicalEntity.id,
+                CanonicalEntity.canonical_name,
+                CanonicalEntity.canonical_name_normalized,
+                CanonicalEntity.type,
+                CanonicalEntity.surface_mode,
+                CanonicalEntity.publication_state,
+            )
+        )
+    ).all():
         nodes[ent.id] = Node(
             id=ent.id,
             name=ent.canonical_name,
