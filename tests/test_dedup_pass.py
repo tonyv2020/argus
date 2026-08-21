@@ -15,6 +15,8 @@ import pytest
 from app.services.ingest.dedup_pass import (
     DEFAULT_APPLIED_RULES,
     _HAS_DIGIT_RE,
+    _PREFIX_CURATED,
+    _check_postconditions,
     Candidate,
     Ent,
     _identity_key,
@@ -375,3 +377,115 @@ def test_a_rule_not_in_the_applied_set_only_reaches_the_review_list() -> None:
     plan = _plan(ents, [Candidate("a", "b", "prefix_variant", "tail 'in'")])
     assert plan.clusters == []
     assert plan.review[0].reason == "rule_not_enabled:prefix_variant"
+
+
+# ─── helen 2026-08-21 review decisions ──────────────────────────────────
+
+
+def test_concept_to_org_denylist_blocks_the_known_mistypings() -> None:
+    """helen: keep the concept→organization retype ON (it fixes xAI /
+    Starlink / OpenAI) but do not propagate the four upstream mis-typings.
+    They still MERGE — only the bad type is withheld, and the cluster is
+    flagged."""
+    for squashed_name in ("401k", "adr", "aietf", "chipmakers"):
+        members = [
+            _e("a", squashed_name, squashed_name, "concept", edges=3),
+            _e("b", squashed_name, squashed_name, "organization"),
+        ]
+        assert _resolve_type(members, members[0]) == ("concept", True)
+
+
+def test_denylist_matches_the_squashed_form_not_just_the_exact_name() -> None:
+    """'401(k)' normalizes to '401 k' and 'chip makers' to 'chip makers';
+    both squash onto the denylist entry."""
+    members = [
+        _e("a", "401(k)", "401 k", "concept", edges=2),
+        _e("b", "401k", "401k", "organization"),
+    ]
+    assert _resolve_type(members, members[0]) == ("concept", True)
+
+
+def test_org_concept_retype_still_fires_for_everything_else() -> None:
+    members = [
+        _e("a", "Starlink", "starlink", "concept", edges=8),
+        _e("b", "Starlink", "starlink", "organization", edges=1),
+    ]
+    assert _resolve_type(members, members[0]) == ("organization", False)
+
+
+def test_curated_prefix_rule_is_applied_and_the_general_one_is_not() -> None:
+    """helen: enable prefix_variant ONLY for the two Palantir OCR mangles."""
+    assert "prefix_variant_curated" in DEFAULT_APPLIED_RULES
+    assert "prefix_variant" not in DEFAULT_APPLIED_RULES
+
+    ents = [
+        _e("a", "Palantir Technologies Inc.", "palantir technologies",
+           "organization", edges=63, aliases=304),
+        _e("b", "PALANTIR TECHNOLOGIES IN", "palantir technologies in",
+           "organization", edges=1),
+    ]
+    plan = _plan(
+        ents, [Candidate("a", "b", "prefix_variant_curated", "tail 'in'")]
+    )
+    assert len(plan.clusters) == 1
+    assert plan.clusters[0].survivor.id == "a"
+    assert [d.id for d in plan.clusters[0].dropped] == ["b"]
+
+
+def test_curated_prefix_list_holds_exactly_the_two_reviewed_pairs() -> None:
+    """The allowlist is the whole safety argument for enabling this rule —
+    it must not drift open."""
+    assert _PREFIX_CURATED == frozenset({
+        ("palantir technologies", "palantir technologies in"),
+        ("palantir technologies", "palantir technologies inclass"),
+    })
+
+
+def test_postconditions_fail_when_a_protected_scrutiny_row_is_lost() -> None:
+    """Losing the privacy-audit row of a suppress/alias canonical is a
+    privacy incident, and the post-merge check must say so out loud."""
+    before = {
+        "entities": 100, "uncited_edges": 0, "orphan_citations": 0,
+        "surface_mode_counts": {"open": 90, "suppress": 10},
+        "scrutiny": {"total": 50, "by_surface_mode": {"open": 40, "suppress": 10}},
+    }
+    after = {
+        "entities": 98, "uncited_edges": 0, "orphan_citations": 0,
+        "surface_mode_counts": {"open": 88, "suppress": 10},
+        "scrutiny": {"total": 49, "by_surface_mode": {"open": 40, "suppress": 9}},
+    }
+    result = _check_postconditions(before, after)
+    assert result["all_passed"] is False
+    assert result["checks"]["no_protected_scrutiny_rows_lost"] is False
+    assert result["checks"]["scrutiny_rows_preserved"] is False
+    assert result["protected_scrutiny_lost"]["suppress"] == 1
+
+
+def test_postconditions_pass_on_a_clean_merge() -> None:
+    before = {
+        "entities": 100, "uncited_edges": 0, "orphan_citations": 0,
+        "surface_mode_counts": {"open": 90, "suppress": 10},
+        "scrutiny": {"total": 50, "by_surface_mode": {"open": 40, "suppress": 10}},
+    }
+    after = {
+        "entities": 98, "uncited_edges": 0, "orphan_citations": 0,
+        "surface_mode_counts": {"open": 88, "suppress": 10},
+        "scrutiny": {"total": 50, "by_surface_mode": {"open": 40, "suppress": 10}},
+    }
+    assert _check_postconditions(before, after)["all_passed"] is True
+
+
+def test_postconditions_fail_if_a_node_changed_surface_mode() -> None:
+    """A merge must never move a canonical between surface_modes — the
+    per-mode counts may only shrink."""
+    before = {
+        "entities": 100, "uncited_edges": 0, "orphan_citations": 0,
+        "surface_mode_counts": {"open": 90, "suppress": 10},
+        "scrutiny": {"total": 50, "by_surface_mode": {}},
+    }
+    after = {
+        "entities": 100, "uncited_edges": 0, "orphan_citations": 0,
+        "surface_mode_counts": {"open": 89, "suppress": 11},
+        "scrutiny": {"total": 50, "by_surface_mode": {}},
+    }
+    assert _check_postconditions(before, after)["all_passed"] is False

@@ -24,7 +24,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_sessionmaker
@@ -35,6 +35,7 @@ from app.models import (
     CanonicalEntity,
     EntityAlias,
 )
+from app.services.scrutiny import ScrutinyDecisionLog
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class MergeStats:
     edges_repointed: int = 0
     aliases_repointed: int = 0
     anchor_rows_repointed: int = 0
+    scrutiny_repointed: int = 0
     refused_privacy: int = 0
     errors: int = 0
 
@@ -155,6 +157,37 @@ async def _apply_one(
         )
     ).rowcount
     stats.anchor_rows_repointed += anchors or 0
+
+    # PRIVACY-CRITICAL: scrutiny_decisions.canonical_id is ON DELETE
+    # CASCADE, so the `session.delete(src)` below would destroy src's
+    # privacy-audit trail. This path never repointed them at all. Move
+    # them, then verify nothing is left before the delete — losing the
+    # scrutiny row of a suppress/alias node is a privacy incident.
+    scrutiny = (
+        await session.execute(
+            update(ScrutinyDecisionLog)
+            .where(ScrutinyDecisionLog.canonical_id == src.id)
+            .values(canonical_id=dst.id)
+        )
+    ).rowcount
+    stats.scrutiny_repointed += scrutiny or 0
+    await session.flush()
+
+    stranded = (
+        await session.execute(
+            select(func.count())
+            .select_from(ScrutinyDecisionLog)
+            .where(ScrutinyDecisionLog.canonical_id == src.id)
+        )
+    ).scalar_one()
+    if stranded:
+        logger.error(
+            "merge %s: REFUSED (privacy) — %d scrutiny_decisions row(s) still "
+            "attached to src=%s; deleting it would cascade the audit away",
+            row.id, stranded, src.id,
+        )
+        stats.refused_privacy += 1
+        return False
 
     # Freeze the audit ids BEFORE deleting src (ondelete SET NULL wipes
     # the FKs on the crosswalk row when src goes away).

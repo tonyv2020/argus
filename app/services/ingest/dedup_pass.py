@@ -44,6 +44,12 @@ Applied by default:
     ``SpaceX`` and ``PALANTIRTECHNOLOGIES INC`` vs
     ``Palantir Technologies Inc.``.
 
+``prefix_variant_curated``
+    The hand-reviewed subset of ``prefix_variant`` pinned in
+    ``_PREFIX_CURATED`` — currently the two Palantir OCR mangles
+    (``PALANTIR TECHNOLOGIES IN``, ``… INCLASS``), approved by helen
+    2026-08-21. It can never match anything not in that list.
+
 Review-only (reported, NEVER applied without an explicit flag):
 
 ``person_name``      person↔person / person↔unknown name matches. A false
@@ -57,10 +63,13 @@ Review-only (reported, NEVER applied without an explicit flag):
                      ``FACEBOOK INC. PAC`` onto the org ``Facebook``.
 ``incompatible_type``other type pairs we refuse to guess on
                      (``organization``↔``place``, ``organization``↔``person``…).
-``prefix_variant``   OCR/truncation variants (``PALANTIR TECHNOLOGIES IN``,
-                     ``PALANTIR TECHNOLOGIES INCLASS``).
+``prefix_variant``   OCR/truncation variants at large. Only the curated
+                     subset above is ever applied.
 ``vector``           pgvector cosine ≥ ``--vector-threshold`` plus a shared
-                     name token. ``--enable-vector`` opts in.
+                     name token. ``--enable-vector`` opts in. helen
+                     2026-08-21: OFF — it finds real duplicates but also
+                     ``Series A``/``Series A-1`` and ``NHL playoffs``/
+                     ``Stanley Cup playoffs``.
 
 HARD PRIVACY RULE — fail-closed, non-negotiable
 -----------------------------------------------
@@ -207,6 +216,28 @@ _MIN_SQUASH_LEN = 6
 _MIN_NAME_LEN = 3
 _HAS_ALPHA_RE = re.compile(r"[a-z]")
 _HAS_DIGIT_RE = re.compile(r"\d")
+
+# helen 2026-08-21: the organization/concept retype is on, but these four
+# are known upstream mis-typings — something in the corpus claims
+# ``organization`` for what is plainly a concept. Merge them, but do NOT
+# propagate the bad type; the cluster is flagged for review instead.
+# Keyed on the whitespace-stripped normalized name so "401(k)" / "401k" and
+# "AI ETF" / "Chipmakers" / "chip makers" all match one entry each.
+_CONCEPT_TO_ORG_DENYLIST: frozenset[str] = frozenset(
+    {"401k", "adr", "aietf", "chipmakers"}
+)
+
+# helen 2026-08-21: ``prefix_variant`` stays review-only in general — a
+# token-boundary tail matches far too much to trust. These two specific
+# pairs are approved: OCR mangles of the Palantir SEC issuer name, each
+# with 1 edge and 0 aliases. Keyed as (short_norm, long_norm) so the rule
+# can never widen beyond what was reviewed.
+_PREFIX_CURATED: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("palantir technologies", "palantir technologies in"),
+        ("palantir technologies", "palantir technologies inclass"),
+    }
+)
 
 
 def _name_is_evidence(norm: str) -> bool:
@@ -412,7 +443,8 @@ def _resolve_type(
         # ``organization`` somewhere in the corpus). ``concept_to_org=False``
         # turns it off — the merge still happens, the survivor keeps its own
         # type, and the cluster is flagged for review instead.
-        if concept_to_org:
+        denied = any(m.squashed in _CONCEPT_TO_ORG_DENYLIST for m in members)
+        if concept_to_org and not denied:
             return "organization", False
         return (survivor.type if survivor.type != "unknown" else "concept"), True
     if survivor.type != "unknown":
@@ -635,10 +667,15 @@ def _cand_prefix(by_norm: dict[str, list[Ent]]) -> list[Candidate]:
             # ("bank of america plaza").
             if not tail.startswith(" ") or len(tail) > 10:
                 continue
+            rule = (
+                "prefix_variant_curated"
+                if (short, long) in _PREFIX_CURATED
+                else "prefix_variant"
+            )
             for a in by_norm[short]:
                 for b in by_norm[long]:
                     out.append(
-                        Candidate(a.id, b.id, "prefix_variant",
+                        Candidate(a.id, b.id, rule,
                                   f"{short!r} + tail {tail.strip()!r}")
                     )
     return out
@@ -950,7 +987,15 @@ def predict(
 # ─── planning entrypoint ────────────────────────────────────────────────
 
 DEFAULT_APPLIED_RULES = frozenset(
-    {"ext_id", "sec_former_name", "exact_name", "squashed_name"}
+    {
+        "ext_id",
+        "sec_former_name",
+        "exact_name",
+        "squashed_name",
+        # Safe to default-on: it can only ever match the two hand-reviewed
+        # pairs pinned in _PREFIX_CURATED.
+        "prefix_variant_curated",
+    }
 )
 ALL_RULES = DEFAULT_APPLIED_RULES | {"prefix_variant", "vector", "person_unknown"}
 
@@ -1008,17 +1053,6 @@ class ApplyStats:
     self_loop_citations_deleted: int = 0
     types_upgraded: int = 0
     refused: int = 0
-
-
-async def _repoint_scrutiny(session: AsyncSession, keep: str, drop: str) -> int:
-    """``scrutiny_decisions.canonical_id`` is ON DELETE CASCADE, so the
-    audit row would be destroyed with the dropped canonical. Move it."""
-    res = await session.execute(
-        text("update scrutiny_decisions set canonical_id = :keep "
-             "where canonical_id = :drop"),
-        {"keep": keep, "drop": drop},
-    )
-    return res.rowcount or 0
 
 
 async def _existing_self_loops(session: AsyncSession, keep: str) -> list[str]:
@@ -1095,6 +1129,7 @@ async def apply_plan(
                     stats.edges_collided_summed += ms.edges_collided_summed
                     stats.citations_reparented += ms.citations_reparented
                     stats.aliases_repointed += ms.aliases_repointed
+                    stats.scrutiny_repointed += ms.scrutiny_repointed
                     stats.entities_dropped += 1
                     session.add(
                         AliasCrosswalk(
@@ -1108,9 +1143,6 @@ async def apply_plan(
                             applied_at=datetime.now(timezone.utc),
                         )
                     )
-                # scrutiny rows are repointed BEFORE the delete inside
-                # merge_two_canonicals flushes — that helper's own attempt
-                # imports a model that does not exist, so do it here.
                 if not keep_self_loops:
                     loops, loop_cits = await _drop_self_loops(
                         session, cl.survivor.id, preexisting
@@ -1133,17 +1165,91 @@ async def apply_plan(
     return stats
 
 
-async def _preflight_scrutiny(plan: Plan) -> int:
-    """Repoint scrutiny_decisions off every to-be-dropped canonical BEFORE
-    any delete, so the ON DELETE CASCADE cannot eat the audit trail."""
-    sm = get_sessionmaker()
-    moved = 0
-    async with sm() as session:
-        for cl in plan.clusters:
-            for d in cl.dropped:
-                moved += await _repoint_scrutiny(session, cl.survivor.id, d.id)
-        await session.commit()
-    return moved
+def _check_postconditions(before: dict, after: dict) -> dict:
+    """Machine-checked pass/fail on the invariants that matter after a live
+    merge. Reported alongside the numbers so nobody has to eyeball them."""
+    b_scr, a_scr = before["scrutiny"], after["scrutiny"]
+    protected_lost = {
+        mode: b_scr["by_surface_mode"].get(mode, 0)
+        - a_scr["by_surface_mode"].get(mode, 0)
+        for mode in ("suppress", "alias")
+    }
+    checks = {
+        "uncited_edges_still_zero": after["uncited_edges"] == 0,
+        "no_orphan_citations": after["orphan_citations"] == 0,
+        "scrutiny_rows_preserved": a_scr["total"] == b_scr["total"],
+        "no_protected_scrutiny_rows_lost": all(
+            v <= 0 for v in protected_lost.values()
+        ),
+        "no_entity_changed_surface_mode": all(
+            after["surface_mode_counts"].get(m, 0)
+            <= before["surface_mode_counts"].get(m, 0)
+            for m in set(before["surface_mode_counts"]) | set(
+                after["surface_mode_counts"]
+            )
+        ),
+        "entities_only_decreased": after["entities"] <= before["entities"],
+    }
+    return {
+        "all_passed": all(checks.values()),
+        "checks": checks,
+        "scrutiny_total_delta": a_scr["total"] - b_scr["total"],
+        "protected_scrutiny_lost": protected_lost,
+    }
+
+
+async def scrutiny_on_dropped(session: AsyncSession, plan: Plan) -> dict:
+    """Pre-flight: how many ``scrutiny_decisions`` rows sit on canonicals the
+    plan would DROP, split by surface_mode.
+
+    Every one of these has to be repointed onto the survivor before the
+    delete, or the ON DELETE CASCADE eats it. This is the number the
+    post-run census must account for.
+    """
+    dropped = [d.id for cl in plan.clusters for d in cl.dropped]
+    if not dropped:
+        return {"total": 0, "by_surface_mode": {}, "dropped_canonicals": 0}
+    rows = (
+        await session.execute(
+            text(
+                "select e.surface_mode, count(*) from scrutiny_decisions s "
+                "join canonical_entities e on e.id = s.canonical_id "
+                "where s.canonical_id = any(:ids) group by 1"
+            ),
+            {"ids": dropped},
+        )
+    ).all()
+    by_mode = dict(rows)
+    return {
+        "total": sum(by_mode.values()),
+        "by_surface_mode": by_mode,
+        "dropped_canonicals": len(dropped),
+    }
+
+
+async def scrutiny_census(session: AsyncSession) -> dict:
+    """Privacy-audit census: how many ``scrutiny_decisions`` rows exist, and
+    how they split by the ``surface_mode`` of the canonical they document.
+
+    Compared before and after a live pass. ``suppress``/``alias`` must not
+    lose a single row — that is the privacy audit trail for a protected
+    identity, and its FK is ON DELETE CASCADE.
+    """
+    total = (
+        await session.execute(text("select count(*) from scrutiny_decisions"))
+    ).scalar_one()
+    by_mode = dict(
+        (
+            await session.execute(
+                text(
+                    "select e.surface_mode, count(*) from scrutiny_decisions s "
+                    "join canonical_entities e on e.id = s.canonical_id "
+                    "group by 1"
+                )
+            )
+        ).all()
+    )
+    return {"total": total, "by_surface_mode": by_mode}
 
 
 # ─── invariants ─────────────────────────────────────────────────────────
@@ -1179,6 +1285,7 @@ async def check_invariants(session: AsyncSession) -> dict:
                 "select surface_mode, count(*) from canonical_entities group by 1"
             )).all()
         ),
+        "scrutiny": await scrutiny_census(session),
         "type_counts": dict(
             (await q(
                 "select type, count(*) from canonical_entities group by 1"
@@ -1288,6 +1395,23 @@ def render_text(report: dict) -> str:
     for rule, n in report["rules"]["candidate_pairs"].items():
         acc = report["rules"]["clusters_per_rule"].get(rule, 0)
         lines.append(f"  {rule:<18} candidate pairs {n:>6}   clusters {acc:>6}")
+    risk = report.get("scrutiny_rows_on_dropped_canonicals", {})
+    lines += [
+        "",
+        "── privacy audit (scrutiny_decisions) ─────────────────",
+        f"rows now: {inv['scrutiny']['total']}  by surface_mode: "
+        f"{inv['scrutiny']['by_surface_mode']}",
+        f"rows sitting on the {risk.get('dropped_canonicals', 0)} canonicals "
+        f"this plan drops: {risk.get('total', 0)} {risk.get('by_surface_mode', {})}"
+        "  (all repointed onto the survivor before any delete; the merge "
+        "REFUSES if any is still attached)",
+    ]
+    after = report.get("postconditions")
+    if after:
+        lines.append(
+            f"POSTCONDITIONS: {'ALL PASSED' if after['all_passed'] else 'FAILED'} "
+            f"{after['checks']}"
+        )
     lines += ["", "── type upgrades on survivors ─────────────────────────"]
     for change, n in p["type_upgrades"].items():
         lines.append(f"  {change:<28} {n:>6}")
@@ -1353,23 +1477,25 @@ async def run(
             allow_person_unknown="person_unknown" in applied_rules,
             concept_to_org=concept_to_org,
         )
+        scrutiny_at_risk = await scrutiny_on_dropped(session, plan)
 
     report = build_report(
         ents, edges, plan, invariants, "apply" if apply else "dry-run"
     )
     report["applied_rules"] = sorted(applied_rules)
+    report["scrutiny_rows_on_dropped_canonicals"] = scrutiny_at_risk
     if read_only_proof is not None:
         report["dry_run_transaction_read_only"] = read_only_proof
 
     if apply:
-        moved = await _preflight_scrutiny(plan)
         stats = await apply_plan(
             plan, limit=limit, keep_self_loops=keep_self_loops
         )
-        stats.scrutiny_repointed = moved
         report["apply_stats"] = stats.__dict__
         async with sm() as session:
-            report["invariants_after"] = await check_invariants(session)
+            after = await check_invariants(session)
+        report["invariants_after"] = after
+        report["postconditions"] = _check_postconditions(invariants, after)
 
     print(render_text(report))
     if json_report:
