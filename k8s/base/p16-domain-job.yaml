@@ -1,0 +1,316 @@
+# P1.6 — Thiel / Palantir / surveillance domain, anchored on EXTERNAL IDS.
+#
+# STAGED, NOT PUBLISHED. Every net-new entity and every edge these jobs
+# create carries publication_state=staged + the batch_id below, so
+# nothing reaches the public read path until an operator runs
+#   POST /api/admin/batches/<batch_id>/publish
+# which still refuses 409 while any batch entity lacks a scrutiny verdict.
+#
+# A Job's pod template is immutable, so pin the image + batch at apply
+# time rather than editing a live Job:
+#
+#   TAG=p16-$(git rev-parse --short=12 HEAD)
+#   BATCH=p16-thiel-$(date -u +%Y%m%dT%H%M%SZ)
+#   sed -e "s|argus/api:latest|argus/api:${TAG}|" -e "s|__BATCH_ID__|${BATCH}|" \
+#     k8s/base/p16-domain-job.yaml | kubectl -n argus apply -f -
+#
+# ORDER MATTERS. Every downstream pass resolves its subject from
+# anchor_registry.canonical_id and REFUSES to mint one from a name, so
+# the anchor job has to land first:
+#
+#   1. argus-p16-anchors        identities + external-ID aliases
+#   2. argus-p16-sec-insiders   Form 3/4/5 → held_position (needs sec.cik)
+#      argus-p16-sources        USAspending UEI + Senate LDA (needs canonical_id)
+#      argus-p16-fec-thiel      Schedule A → contributes_to (needs the person anchor)
+#   3. argus-p16-scrutiny       the publish precondition
+#
+# The merge jobs at the bottom are DESTRUCTIVE and separate: the dry-run
+# is read-only, the apply ships suspended.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p16-anchors
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p16-anchors
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p16-anchors
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: anchors
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.domain_anchors
+            - --domain
+            - surveillance
+            - --batch-id
+            - __BATCH_ID__
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "2Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p16-sec-insiders
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p16-sec-insiders
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p16-sec-insiders
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: sec-insiders
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.sec_insiders
+            - --priority-domain
+            - surveillance
+            - --batch-id
+            - __BATCH_ID__
+          env:
+            # SEC's fair-use policy requires a descriptive, contactable
+            # User-Agent on every request (sec.gov/os/webmaster-faq).
+            - name: SEC_USER_AGENT
+              value: "argus-ingest/1.0 (twin@achilles.tonyvigna.com)"
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "2Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p16-sources
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p16-sources
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 5400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p16-sources
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: sources
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          # USAspending (UEI-verified) + Senate LDA (pattern-gated).
+          # LDA throttles anonymous callers hard; _lda_get backs off
+          # exponentially, hence the long deadline.
+          command:
+            - python
+            - -m
+            - app.services.ingest.domain_sources
+            - --domain
+            - surveillance
+            - --batch-id
+            - __BATCH_ID__
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "2Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p16-fec-thiel
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p16-fec-individual
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p16-fec-individual
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: fec-individual
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.fec_individual
+            - --donor
+            - thiel
+            - --batch-id
+            - __BATCH_ID__
+          envFrom:
+            - secretRef:
+                name: argus-env
+            # A real FEC key is REQUIRED here: the identity predicate
+            # has to see every candidate row before it can refuse the
+            # wrong ones, and DEMO_KEY caps at ~30 requests/hour.
+            - secretRef:
+                name: argus-fec
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "2Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p16-scrutiny
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p16-scrutiny
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p16-scrutiny
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: scrutiny
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          # Scoped to the batch: decides ONLY entities this ingest
+          # created that have no verdict yet. SEC insiders are created
+          # surface_mode=suppress and carry a corporate.registry.officer
+          # alias, which is a deterministic PUBLIC hard signal — no LLM
+          # call. This job is the publish precondition.
+          command:
+            - python
+            - -c
+            - |
+              import asyncio, json, logging, os
+              from app.services.ingest.run_scrutiny import run_scrutiny_batch
+              logging.basicConfig(level=logging.INFO)
+              stats = asyncio.run(run_scrutiny_batch(os.environ["BATCH_ID"]))
+              print(json.dumps(stats.__dict__, indent=2, default=str))
+          env:
+            - name: BATCH_ID
+              value: __BATCH_ID__
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "2Gi", cpu: "1000m"}
+---
+# ─── DESTRUCTIVE: fragment collapse + mis-type repair ──────────────────
+#
+# The dry-run opens SET TRANSACTION READ ONLY, so a stray write raises
+# 25006 rather than touching live public data. Run it, read the plan,
+# THEN unsuspend the apply job:
+#
+#   kubectl -n argus patch job argus-p16-merge-apply \
+#     -p '{"spec":{"suspend":false}}'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p16-merge-dryrun
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p16-merge
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p16-merge
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: merge-dryrun
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.domain_merge
+            - --domain
+            - surveillance
+            - --dry-run
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "2Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p16-merge-apply
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p16-merge
+spec:
+  suspend: true          # DESTRUCTIVE — unsuspend only after the dry-run
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p16-merge
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: merge-apply
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.domain_merge
+            - --domain
+            - surveillance
+            - --apply
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "2Gi", cpu: "1000m"}
