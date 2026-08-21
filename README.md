@@ -74,3 +74,31 @@ the public path can never opt into staged content.
 rule (D4) is untouched.
 
 Full operator guide: [`docs/read-gate.md`](docs/read-gate.md).
+
+## P2 dedup/merge pass (2026-08-21)
+
+`app/services/ingest/dedup_pass.py` is a re-runnable, idempotent fragmentation
+cleanup: the same real-world entity is spread across several canonicals
+(`Tesla` as person + unknown + organization, `xAI` as organization + concept),
+and 32% of the registry is typed `unknown`. The pass resolves fragments to one
+canonical, re-points every edge, citation, alias, anchor and scrutiny decision
+onto the survivor, and deletes the emptied node.
+
+Everything in the corpus is `publication_state=published`, so **run it
+read-only first**. `--dry-run` (the default) opens its transaction with
+`SET TRANSACTION READ ONLY` and emits a before/after report; `--apply` is the
+only mode that writes.
+
+```
+python -m app.services.ingest.dedup_pass --dry-run --enable-vector
+python -m app.services.ingest.dedup_pass --apply          # destructive
+kubectl -n argus apply -f k8s/base/dedup-job.yaml         # dry-run job
+```
+
+**Fail-closed on privacy:** a candidate pair whose members differ in
+`surface_mode` is never merged — it is skipped and logged to the review list,
+with no flag to override. The same partition applies to `publication_state`.
+Type is upgraded only on a reliable signal (authoritative external id, or a
+single real type among the cluster members); anything else keeps the
+survivor's type and is flagged for review. Rules and their refusal buckets are
+documented in the module docstring.
