@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 from sqlalchemy import func as sa_func, select
@@ -25,6 +25,7 @@ from app.models import (
     EdgeRelation,
     EntityAlias,
     EntityType,
+    PublicationState,
     SourceCitation,
     SourceKind,
 )
@@ -231,8 +232,17 @@ async def _find_or_create_canonical(
     entity_type: str,
     source_system: str,
     source_id: str,
+    *,
+    batch_id: str | None = None,
 ) -> str:
-    """Reuse alias-keyed canonical + normalized-name-keyed canonical, else create."""
+    """Reuse alias-keyed canonical + normalized-name-keyed canonical, else create.
+
+    ``batch_id`` (RG1, P1.6) stamps a **net-new** canonical
+    ``publication_state=staged``. A canonical this resolves ONTO is
+    never restamped: re-staging a live published node would pull it off
+    the public read path. The default ``None`` keeps the column default
+    ``published``, so the steady-state sweeps are unchanged.
+    """
     existing = (
         await session.execute(
             select(EntityAlias).where(
@@ -268,6 +278,11 @@ async def _find_or_create_canonical(
         canonical_name=surface_name,
         canonical_name_normalized=norm or surface_name.lower(),
         type=entity_type,
+        publication_state=(
+            PublicationState.STAGED.value if batch_id
+            else PublicationState.PUBLISHED.value
+        ),
+        batch_id=batch_id,
     )
     session.add(ce)
     await session.flush()
@@ -289,6 +304,8 @@ async def _emit_contract_edge(
     dst_canonical: str,
     amount: float | None,
     award_id: str,
+    *,
+    batch_id: str | None = None,
 ) -> tuple[str, bool]:
     """Create or reuse a HOLDS_CONTRACT edge + attach the USAspending award
     citation. IDEMPOTENT per (edge, award_id) — Stage 2 (helen 2026-08-11).
@@ -325,6 +342,11 @@ async def _emit_contract_edge(
             target_id=dst_canonical,
             relation=EdgeRelation.HOLDS_CONTRACT.value,
             weight=0.0,
+            publication_state=(
+                PublicationState.STAGED.value if batch_id
+                else PublicationState.PUBLISHED.value
+            ),
+            batch_id=batch_id,
         )
         session.add(edge)
         await session.flush()
@@ -630,6 +652,246 @@ async def ingest_recipient_contracts(
             if not page_meta.get("hasNext"):
                 break
             body["page"] += 1
+    return stats
+
+
+# ─── P1.6 — UEI-keyed, batch-aware contract ingest ──────────────────────
+
+
+@dataclass
+class UeiContractStats:
+    """Counters for one UEI-keyed contract sweep."""
+
+    anchors_processed: int = 0
+    awards_fetched: int = 0
+    awards_accepted: int = 0
+    awards_refused_foreign_uei: int = 0
+    awards_missing_uei: int = 0
+    awards_missing_id: int = 0
+    agencies_created: int = 0
+    edges_created: int = 0
+    edges_reused: int = 0
+    citations_created: int = 0
+    obligation_total: float = 0.0
+    entities_staged: int = 0
+    edges_staged: int = 0
+    #: UEIs the API returned that are NOT on the anchor's allowlist —
+    #: the fail-closed refusal list, so an operator can widen or not.
+    foreign_ueis: dict[str, int] = field(default_factory=dict)
+    #: Anchors with a UEI but no resolved canonical — never minted here.
+    unanchored: list[dict] = field(default_factory=list)
+    by_agency: list[dict] = field(default_factory=list)
+    errors: int = 0
+
+
+#: ``spending_by_award`` fields the UEI pass requests. ``Recipient UEI``
+#: is the whole point: it lets the pass VERIFY every row it accepts
+#: against the anchor's declared external id rather than trusting the
+#: server-side ``recipient_search_text`` match, which is a fuzzy
+#: name/UEI/DUNS search and does return neighbours.
+_UEI_AWARD_FIELDS: tuple[str, ...] = (
+    "Award ID",
+    "Recipient Name",
+    "Recipient UEI",
+    "Awarding Agency",
+    "Awarding Sub Agency",
+    "generated_internal_id",
+    "Award Amount",
+    "Total Obligated Amount",
+)
+
+
+async def ingest_recipient_contracts_by_uei(
+    *,
+    ueis: tuple[str, ...],
+    recipient_canonical: str,
+    display_label: str,
+    batch_id: str | None = None,
+    max_awards: int = 500,
+    stats: UeiContractStats | None = None,
+) -> UeiContractStats:
+    """P1.6 — one recipient's federal contracts, keyed and VERIFIED on UEI.
+
+    ``recipient_search_text`` accepts a UEI, but it is a fuzzy search:
+    querying Palantir's UEI also returns Palantir USG rows, and querying
+    a short name returns unrelated neighbours (``JAXON ENTERPRISES`` for
+    ``AXON ENTERPRISE``). So the UEI is used BOTH as the query and as the
+    accept gate — a row whose ``Recipient UEI`` is not on the anchor's
+    allowlist is refused and counted, never attributed.
+
+    Agency scope is deliberately broad (every awarding sub-agency): the
+    surveillance domain's contracts sit in DoD, the Army, SOCOM, ICE,
+    the VA and Interior, so the detention-beat ICE/BOP/USMS filter the
+    older path applies would drop most of them.
+    """
+    stats = stats or UeiContractStats()
+    allow = {u.strip().upper() for u in ueis if u}
+    if not allow:
+        return stats
+    sm = get_sessionmaker()
+    per_agency: dict[str, dict] = {}
+
+    body = {
+        "filters": {
+            "recipient_search_text": sorted(allow),
+            "award_type_codes": ["A", "B", "C", "D"],
+        },
+        "fields": list(_UEI_AWARD_FIELDS),
+        "page": 1,
+        "limit": min(100, max_awards),
+        "sort": "Award Amount",
+        "order": "desc",
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        remaining = max_awards
+        while remaining > 0:
+            body["limit"] = min(100, remaining)
+            try:
+                payload = await _post(client, "/search/spending_by_award/", body)
+            except Exception:
+                logger.exception(
+                    "[%s] spending_by_award failed page=%s",
+                    display_label, body["page"],
+                )
+                stats.errors += 1
+                break
+            rows = payload.get("results") or []
+            if not rows:
+                break
+            async with sm() as session:
+                for r in rows:
+                    stats.awards_fetched += 1
+                    uei = (r.get("Recipient UEI") or "").strip().upper()
+                    if not uei:
+                        stats.awards_missing_uei += 1
+                        continue
+                    if uei not in allow:
+                        stats.awards_refused_foreign_uei += 1
+                        stats.foreign_ueis[uei] = (
+                            stats.foreign_ueis.get(uei, 0) + 1
+                        )
+                        continue
+                    award_id = r.get("generated_internal_id") or r.get("Award ID")
+                    if not award_id:
+                        stats.awards_missing_id += 1
+                        continue
+                    sub_agency = (r.get("Awarding Sub Agency") or "").strip()
+                    top_agency = (r.get("Awarding Agency") or "").strip()
+                    agency_label = sub_agency or top_agency
+                    if not agency_label:
+                        continue
+                    try:
+                        before_agency = (
+                            await session.execute(
+                                select(EntityAlias).where(
+                                    EntityAlias.source_system == "usaspending.agency",
+                                    EntityAlias.source_id == agency_label.upper(),
+                                )
+                            )
+                        ).scalar_one_or_none()
+                        agency_canonical = await _find_or_create_canonical(
+                            session,
+                            agency_label.title(),
+                            EntityType.AGENCY.value,
+                            "usaspending.agency",
+                            agency_label.upper(),
+                            batch_id=batch_id,
+                        )
+                        if before_agency is None:
+                            stats.agencies_created += 1
+                            if batch_id:
+                                stats.entities_staged += 1
+                        obligation = await _award_net_obligation(client, r)
+                        edge_id, reused = await _emit_contract_edge(
+                            session,
+                            recipient_canonical,
+                            agency_canonical,
+                            obligation,
+                            str(award_id),
+                            batch_id=batch_id,
+                        )
+                        if reused:
+                            stats.edges_reused += 1
+                        else:
+                            stats.edges_created += 1
+                            if batch_id:
+                                stats.edges_staged += 1
+                        stats.awards_accepted += 1
+                        stats.citations_created += 1
+                        stats.obligation_total += float(obligation or 0.0)
+                        bucket = per_agency.setdefault(
+                            agency_label,
+                            {"agency": agency_label, "awards": 0, "obligated": 0.0},
+                        )
+                        bucket["awards"] += 1
+                        bucket["obligated"] += float(obligation or 0.0)
+                        del edge_id
+                    except Exception:
+                        logger.exception(
+                            "[%s] award failed id=%s", display_label, award_id
+                        )
+                        stats.errors += 1
+                try:
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    stats.errors += 1
+                    logger.exception("[%s] contract batch commit failed", display_label)
+            remaining -= len(rows)
+            if not (payload.get("page_metadata") or {}).get("hasNext"):
+                break
+            body["page"] += 1
+
+    stats.by_agency.extend(
+        sorted(per_agency.values(), key=lambda a: -a["obligated"])
+    )
+    return stats
+
+
+async def ingest_domain_contracts_by_uei(
+    priority_domains: tuple[str, ...] | None = None,
+    *,
+    batch_id: str | None = None,
+    max_awards_per_anchor: int = 500,
+) -> UeiContractStats:
+    """Sweep every registry anchor that declares a USAspending UEI.
+
+    The recipient canonical comes from ``anchor_registry.canonical_id``
+    (written by ``domain_anchors``). An anchor with a UEI but no resolved
+    canonical is REPORTED, not minted — inventing a recipient here is
+    exactly the name-keyed identity P1.6 removes.
+    """
+    from app.services.anchor_registry import anchors_for_usaspending_uei
+
+    stats = UeiContractStats()
+    sm = get_sessionmaker()
+    async with sm() as session:
+        anchors = await anchors_for_usaspending_uei(
+            session, priority_domains=priority_domains
+        )
+    for anchor in anchors:
+        if not anchor.canonical_id:
+            stats.unanchored.append(
+                {"anchor": anchor.label, "uei": anchor.usaspending_uei}
+            )
+            logger.error(
+                "usaspending UEI pass: %s has UEIs but no canonical — run "
+                "domain_anchors first", anchor.label,
+            )
+            continue
+        logger.info(
+            "usaspending UEI pass: %s uei=%s",
+            anchor.label, ",".join(anchor.usaspending_uei),
+        )
+        await ingest_recipient_contracts_by_uei(
+            ueis=tuple(anchor.usaspending_uei),
+            recipient_canonical=anchor.canonical_id,
+            display_label=anchor.label,
+            batch_id=batch_id,
+            max_awards=max_awards_per_anchor,
+            stats=stats,
+        )
+        stats.anchors_processed += 1
     return stats
 
 

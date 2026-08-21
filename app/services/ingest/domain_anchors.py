@@ -135,8 +135,17 @@ class AnchorSpec:
     fec_committee_ids: tuple[str, ...] = ()
     fec_candidate_ids: tuple[str, ...] = ()
     #: Fuzzy search strings the older name-keyed ingesters still use.
+    #: For LDA these are the SERVER-SIDE QUERY strings; what is actually
+    #: accepted is decided by ``lda_client_patterns`` below.
     usaspending_recipient_names: tuple[str, ...] = ()
     lda_client_names: tuple[str, ...] = ()
+    #: Regexes matched against the NORMALIZED LDA client name. LDA mints
+    #: a new client id per REGISTRATION, so a fixed id allowlist goes
+    #: stale the moment the company hires another firm — see
+    #: ``Anchor.lda_client_patterns``. Anchored (``^…$``) wherever a
+    #: bare prefix would over-match: "flock" alone claims FLOCK HOMES,
+    #: "axon" alone claims AXONIUS and AXONICS.
+    lda_client_patterns: tuple[str, ...] = ()
     #: Surface forms news + filings actually print. Used for the
     #: fail-closed name fallback and by the P1.6.3 fragment collapse.
     name_variants: tuple[str, ...] = ()
@@ -157,6 +166,8 @@ class AnchorSpec:
             out["sec_ciks"] = list(self.sec_ciks)
         if self.sec_owner_cik is not None:
             out["sec_owner_cik"] = int(self.sec_owner_cik)
+        if self.lda_client_patterns:
+            out["lda_client_patterns"] = list(self.lda_client_patterns)
         return out
 
     @property
@@ -236,7 +247,13 @@ SURVEILLANCE_ANCHORS: tuple[AnchorSpec, ...] = (
             "PALANTIR USG INC",
             "PALANTIR TECHNOLOGIES",
         ),
-        lda_client_names=("Palantir Technologies",),
+        lda_client_names=("Palantir",),
+        lda_client_patterns=(
+            r"^palantir( technologies)?$",
+            # Filers also register a wrapper string naming the firm that
+            # acts for Palantir ("… OBO PALANTIR TECHNOLOGIES INC.").
+            r"\b(obo|for) palantir technologies$",
+        ),
         name_variants=(
             "Palantir Technologies Inc.",
             "Palantir Technologies",
@@ -253,7 +270,11 @@ SURVEILLANCE_ANCHORS: tuple[AnchorSpec, ...] = (
         sec_cik=1069183,
         usaspending_uei=("TBW7MGPYURM7",),
         usaspending_recipient_names=("AXON ENTERPRISE INC", "TASER INTERNATIONAL INC"),
-        lda_client_names=("Axon Enterprise",),
+        lda_client_names=("Axon",),
+        # Anchored: a bare "axon" prefix claims AXONIUS, AXONICS
+        # MODULATION TECHNOLOGIES and AXON HOLDINGS GROUP, all of which
+        # are different companies with their own LDA registrations.
+        lda_client_patterns=(r"^axon enterprises?$",),
         name_variants=(
             "Axon Enterprise, Inc.",
             "Axon Enterprise",
@@ -271,7 +292,13 @@ SURVEILLANCE_ANCHORS: tuple[AnchorSpec, ...] = (
         # Privately held — no CIK. USAspending UEI is the authoritative key.
         usaspending_uei=("QDLLBKCGL851",),
         usaspending_recipient_names=("FLOCK GROUP INC", "FLOCK SAFETY"),
-        lda_client_names=("Flock Safety", "Flock Group"),
+        lda_client_names=("Flock",),
+        # Anchored: "flock" alone claims FLOCK HOMES, INC.
+        lda_client_patterns=(
+            r"^flock safety$",
+            r"^flock group( inc)? d b a flock safety$",
+            r"\bon behalf of flock safety$",
+        ),
         name_variants=(
             "Flock Safety",
             "Flock Group Inc",
@@ -286,7 +313,8 @@ SURVEILLANCE_ANCHORS: tuple[AnchorSpec, ...] = (
         priority_domain="surveillance",
         usaspending_uei=("E5BEYXDQYJS6",),
         usaspending_recipient_names=("CLEARVIEW AI INC",),
-        lda_client_names=("Clearview AI",),
+        lda_client_names=("Clearview",),
+        lda_client_patterns=(r"^clearview ai$",),
         name_variants=("Clearview AI", "Clearview AI, Inc.", "Clearview"),
         notes="Private (no CIK). USAspending UEI E5BEYXDQYJS6 = CLEARVIEW AI, INC.",
     ),
@@ -308,6 +336,8 @@ SURVEILLANCE_ANCHORS: tuple[AnchorSpec, ...] = (
             2106825,  # Founders Fund Growth II Management, LP
         ),
         usaspending_recipient_names=(),
+        lda_client_names=("Founders Fund",),
+        lda_client_patterns=(r"^founders fund$",),
         name_variants=("Founders Fund", "Founders Fund LLC", "FOUNDERS FUND"),
         notes=(
             "Thiel VC vehicle. No single CIK — EDGAR registers one per fund "

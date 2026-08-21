@@ -107,6 +107,22 @@ class Anchor:
         return _as_ints(self.external_ids.get("lda_client_ids"))
 
     @property
+    def lda_client_patterns(self) -> list[str]:
+        """Regexes that recognise an LDA client record as this anchor.
+
+        LDA mints a NEW ``client.id`` per (registrant, client)
+        REGISTRATION, not one per company — "Palantir" has 32 client
+        records across 13 name spellings, and filers also register a
+        wrapper string ("BROWNSTEIN HYATT … OBO PALANTIR TECHNOLOGIES
+        INC."). So a fixed id allowlist silently drops every filing made
+        after the company hires a new firm. The declared patterns are
+        matched against the NORMALIZED client name; the ids they resolve
+        to are then recorded back into ``lda_client_ids`` as the audit
+        trail. Names select; ids key.
+        """
+        return [str(v) for v in (self.external_ids.get("lda_client_patterns") or []) if v]
+
+    @property
     def lda_registrant_ids(self) -> list[int]:
         """Senate LDA registrant ids (numeric)."""
         return _as_ints(self.external_ids.get("lda_registrant_ids"))
@@ -261,18 +277,20 @@ async def anchors_for_usaspending_uei(
     return [a for a in anchors if a.usaspending_uei]
 
 
-async def anchors_for_lda_ids(
+async def anchors_for_lda_patterns(
     session: AsyncSession,
     *,
     priority_domains: Sequence[str] | None = None,
 ) -> list[Anchor]:
-    """P1.6 — anchors the id-keyed Senate LDA pass should sweep.
+    """P1.6 — anchors the pattern-gated Senate LDA pass should sweep.
 
-    Requires ``external_ids.lda_client_ids``; the name-keyed pass
-    (:func:`anchors_for_senate_lda`) stays for the older domains.
+    Requires ``external_ids.lda_client_patterns`` (see
+    :meth:`Anchor.lda_client_patterns` for why LDA needs a pattern and
+    not an id allowlist). The older substring-matched pass
+    (:func:`anchors_for_senate_lda`) stays for the pre-P1.6 domains.
     """
     anchors = await list_anchors(session, priority_domains=priority_domains)
-    return [a for a in anchors if a.lda_client_ids]
+    return [a for a in anchors if a.lda_client_patterns]
 
 
 async def anchors_for_sec_insiders(
