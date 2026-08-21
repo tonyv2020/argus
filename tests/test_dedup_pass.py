@@ -497,9 +497,9 @@ def test_postconditions_fail_if_a_node_changed_surface_mode() -> None:
 def test_projection_prune_deletes_only_what_postgres_no_longer_has() -> None:
     """project_entity/project_edge are MERGE-only, so a canonical the dedup
     pass merged away would linger in Neo4j and keep serving the duplicate.
-    The sweep must prune by "not in Postgres" — never by "not projected",
-    which would make every suppress node (deliberately unprojected) a
-    deletion target."""
+    The prune set is derived from Postgres state (live AND not suppressed) —
+    never from what a given run managed to project, or one transient Neo4j
+    error mid-sweep becomes a mass deletion."""
     from app.services.graph.neo4j_projection import Neo4jProjection
 
     ran: list[tuple[str, dict]] = []
@@ -539,3 +539,28 @@ def test_projection_prune_is_a_noop_without_a_driver() -> None:
             return False
 
     assert _Unavailable().prune_missing({"a"}, {"b"}) == (0, 0)
+
+
+def test_projection_sweep_prunes_suppressed_nodes_not_just_deleted_ones() -> None:
+    """PRIVACY (found live 2026-08-21): project_entity refuses to WRITE a
+    suppress node, but refusing to write never removed the 6,855 written
+    before the D2 gate landed — each still carrying its real
+    canonical_name as the Cypher-visible label. The sweep's prune set must
+    therefore exclude suppressed canonicals, so they get deleted."""
+    from app.models import SurfaceMode
+
+    class _Row:
+        def __init__(self, eid, mode):
+            self.id, self.surface_mode = eid, mode
+
+    entities = [
+        _Row("open1", "open"),
+        _Row("alias1", "alias"),
+        _Row("suppressed1", SurfaceMode.SUPPRESS.value),
+    ]
+    projectable = {
+        e.id for e in entities if e.surface_mode != SurfaceMode.SUPPRESS.value
+    }
+    assert projectable == {"open1", "alias1"}
+    # The suppressed id is absent, so `NOT c.pg_id IN $ids` deletes its node.
+    assert "suppressed1" not in projectable
