@@ -170,6 +170,11 @@ class Node:
     edge_count: int = 0
     alias_count: int = 0
     namespaces: frozenset[str] = frozenset()
+    #: The Senate LDA client ids this node carries. Kept separately from
+    #: ``namespaces`` because whether an LDA client id is FOREIGN depends
+    #: on the id itself, not on the namespace — see
+    #: :func:`foreign_namespaces`.
+    lda_client_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -181,6 +186,35 @@ class AnchorNode:
     entity_type: str
     variants: frozenset[str]
     client_patterns: tuple[str, ...]
+    #: LDA client ids the ingest pass resolved to this anchor and wrote
+    #: back into ``anchor_registry.external_ids.lda_client_ids``.
+    lda_client_ids: frozenset[str] = frozenset()
+
+
+def foreign_namespaces(node: Node, anchor: AnchorNode) -> frozenset[str]:
+    """Authoritative namespaces on ``node`` that name a DIFFERENT entity.
+
+    A CIK, a UEI or an FEC id on a fragment is always foreign: the
+    anchor's own were resolved before the fragment was ever considered.
+
+    ``senate_lda.client`` is the exception, and it is decided on the IDS,
+    not on the namespace. LDA mints a new client id per REGISTRATION, so
+    one company owns many — Palantir has 32 — and the ingest pass records
+    the ones its patterns resolved to. A fragment whose LDA client ids
+    are all on the anchor's list IS the anchor: that is how the four
+    wrapper client records ("BROWNSTEIN HYATT … OBO PALANTIR
+    TECHNOLOGIES INC.", "BGR GOVERNMENT AFFAIRS … ON BEHALF OF FLOCK
+    SAFETY", …) — each holding real cited `lobbies` edges to a different
+    registrant — get to rejoin the company they lobby for.
+    """
+    foreign = node.namespaces & AUTHORITATIVE_NAMESPACES
+    if (
+        "senate_lda.client" in foreign
+        and node.lda_client_ids
+        and node.lda_client_ids <= anchor.lda_client_ids
+    ):
+        foreign = foreign - {"senate_lda.client"}
+    return frozenset(foreign)
 
 
 @dataclass(frozen=True)
@@ -348,7 +382,7 @@ def build_merge_plan(
                 )
             )
             continue
-        foreign = node.namespaces & AUTHORITATIVE_NAMESPACES
+        foreign = foreign_namespaces(node, anchor)
         if foreign:
             plan.skipped.append(
                 SkippedPair(
@@ -426,14 +460,21 @@ async def _load(
     """Load the domain's anchors, every canonical, and the type pins."""
     ns_rows = (
         await session.execute(
-            select(EntityAlias.canonical_id, EntityAlias.source_system).where(
+            select(
+                EntityAlias.canonical_id,
+                EntityAlias.source_system,
+                EntityAlias.source_id,
+            ).where(
                 EntityAlias.source_system.in_(sorted(AUTHORITATIVE_NAMESPACES))
             )
         )
     ).all()
     namespaces: dict[str, set[str]] = defaultdict(set)
-    for canonical_id, source_system in ns_rows:
+    lda_ids: dict[str, set[str]] = defaultdict(set)
+    for canonical_id, source_system, source_id in ns_rows:
         namespaces[canonical_id].add(source_system)
+        if source_system == "senate_lda.client":
+            lda_ids[canonical_id].add(str(source_id))
 
     edge_counts = dict(
         (
@@ -482,6 +523,7 @@ async def _load(
             edge_count=edge_counts.get(ent.id, 0),
             alias_count=alias_counts.get(ent.id, 0),
             namespaces=frozenset(namespaces.get(ent.id, ())),
+            lda_client_ids=frozenset(lda_ids.get(ent.id, ())),
         )
 
     # Anchors for this domain, with their declared evidence.
@@ -515,9 +557,16 @@ async def _load(
             n = normalize_name(str(v))
             if n:
                 variants.add(n)
+        keyring = row.external_ids or {}
         patterns = tuple(
-            str(p) for p in ((row.external_ids or {}).get("lda_client_patterns") or [])
+            str(p) for p in (keyring.get("lda_client_patterns") or [])
         )
+        # The ids the LDA pass resolved to this anchor, PLUS whatever it
+        # already carries — a re-run before the LDA pass has recorded
+        # anything must still recognise its own aliases.
+        anchor_lda_ids = {
+            str(i) for i in (keyring.get("lda_client_ids") or [])
+        } | set(lda_ids.get(row.canonical_id, ()))
         anchors.append(
             AnchorNode(
                 label=row.label,
@@ -525,6 +574,7 @@ async def _load(
                 entity_type=row.entity_type,
                 variants=frozenset(v for v in variants if _name_is_evidence(v)),
                 client_patterns=patterns,
+                lda_client_ids=frozenset(anchor_lda_ids),
             )
         )
 

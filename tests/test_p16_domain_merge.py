@@ -21,6 +21,7 @@ from app.services.ingest.domain_merge import (
     Node,
     build_merge_plan,
     build_retype_plan,
+    foreign_namespaces,
     mergeable_types_for,
 )
 
@@ -33,6 +34,7 @@ def _node(nid, name, norm, **kw) -> Node:
         "edge_count": 1,
         "alias_count": 0,
         "namespaces": frozenset(),
+        "lda_client_ids": frozenset(),
     }
     base.update(kw)
     return Node(id=nid, name=name, norm=norm, **base)
@@ -56,6 +58,9 @@ def _palantir_anchor() -> AnchorNode:
             r"^palantir( technologies)?$",
             r"\b(obo|for) palantir technologies$",
         ),
+        # The ids the LDA ingest resolved to Palantir, including the
+        # wrapper client records.
+        lda_client_ids=frozenset({"55003", "57683", "112491", "163105"}),
     )
 
 
@@ -108,23 +113,58 @@ def test_collapses_the_lda_wrapper_client_records() -> None:
     """The LDA ingester mints one canonical per ``client.name``, and
     filers register wrapper strings. Each of these holds real cited
     ``lobbies`` edges to a DIFFERENT registrant that never reach the
-    company's profile."""
+    company's profile — and each carries the LDA client id that proves
+    it is Palantir's own registration."""
     frags = [
         _node("w1",
               "BROWNSTEIN HYATT FARBER SCHRECK LLP OBO PALANTIR TECHNOLOGIES INC.",
               "brownstein hyatt farber schreck llp obo palantir technologies",
-              edge_count=1),
+              edge_count=1,
+              namespaces=frozenset({"senate_lda.client"}),
+              lda_client_ids=frozenset({"112491"})),
         _node("w2", "J.A. GREEN AND COMPANY (FOR PALANTIR TECHNOLOGIES INC.)",
-              "j a green and company for palantir technologies", edge_count=1),
+              "j a green and company for palantir technologies", edge_count=1,
+              namespaces=frozenset({"senate_lda.client"}),
+              lda_client_ids=frozenset({"163105"})),
         _node("w3",
               "HANNEGAN LANDAU POERSCH & ROSENBAUM ADVOCACY LLC "
               "(FOR PALANTIR TECHNOLOGIES INC)",
               "hannegan landau poersch rosenbaum advocacy llc for palantir technologies",
-              edge_count=1),
+              edge_count=1,
+              namespaces=frozenset({"senate_lda.client"}),
+              lda_client_ids=frozenset({"57683"})),
     ]
     plan = _plan([_palantir_anchor()], frags)
     assert {p.fragment_id for p in plan.pairs} == {"w1", "w2", "w3"}
     assert all(p.rule == "lda_client_pattern" for p in plan.pairs)
+
+
+def test_an_lda_client_id_the_anchor_owns_is_not_foreign() -> None:
+    """Decided on the IDS, not the namespace: LDA mints a new client id
+    per REGISTRATION, so one company owns many, and the ingest pass
+    records the ones its patterns resolved to."""
+    node = _node("w1", "X", "x", namespaces=frozenset({"senate_lda.client"}),
+                 lda_client_ids=frozenset({"55003"}))
+    assert foreign_namespaces(node, _palantir_anchor()) == frozenset()
+
+
+def test_an_lda_client_id_the_anchor_does_not_own_stays_foreign() -> None:
+    """A client record belonging to some other company must not be
+    absorbed just because it is in the same namespace."""
+    node = _node("w1", "X", "x", namespaces=frozenset({"senate_lda.client"}),
+                 lda_client_ids=frozenset({"55003", "999999"}))
+    assert foreign_namespaces(node, _palantir_anchor()) == frozenset(
+        {"senate_lda.client"}
+    )
+
+
+def test_a_cik_on_a_fragment_is_always_foreign() -> None:
+    """Only LDA client ids get the id-based exception — the anchor's own
+    CIK/UEI/FEC ids were resolved before any fragment was considered."""
+    node = _node("f1", "X", "x", namespaces=frozenset({"sec.cik"}))
+    assert foreign_namespaces(node, _palantir_anchor()) == frozenset(
+        {"sec.cik"}
+    )
 
 
 def test_absorbs_a_concept_typed_company() -> None:
