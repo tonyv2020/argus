@@ -23,13 +23,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_sessionmaker
-from app.models import CanonicalEdge, CanonicalEntity, SurfaceMode
+from app.models import (
+    CanonicalEdge,
+    CanonicalEntity,
+    PublicationState,
+    SurfaceMode,
+)
 from app.services.graph.neo4j_projection import Neo4jProjection
 
 logger = logging.getLogger(__name__)
@@ -66,6 +72,36 @@ def _ensure_pg_id_index(projection: Neo4jProjection) -> None:
         )
 
 
+def projectable_entity_ids(entities: Iterable[CanonicalEntity]) -> set[str]:
+    """Canonicals Postgres says belong in Neo4j RIGHT NOW.
+
+    Two gates, both fail-closed, both mirrored in
+    :meth:`Neo4jProjection.project_entity`:
+
+    * **PRIVACY** — ``surface_mode='suppress'`` is never projected.
+    * **READ-GATE (RG1)** — ``publication_state='staged'`` is not live
+      content, so it is not projected until its batch is published.
+
+    Anything else holding a ``Canonical`` node gets pruned. Derive this
+    from Postgres state, never from what a run managed to project.
+    """
+    return {
+        e.id
+        for e in entities
+        if e.surface_mode != SurfaceMode.SUPPRESS.value
+        and e.publication_state != PublicationState.STAGED.value
+    }
+
+
+def projectable_edge_ids(edges: Iterable[CanonicalEdge]) -> set[str]:
+    """Edges Postgres says belong in Neo4j RIGHT NOW — published only."""
+    return {
+        e.id
+        for e in edges
+        if e.publication_state != PublicationState.STAGED.value
+    }
+
+
 async def project_all(session: AsyncSession, projection: Neo4jProjection) -> ProjectionStats:
     """Sweep every entity + edge into Neo4j (idempotent MERGE by pg_id)."""
     stats = ProjectionStats()
@@ -91,15 +127,13 @@ async def project_all(session: AsyncSession, projection: Neo4jProjection) -> Pro
 
     # MERGE-only projection never removes anything, so a full sweep has to
     # prune: deleted canonicals (else the P2 dedup merges are invisible here
-    # and Neo4j keeps serving the collapsed duplicates) AND suppressed ones
+    # and Neo4j keeps serving the collapsed duplicates), suppressed ones
     # (project_entity refuses to WRITE a suppress node, but that never
     # removed the ones written before the D2 gate — they kept their real
-    # names in a Cypher-reachable graph).
-    projectable = {
-        e.id for e in entities if e.surface_mode != SurfaceMode.SUPPRESS.value
-    }
+    # names in a Cypher-reachable graph), and staged ones (RG1 — an
+    # unpublished batch must not be reachable from Cypher either).
     stats.stale_nodes_pruned, stats.stale_rels_pruned = projection.prune_missing(
-        projectable, {edge.id for edge in edges}
+        projectable_entity_ids(entities), projectable_edge_ids(edges)
     )
     return stats
 
