@@ -194,3 +194,15 @@ def test_citation_existence_checks_do_not_assume_uniqueness() -> None:
     for fn in (usaspending._emit_contract_edge,):
         body = inspect.getsource(fn).split("citation_exists")[1]
         assert "scalar_one_or_none" not in body
+
+
+def test_uei_pass_retries_a_throttled_page_and_reports_abandonment() -> None:
+    """USAspending throttles a sustained sweep — on the first live run
+    three of four anchors were refused at page 1 within one second and
+    the loop abandoned them, silently reporting a partial sweep."""
+    assert "pages_abandoned" in inspect.getsource(
+        usaspending.ingest_recipient_contracts_by_uei
+    )
+    retry_src = inspect.getsource(usaspending._post_with_retry)
+    assert "asyncio.sleep" in retry_src
+    assert "2 ** attempt" in retry_src

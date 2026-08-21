@@ -680,6 +680,9 @@ class UeiContractStats:
     obligation_total: float = 0.0
     entities_staged: int = 0
     edges_staged: int = 0
+    #: Pages given up on after the retries — a NON-ZERO value means the
+    #: sweep is incomplete and the report must say so.
+    pages_abandoned: int = 0
     #: UEIs the API returned that are NOT on the anchor's allowlist —
     #: the fail-closed refusal list, so an operator can widen or not.
     foreign_ueis: dict[str, int] = field(default_factory=dict)
@@ -730,6 +733,35 @@ _UEI_AWARD_FIELDS: tuple[str, ...] = (
 )
 
 
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    path: str,
+    body: dict,
+    *,
+    attempts: int = 5,
+    base_delay: float = 3.0,
+) -> dict:
+    """POST with exponential backoff.
+
+    USAspending throttles a sustained sweep: the UEI pass fires one
+    ``spending_by_award`` POST per page plus one award-detail GET per
+    row for the net-obligation fallback, which on the first live run got
+    three of four anchors refused at page 1 within one second of each
+    other. Without a retry the anchor loop abandoned them and silently
+    reported a partial sweep.
+    """
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return await _post(client, path, body)
+        except Exception as exc:  # noqa: BLE001 — retry any transport error
+            last = exc
+            if attempt == attempts - 1:
+                break
+            await asyncio.sleep(base_delay * (2 ** attempt))
+    raise last  # type: ignore[misc]
+
+
 async def ingest_recipient_contracts_by_uei(
     *,
     ueis: tuple[str, ...],
@@ -738,6 +770,7 @@ async def ingest_recipient_contracts_by_uei(
     batch_id: str | None = None,
     max_awards: int = 500,
     stats: UeiContractStats | None = None,
+    request_delay: float = 0.15,
 ) -> UeiContractStats:
     """P1.6 — one recipient's federal contracts, keyed and VERIFIED on UEI.
 
@@ -776,13 +809,16 @@ async def ingest_recipient_contracts_by_uei(
         while remaining > 0:
             body["limit"] = min(100, remaining)
             try:
-                payload = await _post(client, "/search/spending_by_award/", body)
+                payload = await _post_with_retry(
+                    client, "/search/spending_by_award/", body
+                )
             except Exception:
                 logger.exception(
-                    "[%s] spending_by_award failed page=%s",
+                    "[%s] spending_by_award failed after retries page=%s",
                     display_label, body["page"],
                 )
                 stats.errors += 1
+                stats.pages_abandoned += 1
                 break
             rows = payload.get("results") or []
             if not rows:
@@ -810,7 +846,11 @@ async def ingest_recipient_contracts_by_uei(
                     if not agency_label:
                         continue
                     agency_key = agency_alias_source_id(agency_label)
+                    # The net-obligation fallback is one GET per award;
+                    # paced so the sweep does not trip USAspending's
+                    # throttle and lose whole pages.
                     obligation = await _award_net_obligation(client, r)
+                    await asyncio.sleep(request_delay)
                     try:
                         # SAVEPOINT per award: one bad row (a constraint
                         # violation, a truncation) must not poison the
