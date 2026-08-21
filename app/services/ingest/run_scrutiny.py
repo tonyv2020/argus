@@ -21,7 +21,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_sessionmaker
-from app.models import CanonicalEdge, CanonicalEntity, EntityType
+from app.models import CanonicalEdge, CanonicalEntity, EntityAlias, EntityType
 from app.services.graph.base import normalize_name
 from app.services.scrutiny import scrutinize_and_log
 
@@ -240,6 +240,116 @@ async def run_scrutiny_batch(batch_id: str, limit: int | None = None) -> Scrutin
     return stats
 
 
+async def run_scrutiny_members(
+    apply: bool = False, limit: int | None = None
+) -> dict:
+    """P1.5 — decide the CONGRESSIONAL ROSTER, and nothing else.
+
+    Scoped by construction to canonicals carrying a ``bioguide`` alias —
+    a sitting member of Congress — and, within those, only the ones that
+    are missing a verdict or are not currently ``open``. Nothing else in
+    the corpus is touched.
+
+    The verdict is the deterministic hard-signal path: a bioguide (or
+    ``fec.candidate``) alias classifies PUBLIC → SURFACE with no LLM
+    call and no Anthropic key. ``apply=False`` (the default) computes
+    every verdict and reports it WITHOUT writing an audit row or
+    touching ``surface_mode`` — 46 sitting members are currently
+    ``suppress`` with no recorded reason, and opening a live protection
+    is an operator decision that deserves a preview first.
+    """
+    from app.models import SurfaceMode
+    from app.services.scrutiny import ScrutinyDecisionLog, scrutinize_person
+
+    sm = get_sessionmaker()
+    out: dict = {"mode": "apply" if apply else "dry-run", "members": []}
+    async with sm() as session:
+        member_ids = [
+            r[0]
+            for r in (
+                await session.execute(
+                    select(EntityAlias.canonical_id)
+                    .where(EntityAlias.source_system == "bioguide")
+                    .distinct()
+                )
+            ).all()
+        ]
+        decided = {
+            r[0]
+            for r in (
+                await session.execute(
+                    select(ScrutinyDecisionLog.canonical_id).where(
+                        ScrutinyDecisionLog.canonical_id.in_(member_ids)
+                    )
+                )
+            ).all()
+        }
+        ents = (
+            await session.execute(
+                select(CanonicalEntity).where(CanonicalEntity.id.in_(member_ids))
+            )
+        ).scalars().all()
+    pending = [
+        e
+        for e in ents
+        if e.id not in decided or e.surface_mode != SurfaceMode.OPEN.value
+    ]
+    pending.sort(key=lambda e: e.canonical_name)
+    if limit is not None:
+        pending = pending[:limit]
+    out["members_total"] = len(ents)
+    out["members_pending"] = len(pending)
+
+    for ent in pending:
+        async with sm() as session:
+            try:
+                if apply:
+                    verdict = await scrutinize_and_log(session, ent.id)
+                    await session.commit()
+                    after = (
+                        await session.execute(
+                            select(CanonicalEntity.surface_mode).where(
+                                CanonicalEntity.id == ent.id
+                            )
+                        )
+                    ).scalar_one()
+                else:
+                    verdict = await scrutinize_person(session, ent.id)
+                    await session.rollback()
+                    after = None
+            except Exception as exc:  # noqa: BLE001
+                await session.rollback()
+                logger.exception("member scrutiny failed %s", ent.id)
+                out["members"].append(
+                    {"canonical_id": ent.id, "name": ent.canonical_name,
+                     "error": f"{type(exc).__name__}: {exc}"}
+                )
+                continue
+        out["members"].append(
+            {
+                "canonical_id": ent.id,
+                "name": ent.canonical_name,
+                "surface_mode_before": ent.surface_mode,
+                "surface_mode_after": after,
+                "classification": verdict.classification.value,
+                "decision": verdict.decision.value,
+                "decided_by": verdict.decided_by,
+                "signals": verdict.signals_used,
+            }
+        )
+    by_decision: dict[str, int] = {}
+    for row in out["members"]:
+        key = row.get("decision", "error")
+        by_decision[key] = by_decision.get(key, 0) + 1
+    out["by_decision"] = by_decision
+    # Any member the deterministic path does NOT classify public is a
+    # red flag, not a routine outcome — surface it separately.
+    out["not_classified_public"] = [
+        r for r in out["members"] if r.get("classification") != "public"
+    ]
+    return out
+
+
 def main() -> None:
     """CLI entrypoint — python -m app.services.ingest.run_scrutiny
     [--geo-only] [--batch-id ID] [--limit N]."""
@@ -255,8 +365,28 @@ def main() -> None:
              "verdict yet (the publish precondition). Never touches rows "
              "outside the batch.",
     )
+    parser.add_argument(
+        "--members",
+        action="store_true",
+        help="Decide the congressional roster only (canonicals with a "
+             "bioguide alias) — preview by default; --apply writes.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="With --members: actually write the audit rows + apply the "
+             "verdict to surface_mode.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
+    if args.members:
+        import json
+
+        report = asyncio.run(
+            run_scrutiny_members(apply=args.apply, limit=args.limit)
+        )
+        print(json.dumps(report, indent=2, default=str))
+        return
     if args.batch_id:
         stats = asyncio.run(run_scrutiny_batch(args.batch_id, limit=args.limit))
     else:

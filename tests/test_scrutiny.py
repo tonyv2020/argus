@@ -74,3 +74,22 @@ def test_scrutiny_batch_mode_is_scoped_to_the_batch() -> None:
     src = inspect.getsource(run_scrutiny_batch)
     assert "ce.batch_id = :b" in src
     assert "sd.id IS NULL" in src
+
+
+def test_member_scrutiny_is_scoped_to_the_roster_and_previews_by_default() -> None:
+    """P1.5: 46 sitting members are `suppress` with no recorded reason.
+    Opening a live protection is an operator decision, so the member
+    runner (a) only ever looks at canonicals carrying a bioguide alias,
+    and (b) computes verdicts WITHOUT writing or flipping anything
+    unless --apply is passed."""
+    import inspect
+
+    from app.services.ingest.run_scrutiny import run_scrutiny_members
+
+    src = inspect.getsource(run_scrutiny_members)
+    # Scope: the roster, nothing else.
+    assert 'EntityAlias.source_system == "bioguide"' in src
+    # Preview path uses the read-only classifier, not the logging one.
+    assert "scrutinize_person" in src
+    assert "if apply:" in src
+    assert "await session.rollback()" in src
