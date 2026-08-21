@@ -40,6 +40,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import AnchorRegistry
 
 
+def _as_ints(values) -> list[int]:
+    """Coerce a keyring list to ints, dropping anything non-numeric.
+
+    The keyring is JSONB written by seeds and by operators, so a value
+    can arrive as ``"12345"``, ``12345`` or a typo. A malformed id is
+    DROPPED rather than coerced — an ingest filter built from a bad id
+    would silently select the wrong entity.
+    """
+    out: list[int] = []
+    for v in values or []:
+        if v is None:
+            continue
+        try:
+            out.append(int(str(v).strip()))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 @dataclass(frozen=True)
 class Anchor:
     """A resolved anchor row — a plain read-model over :class:`AnchorRegistry`.
@@ -58,9 +77,57 @@ class Anchor:
     usaspending_recipient_names: list[str] = field(default_factory=list)
     lda_client_names: list[str] = field(default_factory=list)
     name_variants: list[str] = field(default_factory=list)
+    #: P1.6 external-ID keyring (see ``AnchorRegistry.external_ids``).
+    #: ``usaspending_uei`` / ``lda_client_ids`` / ``lda_registrant_ids`` /
+    #: ``sec_ciks`` / ``sec_owner_cik``.
+    external_ids: dict = field(default_factory=dict)
     surface_mode: str = "open"
     canonical_id: str | None = None
     notes: str | None = None
+
+    # ── typed accessors over the keyring ────────────────────────────
+    #
+    # Every accessor NORMALIZES and DROPS malformed values rather than
+    # passing them through: a bad id in the keyring must not become a
+    # silently-wrong ingest filter.
+
+    @property
+    def usaspending_uei(self) -> list[str]:
+        """Recipient UEIs — uppercased, 12-char alphanumeric only."""
+        out = []
+        for v in self.external_ids.get("usaspending_uei") or []:
+            u = str(v).strip().upper()
+            if len(u) == 12 and u.isalnum():
+                out.append(u)
+        return out
+
+    @property
+    def lda_client_ids(self) -> list[int]:
+        """Senate LDA client ids (numeric)."""
+        return _as_ints(self.external_ids.get("lda_client_ids"))
+
+    @property
+    def lda_registrant_ids(self) -> list[int]:
+        """Senate LDA registrant ids (numeric)."""
+        return _as_ints(self.external_ids.get("lda_registrant_ids"))
+
+    @property
+    def sec_ciks(self) -> list[int]:
+        """Every issuer CIK for this anchor — the typed ``sec_cik``
+        column first, then any secondaries in the keyring, deduped."""
+        out: list[int] = []
+        if self.sec_cik is not None:
+            out.append(int(self.sec_cik))
+        for cik in _as_ints(self.external_ids.get("sec_ciks")):
+            if cik not in out:
+                out.append(cik)
+        return out
+
+    @property
+    def sec_owner_cik(self) -> int | None:
+        """Form 3/4/5 reporting-owner CIK — PERSON anchors only."""
+        vals = _as_ints([self.external_ids.get("sec_owner_cik")])
+        return vals[0] if vals else None
 
     @classmethod
     def from_row(cls, row: AnchorRegistry) -> "Anchor":
@@ -76,6 +143,10 @@ class Anchor:
             ),
             lda_client_names=list(row.lda_client_names or []),
             name_variants=list(row.name_variants or []),
+            # ``getattr`` for the same reason the lists use ``or []``:
+            # this read model is also built from hand-rolled row
+            # objects in tests and from pre-migration rows.
+            external_ids=dict(getattr(row, "external_ids", None) or {}),
             surface_mode=row.surface_mode,
             canonical_id=row.canonical_id,
             notes=row.notes,
@@ -174,6 +245,51 @@ async def anchors_for_senate_lda(
     return [a for a in anchors if a.lda_client_names]
 
 
+async def anchors_for_usaspending_uei(
+    session: AsyncSession,
+    *,
+    priority_domains: Sequence[str] | None = None,
+) -> list[Anchor]:
+    """P1.6 — anchors the UEI-keyed USAspending pass should sweep.
+
+    Distinct from :func:`anchors_for_usaspending`, which sweeps on
+    ``usaspending_recipient_names`` (a fuzzy search string). This one
+    requires a real recipient UEI, so the pass can verify every award
+    row it accepts against an external id.
+    """
+    anchors = await list_anchors(session, priority_domains=priority_domains)
+    return [a for a in anchors if a.usaspending_uei]
+
+
+async def anchors_for_lda_ids(
+    session: AsyncSession,
+    *,
+    priority_domains: Sequence[str] | None = None,
+) -> list[Anchor]:
+    """P1.6 — anchors the id-keyed Senate LDA pass should sweep.
+
+    Requires ``external_ids.lda_client_ids``; the name-keyed pass
+    (:func:`anchors_for_senate_lda`) stays for the older domains.
+    """
+    anchors = await list_anchors(session, priority_domains=priority_domains)
+    return [a for a in anchors if a.lda_client_ids]
+
+
+async def anchors_for_sec_insiders(
+    session: AsyncSession,
+    *,
+    priority_domains: Sequence[str] | None = None,
+) -> list[Anchor]:
+    """P1.6 — anchors whose SEC Form 3/4/5 insiders should be ingested.
+
+    Any anchor with at least one issuer CIK qualifies; the pass reads
+    the issuer's ownership filings and emits officer/director edges
+    keyed on (issuer CIK, reporting-owner CIK).
+    """
+    anchors = await list_anchors(session, priority_domains=priority_domains)
+    return [a for a in anchors if a.sec_ciks]
+
+
 async def anchors_for_sec_edgar(
     session: AsyncSession,
     *,
@@ -197,6 +313,7 @@ async def upsert_anchor(
     usaspending_recipient_names: Iterable[str] = (),
     lda_client_names: Iterable[str] = (),
     name_variants: Iterable[str] = (),
+    external_ids: dict | None = None,
     surface_mode: str = "open",
     canonical_id: str | None = None,
     notes: str | None = None,
@@ -227,6 +344,7 @@ async def upsert_anchor(
             usaspending_recipient_names=list(usaspending_recipient_names),
             lda_client_names=list(lda_client_names),
             name_variants=list(name_variants),
+            external_ids=dict(external_ids or {}),
             surface_mode=surface_mode,
             canonical_id=canonical_id,
             notes=notes,
@@ -242,6 +360,7 @@ async def upsert_anchor(
     existing.usaspending_recipient_names = list(usaspending_recipient_names)
     existing.lda_client_names = list(lda_client_names)
     existing.name_variants = list(name_variants)
+    existing.external_ids = dict(external_ids or {})
     existing.surface_mode = surface_mode
     existing.canonical_id = canonical_id
     existing.notes = notes

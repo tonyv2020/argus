@@ -421,6 +421,22 @@ class AnchorRegistry(Base):
     name_variants: Mapped[list] = mapped_column(
         JSONB, nullable=False, server_default=func.jsonb_build_array()
     )
+    # P1.6 (2026-08-21) — the external-ID keyring. One JSONB map rather
+    # than a typed column per source, so anchoring a new domain against a
+    # new authority is a data edit. Known keys:
+    #   usaspending_uei      list[str]  — recipient UEI (the real key;
+    #                                     ``usaspending_recipient_names``
+    #                                     is only a fuzzy search string)
+    #   lda_client_ids       list[int]  — Senate LDA client ids
+    #   lda_registrant_ids   list[int]  — Senate LDA registrant ids
+    #   sec_ciks             list[int]  — secondary issuer CIKs beyond
+    #                                     ``sec_cik`` (e.g. subsidiaries)
+    #   sec_owner_cik        int        — Form 3/4/5 reporting-owner CIK
+    #                                     for a PERSON anchor
+    # See migration 0010_anchor_external_ids.
+    external_ids: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
     surface_mode: Mapped[str] = mapped_column(
         Text, nullable=False, server_default="open"
     )
