@@ -489,3 +489,53 @@ def test_postconditions_fail_if_a_node_changed_surface_mode() -> None:
         "scrutiny": {"total": 50, "by_surface_mode": {}},
     }
     assert _check_postconditions(before, after)["all_passed"] is False
+
+
+# ─── Neo4j projection prune (post-merge staleness) ──────────────────────
+
+
+def test_projection_prune_deletes_only_what_postgres_no_longer_has() -> None:
+    """project_entity/project_edge are MERGE-only, so a canonical the dedup
+    pass merged away would linger in Neo4j and keep serving the duplicate.
+    The sweep must prune by "not in Postgres" — never by "not projected",
+    which would make every suppress node (deliberately unprojected) a
+    deletion target."""
+    from app.services.graph.neo4j_projection import Neo4jProjection
+
+    ran: list[tuple[str, dict]] = []
+
+    class _FakeProjection(Neo4jProjection):
+        def __init__(self):  # noqa: D107 - test double
+            pass
+
+        @property
+        def available(self) -> bool:
+            return True
+
+        def _run(self, cypher, **params):
+            ran.append((cypher, params))
+            return [{"n": 7}]
+
+    nodes, rels = _FakeProjection().prune_missing({"keep"}, {"e1"})
+    assert (nodes, rels) == (7, 7)
+
+    rel_cypher, rel_params = ran[0]
+    node_cypher, node_params = ran[1]
+    assert "NOT r.pg_id IN $ids" in rel_cypher and rel_params["ids"] == ["e1"]
+    assert "NOT c.pg_id IN $ids" in node_cypher and node_params["ids"] == ["keep"]
+    # Relationships first, then DETACH DELETE the nodes.
+    assert "DETACH DELETE" in node_cypher
+
+
+def test_projection_prune_is_a_noop_without_a_driver() -> None:
+    from app.services.graph.neo4j_projection import Neo4jProjection
+
+    class _Unavailable(Neo4jProjection):
+        def __init__(self):  # noqa: D107 - test double
+            pass
+
+        @property
+        def available(self) -> bool:
+            return False
+
+    assert _Unavailable().prune_missing({"a"}, {"b"}) == (0, 0)

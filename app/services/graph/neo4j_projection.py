@@ -116,6 +116,44 @@ class Neo4jProjection:
         session.add(canonical)
         return True
 
+    def prune_missing(
+        self, live_entity_ids: set[str], live_edge_ids: set[str]
+    ) -> tuple[int, int]:
+        """Delete projected nodes/relationships that no longer exist in
+        Postgres. Returns ``(nodes_deleted, rels_deleted)``.
+
+        ``project_entity``/``project_edge`` are MERGE-only, so a canonical
+        the P2 dedup pass merged away lingers in Neo4j forever with its old
+        relationships — the projection would keep serving the duplicates the
+        merge just collapsed. A full sweep must therefore prune as well as
+        upsert.
+
+        Note the privacy interaction: a ``suppress`` canonical is
+        deliberately never projected, so it is absent from Neo4j and simply
+        never matches anything here. Passing the full live id set (rather
+        than only the projected ones) is what keeps that true — pruning is
+        driven by "not in Postgres", never by "not projected".
+        """
+        if not self.available:
+            return 0, 0
+        rels = self._run(
+            "MATCH ()-[r:REL]->() WHERE NOT r.pg_id IN $ids "
+            "DELETE r RETURN count(r) AS n",
+            ids=list(live_edge_ids),
+        )
+        nodes = self._run(
+            "MATCH (c:Canonical) WHERE NOT c.pg_id IN $ids "
+            "DETACH DELETE c RETURN count(c) AS n",
+            ids=list(live_entity_ids),
+        )
+        n_rels = rels[0]["n"] if rels else 0
+        n_nodes = nodes[0]["n"] if nodes else 0
+        logger.info(
+            "neo4j prune: deleted %d stale relationships + %d stale nodes",
+            n_rels, n_nodes,
+        )
+        return n_nodes, n_rels
+
     async def project_edge(self, session: AsyncSession, edge: CanonicalEdge) -> bool:
         """MERGE a canonical edge — gated on the edge having ≥1 SourceCitation."""
         if not self.available:

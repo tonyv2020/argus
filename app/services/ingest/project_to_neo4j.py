@@ -2,6 +2,11 @@
 
 Idempotent: MERGE on pg_id. Skips edges without ≥1 SourceCitation (defense-in-depth
 citation gate). Stamps `projected_at` on success.
+
+The sweep also PRUNES (P2, 2026-08-21): projection is MERGE-only, so a
+canonical deleted in Postgres — by the dedup/merge pass, say — would linger
+in Neo4j with its old relationships and the projection would keep serving
+duplicates the merge had already collapsed.
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ class ProjectionStats:
     edges_projected: int = 0
     edges_skipped_no_citation: int = 0
     edges_failed: int = 0
+    stale_nodes_pruned: int = 0
+    stale_rels_pruned: int = 0
 
 
 def _ensure_pg_id_index(projection: Neo4jProjection) -> None:
@@ -71,6 +78,13 @@ async def project_all(session: AsyncSession, projection: Neo4jProjection) -> Pro
             # Distinguish citation-gate skip from actual failure via a follow-up read.
             stats.edges_skipped_no_citation += 1
     await session.commit()
+
+    # MERGE-only projection leaves deleted canonicals behind forever, so a
+    # full sweep has to prune too — otherwise the P2 dedup merges are
+    # invisible here and Neo4j keeps serving the collapsed duplicates.
+    stats.stale_nodes_pruned, stats.stale_rels_pruned = projection.prune_missing(
+        {e.id for e in entities}, {edge.id for edge in edges}
+    )
     return stats
 
 
