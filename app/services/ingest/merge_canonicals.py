@@ -44,7 +44,10 @@ MERGE IS FK-REMAP + AGGREGATE:
     naive UPDATE otherwise).
   * ``anchor_registry``: re-point ``canonical_id`` FK.
   * ``scrutiny_decisions`` + ``alias_crosswalk`` FROM/TO id
-    references: repoint.
+    references: repoint. The scrutiny repoint is PRIVACY-CRITICAL and
+    verified — its FK is ON DELETE CASCADE, so a drop canonical that
+    still owns audit rows would have them destroyed. The merge is
+    REFUSED (``ScrutinyRepointFailed``) rather than losing them.
   * ``source_citations``: NOT touched directly — they follow their
     edges (either re-parented above or attached to a surviving edge).
   * DELETE the drop canonical last.
@@ -60,7 +63,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_sessionmaker
@@ -72,8 +75,20 @@ from app.models import (
     EntityAlias,
     SourceCitation,
 )
+from app.services.scrutiny import ScrutinyDecisionLog
 
 logger = logging.getLogger(__name__)
+
+
+class ScrutinyRepointFailed(RuntimeError):
+    """A merge could not move the drop canonical's privacy-audit rows.
+
+    Raised instead of returning, so the caller's ``except`` → ``rollback``
+    aborts the whole merge. Deleting a canonical that still owns
+    ``scrutiny_decisions`` rows would cascade the audit trail away — for a
+    ``suppress``/``alias`` node that is a privacy incident, not a data-quality
+    nit, so it fails the merge rather than degrading it.
+    """
 
 
 _SURFACE_MODE_STRICTNESS = {"open": 0, "alias": 1, "suppress": 2}
@@ -89,6 +104,7 @@ class MergeStats:
     aliases_repointed: int = 0
     aliases_dropped_duplicate: int = 0
     anchors_repointed: int = 0
+    scrutiny_repointed: int = 0
     survivor_id: str = ""
     dropped_id: str = ""
     refused: bool = False
@@ -260,19 +276,43 @@ async def merge_two_canonicals(
             .values(to_id=keep_id)
         )
     )
-    # scrutiny_decisions: not always present in every schema — do a
-    # best-effort raw UPDATE that no-ops if the table isn't there.
-    try:
-        from app.models import ScrutinyDecision
-        _ = (
-            await session.execute(
-                update(ScrutinyDecision)
-                .where(ScrutinyDecision.canonical_id == drop_id)
-                .values(canonical_id=keep_id)
-            )
+    # ── 5b. scrutiny_decisions — PRIVACY-CRITICAL repoint ───────────────
+    #
+    # ``scrutiny_decisions.canonical_id`` is ON DELETE CASCADE, so deleting
+    # the drop canonical DESTROYS its privacy-audit trail. This used to be a
+    # best-effort `from app.models import ScrutinyDecision` inside a bare
+    # `except ImportError: pass` — and it never once ran: the ORM model is
+    # ``ScrutinyDecisionLog`` in ``app.services.scrutiny``, while
+    # ``ScrutinyDecision`` is a StrEnum in that same module (so even the
+    # "obvious" import fix would have bound the enum and blown up on
+    # ``.canonical_id``). Every merge before this fix silently cascade-deleted
+    # the scrutiny rows of the node it dropped. Import it for real, repoint,
+    # and REFUSE the merge if anything is still attached to the drop
+    # canonical when we get to the delete.
+    stats.scrutiny_repointed = (
+        await session.execute(
+            update(ScrutinyDecisionLog)
+            .where(ScrutinyDecisionLog.canonical_id == drop_id)
+            .values(canonical_id=keep_id)
         )
-    except ImportError:
-        pass
+    ).rowcount or 0
+    await session.flush()
+
+    stranded = (
+        await session.execute(
+            select(func.count())
+            .select_from(ScrutinyDecisionLog)
+            .where(ScrutinyDecisionLog.canonical_id == drop_id)
+        )
+    ).scalar_one()
+    if stranded:
+        stats.refused = True
+        stats.refused_reason = (
+            f"privacy: {stranded} scrutiny_decisions row(s) still attached to "
+            f"drop={drop_id}; deleting it would cascade away the audit trail"
+        )
+        logger.error("merge_two_canonicals REFUSED: %s", stats.refused_reason)
+        raise ScrutinyRepointFailed(stats.refused_reason)
 
     # ── 6. Delete drop canonical (edges/citations already re-parented) ─
     await session.delete(drop)
@@ -281,11 +321,12 @@ async def merge_two_canonicals(
     logger.info(
         "merge_two_canonicals: keep=%s drop=%s edges_repointed=%d "
         "collided_summed=%d citations_reparented=%d "
-        "aliases_repointed=%d aliases_dropped=%d anchors=%d",
+        "aliases_repointed=%d aliases_dropped=%d anchors=%d scrutiny=%d",
         keep_id, drop_id,
         stats.edges_repointed, stats.edges_collided_summed,
         stats.citations_reparented, stats.aliases_repointed,
         stats.aliases_dropped_duplicate, stats.anchors_repointed,
+        stats.scrutiny_repointed,
     )
     return stats
 

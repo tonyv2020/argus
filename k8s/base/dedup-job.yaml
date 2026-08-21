@@ -1,0 +1,103 @@
+# P2 dedup/merge pass — the DRY-RUN job and the (suspended) LIVE job.
+#
+# Everything in the argus DB is publication_state=published, so a merge
+# touches LIVE public data. The dry-run job below is read-only: it opens its
+# transaction with `SET TRANSACTION READ ONLY`, so any stray write raises
+# 25006 instead of mutating the corpus.
+#
+# A Job's pod template is immutable, so pin the image at apply time rather
+# than editing a live Job:
+#
+#   TAG=p2-dedup-$(git rev-parse --short=12 HEAD)
+#   sed "s|argus/api:latest|argus/api:${TAG}|" k8s/base/dedup-job.yaml \
+#     | kubectl -n argus apply -f -
+#   kubectl -n argus logs job/argus-dedup-dryrun -f
+#
+# The LIVE job is `suspend: true`. It only runs after helen reviews the
+# dry-run report and green-lights it:
+#
+#   kubectl -n argus patch job argus-dedup-apply \
+#     --type=merge -p '{"spec":{"suspend":false}}'
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-dedup-dryrun
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: dedup-dryrun
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: dedup-dryrun
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: dedup
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.dedup_pass
+            - --dry-run
+            # Preview only — `vector` is not in --rules, so every pgvector
+            # candidate lands on the review list rather than being merged.
+            - --enable-vector
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "200m"
+            limits:
+              # The plan holds 65k entities + 24k edges in RAM; the pgvector
+              # preview streams a lateral top-K over 56k embeddings.
+              memory: "4Gi"
+              cpu: "1000m"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-dedup-apply
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: dedup-apply
+spec:
+  # DESTRUCTIVE — stays suspended until helen green-lights the dry-run.
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 5400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: dedup-apply
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: dedup
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.dedup_pass
+            - --apply
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "200m"
+            limits:
+              memory: "4Gi"
+              cpu: "1000m"

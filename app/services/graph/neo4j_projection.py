@@ -116,6 +116,52 @@ class Neo4jProjection:
         session.add(canonical)
         return True
 
+    def prune_missing(
+        self, projectable_entity_ids: set[str], live_edge_ids: set[str]
+    ) -> tuple[int, int]:
+        """Delete every projected node/relationship that Postgres says should
+        NOT be there. Returns ``(nodes_deleted, rels_deleted)``.
+
+        ``projectable_entity_ids`` is the set of canonicals Postgres says are
+        projectable RIGHT NOW — live, and ``surface_mode != 'suppress'``.
+        Anything else with a ``Canonical`` node is deleted. That covers two
+        distinct failures, both caused by projection being MERGE-only:
+
+        * **Deleted canonicals.** One the P2 dedup pass merged away lingers
+          forever with its old relationships, so the projection keeps
+          serving duplicates the merge already collapsed.
+        * **Suppressed canonicals — PRIVACY.** ``project_entity`` refuses to
+          project a ``suppress`` node (D2, 2026-08-05), but refusing to
+          WRITE never removes what an earlier sweep already wrote. Every
+          suppress canonical projected before that gate landed still carried
+          its real ``canonical_name`` as ``c.label``, reachable from Cypher
+          — 6,855 of them, found 2026-08-21. Deleting is the only thing that
+          closes it.
+
+        Derive the set from Postgres state, NEVER from "what this run
+        managed to project" — a transient Neo4j error mid-sweep would
+        otherwise turn into a mass deletion.
+        """
+        if not self.available:
+            return 0, 0
+        rels = self._run(
+            "MATCH ()-[r:REL]->() WHERE NOT r.pg_id IN $ids "
+            "DELETE r RETURN count(r) AS n",
+            ids=list(live_edge_ids),
+        )
+        nodes = self._run(
+            "MATCH (c:Canonical) WHERE NOT c.pg_id IN $ids "
+            "DETACH DELETE c RETURN count(c) AS n",
+            ids=list(projectable_entity_ids),
+        )
+        n_rels = rels[0]["n"] if rels else 0
+        n_nodes = nodes[0]["n"] if nodes else 0
+        logger.info(
+            "neo4j prune: deleted %d stale relationships + %d stale nodes",
+            n_rels, n_nodes,
+        )
+        return n_nodes, n_rels
+
     async def project_edge(self, session: AsyncSession, edge: CanonicalEdge) -> bool:
         """MERGE a canonical edge — gated on the edge having ≥1 SourceCitation."""
         if not self.available:
