@@ -133,6 +133,7 @@ python -m app.services.ingest.sec_insiders    --priority-domain surveillance --b
 python -m app.services.ingest.domain_sources  --domain surveillance --batch-id p16-...
 python -m app.services.ingest.fec_individual  --donor thiel --batch-id p16-...
 python -m app.services.ingest.domain_merge    --domain surveillance --dry-run   # --apply writes
+python -m app.services.ingest.fec_individual  --donor thiel --repair            # --apply writes
 kubectl -n argus apply -f k8s/base/p16-domain-job.yaml                          # see header
 ```
 
@@ -196,6 +197,27 @@ inflates the edge weight the way the pre-P1.6 emitter did.
 
 `DonorIdentity` is data — P1.7 adds Musk as one entry plus a person
 anchor, with no code change.
+
+### `--repair`: undoing the pre-P1.6 emitter
+
+The predecessor (`fec.ingest_individual_contributor`) added a
+`SourceCitation` unconditionally on every run **and** re-added the amount
+to the edge weight, so the published figures were inflated by the number
+of times the ingest had run — Peter Thiel's Saving Arizona PAC edge read
+**$140,000,000** against a true $20,000,000, and across his 62 edges
+$270,902,324 of weight was backed by 1,354 citation rows covering only
+220 distinct transactions. It also used the fuzzy name search, so some
+of those transactions belonged to other, private people.
+
+`--repair` rebuilds a donor's contribution edges from the identity
+predicate: keep one citation per accepted transaction, drop duplicates,
+drop memo rows, drop mis-attributed rows, recompute the weight from what
+remains, and **delete** an edge left with nothing to cite so the
+0-uncited invariant holds. Every row id is chosen at plan time, so the
+dry-run preview and the apply cannot diverge, and an edge carrying a
+`sub_id` the sweep never saw is **deferred whole** rather than rewritten
+on a guess. Dry-run is the default and opens `SET TRANSACTION READ ONLY`;
+it touches published rows, so `--apply` is an operator decision.
 
 ### Read-gate + fail-closed
 
