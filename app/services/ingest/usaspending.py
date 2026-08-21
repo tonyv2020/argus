@@ -11,6 +11,7 @@ Every edge carries a `SourceCitation` to the USAspending award-detail URL.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass, field
 
@@ -357,15 +358,19 @@ async def _emit_contract_edge(
     # Per-award idempotency: (edge_id, kind, award_id) is the unique
     # identity of "this award has been counted on this edge". Repeat
     # runs of the same ingest hit this branch and become no-ops.
+    # EXISTENCE check, never ``scalar_one_or_none``: there is no unique
+    # index on (edge_id, kind, citation_ref), and the pre-Stage-2 emitter
+    # added a citation row on every run, so historical edges genuinely
+    # carry the same award id more than once.
     citation_exists = (
         await session.execute(
-            select(SourceCitation).where(
+            select(SourceCitation.id).where(
                 SourceCitation.edge_id == edge.id,
                 SourceCitation.kind == SourceKind.USASPENDING_AWARD.value,
                 SourceCitation.citation_ref == award_id,
-            )
+            ).limit(1)
         )
-    ).scalar_one_or_none()
+    ).first()
     if citation_exists is None:
         edge.weight = float((edge.weight or 0.0) + float(amount or 0.0))
         session.add(
@@ -684,6 +689,30 @@ class UeiContractStats:
     errors: int = 0
 
 
+#: ``entity_aliases.source_id`` is VARCHAR(64). USAspending sub-agency
+#: names blow through that — "BUREAU OF ALCOHOL, TOBACCO, FIREARMS AND
+#: EXPLOSIVES ACQUISITION AND PROPERTY MANAGEMENT DIVISION" is 96 chars,
+#: and inserting it raised StringDataRightTruncation, which poisoned the
+#: page's transaction and lost 436 awards on the first live run.
+_ALIAS_SOURCE_ID_MAX = 64
+
+
+def agency_alias_source_id(agency_label: str) -> str:
+    """Stable, bounded ``entity_aliases.source_id`` for an agency.
+
+    Short names keep their exact uppercase form, so every alias written
+    before this existed still resolves. A long name is truncated and
+    suffixed with a digest of the FULL name, which keeps the key unique
+    (two sub-agencies sharing a 47-char prefix are common) and stable
+    across runs.
+    """
+    key = (agency_label or "").strip().upper()
+    if len(key) <= _ALIAS_SOURCE_ID_MAX:
+        return key
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    return f"{key[:_ALIAS_SOURCE_ID_MAX - len(digest) - 1]}:{digest}"
+
+
 #: ``spending_by_award`` fields the UEI pass requests. ``Recipient UEI``
 #: is the whole point: it lets the pass VERIFY every row it accepts
 #: against the anchor's declared external id rather than trusting the
@@ -780,36 +809,42 @@ async def ingest_recipient_contracts_by_uei(
                     agency_label = sub_agency or top_agency
                     if not agency_label:
                         continue
+                    agency_key = agency_alias_source_id(agency_label)
+                    obligation = await _award_net_obligation(client, r)
                     try:
-                        before_agency = (
-                            await session.execute(
-                                select(EntityAlias).where(
-                                    EntityAlias.source_system == "usaspending.agency",
-                                    EntityAlias.source_id == agency_label.upper(),
+                        # SAVEPOINT per award: one bad row (a constraint
+                        # violation, a truncation) must not poison the
+                        # page's transaction and lose every award after it.
+                        async with session.begin_nested():
+                            before_agency = (
+                                await session.execute(
+                                    select(EntityAlias.id).where(
+                                        EntityAlias.source_system
+                                        == "usaspending.agency",
+                                        EntityAlias.source_id == agency_key,
+                                    ).limit(1)
                                 )
+                            ).first()
+                            agency_canonical = await _find_or_create_canonical(
+                                session,
+                                agency_label.title(),
+                                EntityType.AGENCY.value,
+                                "usaspending.agency",
+                                agency_key,
+                                batch_id=batch_id,
                             )
-                        ).scalar_one_or_none()
-                        agency_canonical = await _find_or_create_canonical(
-                            session,
-                            agency_label.title(),
-                            EntityType.AGENCY.value,
-                            "usaspending.agency",
-                            agency_label.upper(),
-                            batch_id=batch_id,
-                        )
-                        if before_agency is None:
-                            stats.agencies_created += 1
-                            if batch_id:
-                                stats.entities_staged += 1
-                        obligation = await _award_net_obligation(client, r)
-                        edge_id, reused = await _emit_contract_edge(
-                            session,
-                            recipient_canonical,
-                            agency_canonical,
-                            obligation,
-                            str(award_id),
-                            batch_id=batch_id,
-                        )
+                            if before_agency is None:
+                                stats.agencies_created += 1
+                                if batch_id:
+                                    stats.entities_staged += 1
+                            _, reused = await _emit_contract_edge(
+                                session,
+                                recipient_canonical,
+                                agency_canonical,
+                                obligation,
+                                str(award_id),
+                                batch_id=batch_id,
+                            )
                         if reused:
                             stats.edges_reused += 1
                         else:
@@ -825,7 +860,6 @@ async def ingest_recipient_contracts_by_uei(
                         )
                         bucket["awards"] += 1
                         bucket["obligated"] += float(obligation or 0.0)
-                        del edge_id
                     except Exception:
                         logger.exception(
                             "[%s] award failed id=%s", display_label, award_id
@@ -842,9 +876,10 @@ async def ingest_recipient_contracts_by_uei(
                 break
             body["page"] += 1
 
-    stats.by_agency.extend(
-        sorted(per_agency.values(), key=lambda a: -a["obligated"])
-    )
+    stats.by_agency.extend(per_agency.values())
+    # Re-sort the COMBINED table: each anchor extends the same list, so
+    # sorting only its own slice leaves the report unordered overall.
+    stats.by_agency.sort(key=lambda a: -a["obligated"])
     return stats
 
 

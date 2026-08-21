@@ -220,3 +220,67 @@ def test_citation_url_points_at_the_public_transaction() -> None:
     url = contribution_citation_url("C00777185", "4082220221234567890")
     assert url.startswith("https://www.fec.gov/data/receipts/")
     assert "C00777185" in url and "4082220221234567890" in url
+
+
+# ─── repair of the pre-P1.6 emitter's damage ────────────────────────────
+
+
+def test_repair_keeps_one_citation_per_accepted_transaction() -> None:
+    """The pre-P1.6 emitter added a citation row on EVERY run and
+    re-added the amount to the weight, so live edges carry the same
+    ``sub_id`` up to seven times and Thiel's published Saving Arizona
+    figure reads $140,000,000 against a true $20,000,000."""
+    from app.services.ingest.fec_individual import EdgeRepair
+
+    repair = EdgeRepair(
+        edge_id="e1", committee="SAVING ARIZONA PAC",
+        old_weight=140_000_000.0, new_weight=20_000_000.0,
+        citations_before=35, duplicate_citations_removed=30,
+        memo_citations_removed=0, refused_citations_removed=0,
+        citations_after=5, delete_edge=False, publication_state="published",
+        keep_citation_ids=("a", "b", "c", "d", "e"),
+        drop_citation_ids=tuple(f"d{i}" for i in range(30)),
+    )
+    assert repair.citations_after == len(repair.keep_citation_ids)
+    assert (
+        repair.citations_before
+        == len(repair.keep_citation_ids) + len(repair.drop_citation_ids)
+    )
+    # The report must not leak row ids into the operator's JSON.
+    assert "keep_citation_ids" not in repair.to_dict()
+    assert repair.to_dict()["new_weight"] == 20_000_000.0
+
+
+def test_repair_row_ids_are_decided_at_plan_time() -> None:
+    """The dry-run preview and the apply must not be able to diverge —
+    the apply replays ids the PLAN chose, it does not re-decide."""
+    import inspect
+
+    from app.services.ingest import fec_individual
+
+    src = inspect.getsource(fec_individual.apply_repair)
+    assert "repair.drop_citation_ids" in src
+    assert "check_identity" not in src, (
+        "apply must not re-run the predicate; it replays the plan"
+    )
+
+
+def test_citation_existence_check_does_not_assume_uniqueness() -> None:
+    """There is no unique index on (edge_id, citation_ref), and live
+    edges genuinely carry duplicates. `scalar_one_or_none` here raised
+    MultipleResultsFound on 51 of Thiel's 83 accepted rows."""
+    import inspect
+
+    from app.services.ingest import fec_individual
+
+    src = inspect.getsource(fec_individual._citation_exists)
+    body = src.split('"""')[-1]  # the docstring names the bug it fixes
+    assert "scalar_one_or_none" not in body
+    assert ".limit(1)" in body
+
+
+def test_sweep_covers_enough_cycles_to_classify_old_citations() -> None:
+    """The repair DEFERS any edge carrying a sub_id the sweep never saw,
+    so the period list has to reach back past the oldest citation on the
+    donor's edges rather than just the recent cycles."""
+    assert min(THIEL.two_year_periods) <= 2010

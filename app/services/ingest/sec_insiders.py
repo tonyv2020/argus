@@ -426,14 +426,16 @@ async def _emit_position_edge(
         if str(filing["date"]) >= str(stored.get("latest_filing_date") or ""):
             edge.edge_metadata = metadata
 
+    # EXISTENCE check, never ``scalar_one_or_none`` — there is no unique
+    # index on (edge_id, citation_ref).
     already = (
         await session.execute(
-            select(SourceCitation).where(
+            select(SourceCitation.id).where(
                 SourceCitation.edge_id == edge.id,
                 SourceCitation.citation_ref == filing["accession"],
-            )
+            ).limit(1)
         )
-    ).scalar_one_or_none()
+    ).first()
     if already is not None:
         stats.citations_skipped_already_cited += 1
         return
@@ -523,42 +525,45 @@ async def ingest_issuer_insiders(
                         stats.ten_percent_only_skipped += 1
                         continue
                     try:
-                        owner_canonical = await _resolve_owner_canonical(
-                            session, owner, batch_id=batch_id, stats=stats
-                        )
-                        if await attach_alias(
-                            session,
-                            owner_canonical,
-                            SEC_OWNER_NAMESPACE,
-                            owner.cik,
-                            owner.name,
-                            kind_hint="person",
-                            stats=stats,
-                            label=owner.name,
-                        ):
-                            stats.owner_aliases_created += 1
-                        # Hard scrutiny signal — a filed director/officer.
-                        if await attach_alias(
-                            session,
-                            owner_canonical,
-                            OFFICER_SIGNAL_NAMESPACE,
-                            f"{cik10}:{owner.cik}",
-                            owner.name,
-                            kind_hint="person",
-                            stats=stats,
-                            label=owner.name,
-                        ):
-                            stats.officer_signal_aliases_created += 1
-                        await _emit_position_edge(
-                            session,
-                            owner_canonical=owner_canonical,
-                            issuer_canonical=issuer_canonical,
-                            owner=owner,
-                            issuer_cik=cik10,
-                            filing=filing,
-                            batch_id=batch_id,
-                            stats=stats,
-                        )
+                        # SAVEPOINT per owner: one bad row must not
+                        # poison the transaction for the whole issuer.
+                        async with session.begin_nested():
+                            owner_canonical = await _resolve_owner_canonical(
+                                session, owner, batch_id=batch_id, stats=stats
+                            )
+                            if await attach_alias(
+                                session,
+                                owner_canonical,
+                                SEC_OWNER_NAMESPACE,
+                                owner.cik,
+                                owner.name,
+                                kind_hint="person",
+                                stats=stats,
+                                label=owner.name,
+                            ):
+                                stats.owner_aliases_created += 1
+                            # Hard scrutiny signal — a filed director/officer.
+                            if await attach_alias(
+                                session,
+                                owner_canonical,
+                                OFFICER_SIGNAL_NAMESPACE,
+                                f"{cik10}:{owner.cik}",
+                                owner.name,
+                                kind_hint="person",
+                                stats=stats,
+                                label=owner.name,
+                            ):
+                                stats.officer_signal_aliases_created += 1
+                            await _emit_position_edge(
+                                session,
+                                owner_canonical=owner_canonical,
+                                issuer_canonical=issuer_canonical,
+                                owner=owner,
+                                issuer_cik=cik10,
+                                filing=filing,
+                                batch_id=batch_id,
+                                stats=stats,
+                            )
                     except Exception:
                         logger.exception(
                             "sec_insiders: owner failed cik=%s owner=%s",

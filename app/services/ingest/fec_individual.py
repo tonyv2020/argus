@@ -84,7 +84,7 @@ import re
 from dataclasses import dataclass, field
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_sessionmaker
@@ -152,7 +152,9 @@ class DonorIdentity:
     search_queries: tuple[str, ...] = ()
     #: Two-year transaction periods to sweep (FEC partitions Schedule A
     #: by cycle, so each has to be requested separately).
-    two_year_periods: tuple[int, ...] = (2026, 2024, 2022, 2020, 2018, 2016)
+    two_year_periods: tuple[int, ...] = (
+        2026, 2024, 2022, 2020, 2018, 2016, 2014, 2012, 2010, 2008,
+    )
     #: Anchor labels whose canonical an accepted employer string may map
     #: to, for the cited ``affiliated_with`` edge. Keys are regexes.
     employer_anchor_patterns: tuple[tuple[str, str], ...] = ()
@@ -495,6 +497,30 @@ async def _recipient_canonical(
     return ent.id
 
 
+async def _citation_exists(
+    session: AsyncSession, edge_id: str, citation_ref: str
+) -> bool:
+    """Has this transaction already been cited on this edge?
+
+    An EXISTENCE check, never ``scalar_one_or_none``: there is no unique
+    index on ``(edge_id, citation_ref)``, and the pre-P1.6 emitter added
+    a citation row on every re-run, so live edges genuinely carry the
+    same ``sub_id`` up to seven times. Asserting uniqueness here raised
+    ``MultipleResultsFound`` on 51 of Peter Thiel's 83 accepted rows in
+    the first live run.
+    """
+    return (
+        await session.execute(
+            select(SourceCitation.id)
+            .where(
+                SourceCitation.edge_id == edge_id,
+                SourceCitation.citation_ref == citation_ref,
+            )
+            .limit(1)
+        )
+    ).first() is not None
+
+
 def contribution_citation_url(committee_id: str, sub_id: str) -> str:
     """Public FEC receipts page for one itemized transaction."""
     return (
@@ -557,15 +583,7 @@ async def _emit_contribution(
     else:
         stats.edges_reused += 1
 
-    already = (
-        await session.execute(
-            select(SourceCitation).where(
-                SourceCitation.edge_id == edge.id,
-                SourceCitation.citation_ref == sub_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if already is not None:
+    if await _citation_exists(session, edge.id, sub_id):
         stats.citations_skipped_already_cited += 1
         return
     session.add(
@@ -656,15 +674,7 @@ async def _emit_employer_affiliation(
             stats.affiliation_edges_reused += 1
 
         sub_id = str(row.get("sub_id") or "")
-        already = (
-            await session.execute(
-                select(SourceCitation).where(
-                    SourceCitation.edge_id == edge.id,
-                    SourceCitation.citation_ref == sub_id,
-                )
-            )
-        ).scalar_one_or_none()
-        if already is None:
+        if not await _citation_exists(session, edge.id, sub_id):
             session.add(
                 SourceCitation(
                     edge_id=edge.id,
@@ -785,28 +795,31 @@ async def ingest_donor(
             shape["amount"] += float(row.get("contribution_receipt_amount") or 0.0)
 
             try:
-                recipient_id = await _recipient_canonical(
-                    session, committee, batch_id=batch_id, stats=stats
-                )
-                await _emit_contribution(
-                    session,
-                    donor_id=donor_id,
-                    recipient_id=recipient_id,
-                    row=row,
-                    committee_id=committee_id,
-                    batch_id=batch_id,
-                    stats=stats,
-                )
-                if emit_affiliations:
-                    await _emit_employer_affiliation(
+                # SAVEPOINT per transaction: one bad row must not poison
+                # the transaction and lose every row after it.
+                async with session.begin_nested():
+                    recipient_id = await _recipient_canonical(
+                        session, committee, batch_id=batch_id, stats=stats
+                    )
+                    await _emit_contribution(
                         session,
                         donor_id=donor_id,
-                        identity=identity,
+                        recipient_id=recipient_id,
                         row=row,
                         committee_id=committee_id,
                         batch_id=batch_id,
                         stats=stats,
                     )
+                    if emit_affiliations:
+                        await _emit_employer_affiliation(
+                            session,
+                            donor_id=donor_id,
+                            identity=identity,
+                            row=row,
+                            committee_id=committee_id,
+                            batch_id=batch_id,
+                            stats=stats,
+                        )
                 bucket = per_committee.setdefault(
                     committee_id,
                     {
@@ -841,6 +854,353 @@ async def ingest_donor(
     return stats
 
 
+# ─── repair of the pre-P1.6 emitter's damage ────────────────────────────
+#
+# LIVE FINDING (2026-08-21). Peter Thiel's ``contributes_to`` edges were
+# already in the graph, PUBLISHED, written by the pre-P1.6
+# ``fec.ingest_individual_contributor``. That emitter added a
+# SourceCitation row unconditionally on every run and added the amount
+# to the edge weight every time, so the published figures are inflated
+# by the number of times the ingest ran:
+#
+#   SAVING ARIZONA PAC                 $140,000,000  (true: $20,000,000)
+#   PROTECT OHIO VALUES PAC (POV PAC)  $105,000,000  (true: $15,000,000)
+#   FREE FOREVER PAC                    $14,700,000  (true:  $2,100,000)
+#
+# Across the 62 edges: $270,902,324 of weight backed by 1,354 citation
+# rows covering only 220 distinct transactions — 6.15x average
+# duplication, 7x worst case. It also used the FUZZY contributor-name
+# search, so some of those transactions belong to other, private people
+# with similar names.
+#
+# This repair is DESTRUCTIVE and touches PUBLISHED rows, so it is
+# dry-run by default, scoped to one donor, and refuses to touch an edge
+# it cannot fully explain.
+
+
+@dataclass(frozen=True)
+class EdgeRepair:
+    """One donor→committee edge the repair would rewrite."""
+
+    edge_id: str
+    committee: str
+    old_weight: float
+    new_weight: float
+    citations_before: int
+    duplicate_citations_removed: int
+    memo_citations_removed: int
+    refused_citations_removed: int
+    citations_after: int
+    delete_edge: bool
+    publication_state: str
+    #: The exact citation rows to keep and to drop, decided at PLAN time
+    #: so the dry-run preview and the apply cannot diverge.
+    keep_citation_ids: tuple[str, ...] = ()
+    drop_citation_ids: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict:
+        """JSON-able row for the report — ids elided, counts kept."""
+        d = dict(self.__dict__)
+        d.pop("keep_citation_ids", None)
+        d.pop("drop_citation_ids", None)
+        return d
+
+
+@dataclass
+class RepairPlan:
+    """What one repair pass would do to a donor's contribution edges."""
+
+    donor: str = ""
+    donor_canonical_id: str = ""
+    edges_examined: int = 0
+    edges_repaired: list[EdgeRepair] = field(default_factory=list)
+    #: Edges carrying a citation the sweep could not classify — left
+    #: EXACTLY as they are and reported. Never rewritten on a guess.
+    edges_deferred: list[dict] = field(default_factory=list)
+    weight_before: float = 0.0
+    weight_after: float = 0.0
+    citations_before: int = 0
+    citations_after: int = 0
+
+    @property
+    def edges_deleted(self) -> int:
+        """Edges left with no citation at all — they must not survive."""
+        return sum(1 for e in self.edges_repaired if e.delete_edge)
+
+
+async def plan_repair(
+    donor_key: str,
+    *,
+    rows: dict[str, dict] | None = None,
+    max_rows_per_period: int = 4000,
+) -> RepairPlan:
+    """Classify every citation on the donor's contribution edges.
+
+    Each citation's ``citation_ref`` is an FEC ``sub_id``, so it can be
+    checked against the SAME identity predicate the ingest uses:
+
+    * **accepted** — the transaction is the donor's and is not a memo:
+      keep exactly ONE citation, and its amount is what the weight sums.
+    * **memo** — the identity is right but ``memo_code='X'`` means these
+      dollars are itemized elsewhere too; the citation is dropped so the
+      edge cites exactly the transactions its weight sums.
+    * **refused** — the transaction belongs to somebody else. Dropping
+      it is the point: it is another person's giving.
+    * **unclassified** — a ``sub_id`` the sweep never saw. The edge is
+      DEFERRED whole and reported: rewriting a weight from evidence we
+      have not examined is a guess.
+    """
+    identity = DONOR_IDENTITIES.get(donor_key)
+    if identity is None:
+        raise ValueError(f"unknown donor {donor_key!r}")
+    plan = RepairPlan(donor=identity.label)
+    stats = IndividualContribStats(donor=identity.label)
+    sm = get_sessionmaker()
+
+    async with sm() as session:
+        donor_id = await _donor_canonical(
+            session, identity, batch_id=None, stats=stats
+        )
+    if donor_id is None:
+        raise RuntimeError(
+            f"{identity.label!r} has no anchored canonical — run domain_anchors"
+        )
+    plan.donor_canonical_id = donor_id
+
+    if rows is None:
+        rows = await fetch_schedule_a(
+            identity, max_rows_per_period=max_rows_per_period, stats=stats
+        )
+
+    accepted: dict[str, float] = {}
+    memo: set[str] = set()
+    refused: set[str] = set()
+    for sub_id, row in rows.items():
+        if not check_identity(row, identity).accepted:
+            refused.add(sub_id)
+        elif (row.get("memo_code") or "").strip().upper() == MEMO_CODE:
+            memo.add(sub_id)
+        else:
+            accepted[sub_id] = float(
+                row.get("contribution_receipt_amount") or 0.0
+            )
+
+    async with sm() as session:
+        edges = (
+            await session.execute(
+                select(CanonicalEdge).where(
+                    CanonicalEdge.source_id == donor_id,
+                    CanonicalEdge.relation == EdgeRelation.CONTRIBUTES_TO.value,
+                )
+            )
+        ).scalars().all()
+        for edge in edges:
+            plan.edges_examined += 1
+            target = (
+                await session.execute(
+                    select(CanonicalEntity.canonical_name).where(
+                        CanonicalEntity.id == edge.target_id
+                    )
+                )
+            ).scalar_one_or_none() or edge.target_id
+            cites = (
+                await session.execute(
+                    select(SourceCitation.id, SourceCitation.citation_ref).where(
+                        SourceCitation.edge_id == edge.id
+                    )
+                )
+            ).all()
+            plan.weight_before += float(edge.weight or 0.0)
+            plan.citations_before += len(cites)
+
+            by_ref: dict[str, list[str]] = {}
+            for cite_id, ref in cites:
+                by_ref.setdefault(str(ref or ""), []).append(cite_id)
+            unclassified = [
+                r for r in by_ref
+                if r not in accepted and r not in memo and r not in refused
+            ]
+            if unclassified:
+                plan.edges_deferred.append(
+                    {
+                        "edge_id": edge.id,
+                        "committee": target,
+                        "weight": float(edge.weight or 0.0),
+                        "citations": len(cites),
+                        "unclassified_refs": sorted(unclassified)[:10],
+                        "unclassified_count": len(unclassified),
+                    }
+                )
+                plan.weight_after += float(edge.weight or 0.0)
+                plan.citations_after += len(cites)
+                continue
+
+            dup = sum(len(v) - 1 for r, v in by_ref.items() if r in accepted)
+            memo_removed = sum(len(v) for r, v in by_ref.items() if r in memo)
+            refused_removed = sum(
+                len(v) for r, v in by_ref.items() if r in refused
+            )
+            kept = sorted(r for r in by_ref if r in accepted)
+            keep_ids: list[str] = []
+            drop_ids: list[str] = []
+            for ref, ids in by_ref.items():
+                if ref in accepted:
+                    keep_ids.append(ids[0])
+                    drop_ids.extend(ids[1:])
+                else:
+                    drop_ids.extend(ids)
+            new_weight = round(sum(accepted[r] for r in kept), 2)
+            repair = EdgeRepair(
+                edge_id=edge.id,
+                committee=target,
+                old_weight=float(edge.weight or 0.0),
+                new_weight=new_weight,
+                citations_before=len(cites),
+                duplicate_citations_removed=dup,
+                memo_citations_removed=memo_removed,
+                refused_citations_removed=refused_removed,
+                citations_after=len(kept),
+                delete_edge=not kept,
+                publication_state=edge.publication_state,
+                keep_citation_ids=tuple(keep_ids),
+                drop_citation_ids=tuple(drop_ids),
+            )
+            if (
+                repair.citations_before == repair.citations_after
+                and repair.old_weight == repair.new_weight
+            ):
+                # Already correct — nothing to do, but it still counts
+                # toward the after-totals.
+                plan.weight_after += repair.new_weight
+                plan.citations_after += repair.citations_after
+                continue
+            plan.edges_repaired.append(repair)
+            plan.weight_after += 0.0 if repair.delete_edge else new_weight
+            plan.citations_after += repair.citations_after
+    return plan
+
+
+async def apply_repair(plan: RepairPlan) -> dict:
+    """Execute a :class:`RepairPlan`. One transaction per edge.
+
+    Every row id was decided at plan time, so what runs here is exactly
+    what the dry-run printed. Ordering inside an edge preserves the
+    0-uncited invariant: an edge with nothing left to cite is DELETED
+    (cascading its citations) rather than left citation-less.
+    """
+    sm = get_sessionmaker()
+    out: dict = {
+        "edges_rewritten": 0,
+        "edges_deleted": 0,
+        "citations_deleted": 0,
+        "errors": [],
+    }
+    for repair in plan.edges_repaired:
+        async with sm() as session:
+            try:
+                if repair.delete_edge:
+                    await session.execute(
+                        delete(CanonicalEdge).where(
+                            CanonicalEdge.id == repair.edge_id
+                        )
+                    )
+                    out["citations_deleted"] += repair.citations_before
+                    out["edges_deleted"] += 1
+                    await session.commit()
+                    continue
+                if repair.drop_citation_ids:
+                    await session.execute(
+                        delete(SourceCitation).where(
+                            SourceCitation.id.in_(repair.drop_citation_ids)
+                        )
+                    )
+                    out["citations_deleted"] += len(repair.drop_citation_ids)
+                edge = (
+                    await session.execute(
+                        select(CanonicalEdge).where(
+                            CanonicalEdge.id == repair.edge_id
+                        )
+                    )
+                ).scalar_one()
+                edge.weight = repair.new_weight
+                out["edges_rewritten"] += 1
+                await session.commit()
+            except Exception as exc:  # noqa: BLE001
+                await session.rollback()
+                out["errors"].append(
+                    {
+                        "edge_id": repair.edge_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                logger.exception("repair failed edge=%s", repair.edge_id)
+    return out
+
+
+async def run_repair(donor_key: str, apply: bool) -> dict:
+    """Plan (always) and apply (only with ``apply=True``)."""
+    plan = await plan_repair(donor_key)
+    report: dict = {
+        "mode": "apply" if apply else "dry-run",
+        "donor": plan.donor,
+        "donor_canonical_id": plan.donor_canonical_id,
+        "edges_examined": plan.edges_examined,
+        "edges_to_rewrite": len(plan.edges_repaired) - plan.edges_deleted,
+        "edges_to_delete": plan.edges_deleted,
+        "edges_deferred": len(plan.edges_deferred),
+        "weight_before": round(plan.weight_before, 2),
+        "weight_after": round(plan.weight_after, 2),
+        "citations_before": plan.citations_before,
+        "citations_after": plan.citations_after,
+        "repairs": [
+            r.to_dict()
+            for r in sorted(plan.edges_repaired, key=lambda r: -r.old_weight)
+        ],
+        "deferred": plan.edges_deferred,
+    }
+    if apply:
+        report["apply"] = await apply_repair(plan)
+        sm = get_sessionmaker()
+        async with sm() as session:
+            report["postconditions"] = {
+                "uncited_edges_zero": (
+                    await session.execute(
+                        text(
+                            "select count(*) from canonical_edges e where not "
+                            "exists (select 1 from source_citations c where "
+                            "c.edge_id = e.id)"
+                        )
+                    )
+                ).scalar_one() == 0,
+                "orphan_citations_zero": (
+                    await session.execute(
+                        text(
+                            "select count(*) from source_citations c where not "
+                            "exists (select 1 from canonical_edges e where "
+                            "e.id = c.edge_id)"
+                        )
+                    )
+                ).scalar_one() == 0,
+                "donor_weight_now": float(
+                    (
+                        await session.execute(
+                            text(
+                                "select coalesce(sum(weight),0) from "
+                                "canonical_edges where source_id = :d and "
+                                "relation = 'contributes_to'"
+                            ),
+                            {"d": plan.donor_canonical_id},
+                        )
+                    ).scalar_one()
+                ),
+            }
+            report["postconditions"]["all_passed"] = all(
+                v for k, v in report["postconditions"].items()
+                if isinstance(v, bool)
+            )
+    return report
+
+
 def main() -> None:
     """CLI — ``python -m app.services.ingest.fec_individual``."""
     logging.basicConfig(
@@ -859,19 +1219,34 @@ def main() -> None:
         "--no-affiliations", action="store_true",
         help="skip the cited affiliated_with donor → employer edges",
     )
+    ap.add_argument(
+        "--repair", action="store_true",
+        help="DESTRUCTIVE (with --apply). Rebuild this donor's existing "
+             "contributes_to weights + citations from the identity "
+             "predicate, undoing the pre-P1.6 emitter's duplicate "
+             "citations, inflated weights and mis-attributed rows. "
+             "Dry-run unless --apply is also given.",
+    )
+    ap.add_argument(
+        "--apply", action="store_true",
+        help="with --repair: actually write. Touches PUBLISHED rows.",
+    )
     ap.add_argument("--json-report", default=None)
     args = ap.parse_args()
 
-    stats = asyncio.run(
-        ingest_donor(
-            args.donor,
-            batch_id=args.batch_id,
-            max_rows_per_period=args.max_rows_per_period,
-            emit_affiliations=not args.no_affiliations,
+    if args.repair:
+        report = asyncio.run(run_repair(args.donor, apply=args.apply))
+    else:
+        stats = asyncio.run(
+            ingest_donor(
+                args.donor,
+                batch_id=args.batch_id,
+                max_rows_per_period=args.max_rows_per_period,
+                emit_affiliations=not args.no_affiliations,
+            )
         )
-    )
-    report = dict(stats.__dict__)
-    report["batch_id"] = args.batch_id
+        report = dict(stats.__dict__)
+        report["batch_id"] = args.batch_id
     print(json.dumps(report, indent=2, default=str))
     if args.json_report:
         with open(args.json_report, "w") as fh:

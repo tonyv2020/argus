@@ -531,49 +531,54 @@ async def ingest_client_filings_by_pattern(
                             continue
 
                         try:
-                            await attach_alias(
-                                session,
-                                client_canonical,
-                                "senate_lda.client",
-                                client_lda_id,
-                                client_name,
-                                stats=stats,
-                                label=display_label,
-                            )
+                            # SAVEPOINT per filing: one bad row must not
+                            # poison the page's transaction and lose
+                            # every filing after it.
+                            async with session.begin_nested():
+                                await attach_alias(
+                                    session,
+                                    client_canonical,
+                                    "senate_lda.client",
+                                    client_lda_id,
+                                    client_name,
+                                    stats=stats,
+                                    label=display_label,
+                                )
+                                before = (
+                                    await session.execute(
+                                        select(EntityAlias.id).where(
+                                            EntityAlias.source_system
+                                            == "senate_lda.registrant",
+                                            EntityAlias.source_id
+                                            == registrant_lda_id,
+                                        ).limit(1)
+                                    )
+                                ).first()
+                                registrant_canonical = await _upsert_entity(
+                                    session,
+                                    surface_name=registrant_name,
+                                    entity_type=EntityType.ORGANIZATION.value,
+                                    source_system="senate_lda.registrant",
+                                    source_id=registrant_lda_id,
+                                    kind_hint=None,
+                                    batch_id=batch_id,
+                                )
+                                _, reused = await _emit_lobbies_edge(
+                                    session,
+                                    client_canonical=client_canonical,
+                                    registrant_canonical=registrant_canonical,
+                                    filing_uuid=str(filing_uuid),
+                                    batch_id=batch_id,
+                                )
                             stats.accepted_clients[client_lda_id] = {
                                 "client_id": int(client_lda_id),
                                 "name": client_name,
                                 "state": client_row.get("state"),
                             }
-                            before = (
-                                await session.execute(
-                                    select(EntityAlias).where(
-                                        EntityAlias.source_system
-                                        == "senate_lda.registrant",
-                                        EntityAlias.source_id == registrant_lda_id,
-                                    )
-                                )
-                            ).scalar_one_or_none()
-                            registrant_canonical = await _upsert_entity(
-                                session,
-                                surface_name=registrant_name,
-                                entity_type=EntityType.ORGANIZATION.value,
-                                source_system="senate_lda.registrant",
-                                source_id=registrant_lda_id,
-                                kind_hint=None,
-                                batch_id=batch_id,
-                            )
                             if before is None:
                                 stats.registrants_created += 1
                                 if batch_id:
                                     stats.entities_staged += 1
-                            _, reused = await _emit_lobbies_edge(
-                                session,
-                                client_canonical=client_canonical,
-                                registrant_canonical=registrant_canonical,
-                                filing_uuid=str(filing_uuid),
-                                batch_id=batch_id,
-                            )
                             if reused:
                                 stats.edges_reused += 1
                             else:

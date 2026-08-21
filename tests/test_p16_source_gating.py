@@ -140,3 +140,57 @@ def test_flock_and_clearview_key_on_uei_not_a_cik() -> None:
     for spec in (FLOCK, CLEARVIEW):
         assert spec.sec_cik is None
         assert spec.usaspending_uei
+
+
+# ─── robustness fixes the first live run forced ─────────────────────────
+
+
+def test_agency_alias_source_id_fits_the_column() -> None:
+    """`entity_aliases.source_id` is VARCHAR(64). USAspending sub-agency
+    names blow through it — this one is 96 chars — and the raw insert
+    raised StringDataRightTruncation, which poisoned the page's
+    transaction and lost 436 awards on the first live run."""
+    long_name = (
+        "BUREAU OF ALCOHOL, TOBACCO, FIREARMS AND EXPLOSIVES "
+        "ACQUISITION AND PROPERTY MANAGEMENT DIVISION"
+    )
+    assert len(long_name) > 64
+    key = usaspending.agency_alias_source_id(long_name)
+    assert len(key) <= 64
+
+
+def test_agency_alias_source_id_is_stable_and_backward_compatible() -> None:
+    """A short name keeps its exact uppercase form, so every alias
+    written before this helper existed still resolves."""
+    assert usaspending.agency_alias_source_id("U.S. Marshals Service") == (
+        "U.S. MARSHALS SERVICE"
+    )
+    long_a = "OFFICE OF THE ASSISTANT SECRETARY " + "A" * 60
+    long_b = "OFFICE OF THE ASSISTANT SECRETARY " + "B" * 60
+    key_a = usaspending.agency_alias_source_id(long_a)
+    assert key_a == usaspending.agency_alias_source_id(long_a)
+    # Two sub-agencies sharing a long prefix must not collide.
+    assert key_a != usaspending.agency_alias_source_id(long_b)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        usaspending.ingest_recipient_contracts_by_uei,
+        senate_lda.ingest_client_filings_by_pattern,
+    ],
+)
+def test_row_loops_use_a_savepoint(fn) -> None:
+    """One bad row must not poison the page's transaction. Without the
+    SAVEPOINT, a single over-long agency name took down every award
+    after it in the same page."""
+    assert "begin_nested" in inspect.getsource(fn)
+
+
+def test_citation_existence_checks_do_not_assume_uniqueness() -> None:
+    """There is no unique index on (edge_id, kind, citation_ref), and
+    the pre-Stage-2 emitters added a citation row per run, so historical
+    edges genuinely carry the same reference more than once."""
+    for fn in (usaspending._emit_contract_edge,):
+        body = inspect.getsource(fn).split("citation_exists")[1]
+        assert "scalar_one_or_none" not in body
