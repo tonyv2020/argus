@@ -541,8 +541,25 @@ MUSK_ANCHORS: tuple[AnchorSpec, ...] = (
         # the exact misattribution this phase exists to prevent.
         usaspending_uei=(),
         usaspending_recipient_names=(),
-        lda_client_names=("X Corp",),
-        lda_client_patterns=(r"^x$", r"^x corp(oration)?$", r"^twitter$"),
+        lda_client_names=("X Corp", "Twitter"),
+        # The eight real client records lda.gov holds for this company,
+        # verified 2026-08-22. LDA itself asserts the continuity —
+        # "X CORP. (FORMERLY TWITTER, INC.)", "X, INC. F/K/A TWITTER,
+        # INC." — and unlike a Form 4 (which is about a PERSON), a
+        # lobbying filing is about the COMPANY, so the Twitter-era
+        # registrations are this anchor's own and are accepted.
+        #
+        # A bare ``^x$`` pattern is deliberately NOT declared even though
+        # "X CORP" would normalize to it: it would accept the filings of
+        # any LDA client whose name reduces to that one letter. The
+        # first live run refused 79 real X Corp filings for want of these
+        # patterns, which is the right way round to be wrong.
+        lda_client_patterns=(
+            r"^twitter$",
+            r"^x corp (formerly|fka|f k a) twitter$",
+            r"^x inc f k a twitter$",
+            r"\bon behalf of twitter$",
+        ),
         name_variants=(),
         surface_mode=SurfaceMode.OPEN.value,
         notes=(

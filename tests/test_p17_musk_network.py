@@ -125,6 +125,38 @@ def test_an_anchor_with_no_verified_uei_declares_none(label: str) -> None:
 # ─── the name-key hazards ───────────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    "client_name,norm,accepted",
+    [
+        # X Corp's eight real lda.gov client records.
+        ("TWITTER INC.", "twitter", True),
+        ("TWITTER, INC.", "twitter", True),
+        ("X CORP. (FORMERLY TWITTER, INC.)", "x corp formerly twitter", True),
+        ("X, INC. F/K/A TWITTER, INC.", "x inc f k a twitter", True),
+        ("TWINLOGIC STRATEGIES ON BEHALF OF TWITTER, INC",
+         "twinlogic strategies on behalf of twitter", True),
+        # The neighbours the first live run refused, correctly, and must
+        # keep refusing: 143 XEROX CORPORATION filings alone.
+        ("XEROX CORPORATION", "xerox", False),
+        ("XEROX CORP", "xerox", False),
+        ("XCEL ENERGY CORP", "xcel energy", False),
+        ("XOMA CORPORATION", "xoma", False),
+        ("TECH-X CORPORATION", "tech x", False),
+        ("XSOC CORPORATION", "xsoc", False),
+        ("XINERGY CORP", "xinergy", False),
+        ("CONSTELLATION XXL CORPORATION", "constellation xxl", False),
+    ],
+)
+def test_x_corp_lda_patterns(client_name: str, norm: str, accepted: bool) -> None:
+    """The first live lobbying run refused 79 genuine X Corp filings
+    because LDA registers the company as "X CORP. (FORMERLY TWITTER,
+    INC.)". Fixing that must not open the door to the 143 XEROX filings
+    sitting next to them in the same search."""
+    from app.services.ingest.senate_lda import client_name_accepted
+
+    assert client_name_accepted(norm, XCORP.lda_client_patterns) is accepted
+
+
 def test_x_corp_declares_no_name_variants() -> None:
     """Every legal form of "X Corp" normalizes to the single token "x",
     and the live graph holds four unrelated nodes on that key —

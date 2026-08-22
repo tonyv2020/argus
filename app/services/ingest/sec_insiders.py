@@ -217,6 +217,9 @@ class SecInsiderStats:
     edges_reused: int = 0
     citations_created: int = 0
     citations_skipped_already_cited: int = 0
+    #: Reuse hits refused because the edge is already PUBLISHED and
+    #: this is a staged run. See the read-gate in _emit_position.
+    published_edges_skipped: int = 0
     entities_staged: int = 0
     edges_staged: int = 0
     #: Positions found, for the report: one row per (owner, issuer).
@@ -417,6 +420,14 @@ async def _emit_position_edge(
     else:
         edge = existing
         stats.edges_reused += 1
+        # READ-GATE, same rule as fec_individual: a staged run must not
+        # move a live published edge. This one did not fire on P1.7 (all
+        # 131 filings landed on the batch's own new edges), but the hole
+        # is identical and a future domain whose insiders already have
+        # published held_position edges would walk into it.
+        if batch_id and edge.publication_state == PublicationState.PUBLISHED.value:
+            stats.published_edges_skipped += 1
+            return
         # The relationship flags are as-of the LATEST filing that names
         # this person. Refresh when we are looking at one at least as
         # recent as what is stored, so a promotion (director → director
