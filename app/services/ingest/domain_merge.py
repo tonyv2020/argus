@@ -555,13 +555,24 @@ async def _load(
         if not row.canonical_id or row.canonical_id not in nodes:
             continue
         node = nodes[row.canonical_id]
-        variants = set(variants_by_canonical.get(row.canonical_id, set()))
-        variants.add(node.norm)
-        for v in row.name_variants or []:
-            n = normalize_name(str(v))
-            if n:
-                variants.add(n)
         keyring = row.external_ids or {}
+        # An anchor may declare that its NAME is not identity evidence
+        # (``AnchorSpec.name_is_evidence``). The anchor's own normalized
+        # name is otherwise ALWAYS a merge key, which is how the first
+        # P1.7 dry-run planned "America" (a news-tag node about the
+        # country, typed unknown) into AMERICA PAC: the normalizer
+        # strips the trailing "pac", so the anchor's own key is
+        # "america". Such an anchor keys on external ids and LDA client
+        # patterns only.
+        if keyring.get("name_is_evidence") is False:
+            variants: set[str] = set()
+        else:
+            variants = set(variants_by_canonical.get(row.canonical_id, set()))
+            variants.add(node.norm)
+            for v in row.name_variants or []:
+                n = normalize_name(str(v))
+                if n:
+                    variants.add(n)
         patterns = tuple(
             str(p) for p in (keyring.get("lda_client_patterns") or [])
         )

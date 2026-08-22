@@ -151,6 +151,17 @@ class AnchorSpec:
     #: Surface forms news + filings actually print. Used for the
     #: fail-closed name fallback and by the P1.6.3 fragment collapse.
     name_variants: tuple[str, ...] = ()
+    #: Is this anchor's NAME usable as identity evidence at all?
+    #:
+    #: False for anchors whose label collapses to a generic word once the
+    #: normalizer strips its legal suffix — the suffix is the part that
+    #: carried the meaning. "X Corp" -> "x" and "America PAC" ->
+    #: "america" (both `corp` and `pac` are stripped suffixes), and the
+    #: live graph holds unrelated nodes on both keys. When False the
+    #: anchor registers NO name variants, the resolver skips the name
+    #: fallback, and the fragment merge has nothing to key on, so the
+    #: anchor lives on its external ids and LDA patterns alone.
+    name_is_evidence: bool = True
     surface_mode: str = SurfaceMode.OPEN.value
     notes: str | None = None
 
@@ -170,6 +181,8 @@ class AnchorSpec:
             out["sec_owner_cik"] = int(self.sec_owner_cik)
         if self.lda_client_patterns:
             out["lda_client_patterns"] = list(self.lda_client_patterns)
+        if not self.name_is_evidence:
+            out["name_is_evidence"] = False
         return out
 
     @property
@@ -561,6 +574,7 @@ MUSK_ANCHORS: tuple[AnchorSpec, ...] = (
             r"\bon behalf of twitter$",
         ),
         name_variants=(),
+        name_is_evidence=False,
         surface_mode=SurfaceMode.OPEN.value,
         notes=(
             "Private successor to Twitter, Inc.; merged under X.AI "
@@ -630,10 +644,15 @@ MUSK_ANCHORS: tuple[AnchorSpec, ...] = (
         usaspending_recipient_names=(),
         lda_client_names=(),
         lda_client_patterns=(),
-        # No name variants: "AMERICA PAC" is a common committee-name
-        # stem and the live graph holds nine different PACs whose names
-        # end in it (STAND FOR AMERICA PAC, WINNING FOR AMERICA PAC, …).
+        # No name variants, and the LABEL is not evidence either: the
+        # normalizer strips the trailing "pac", so "AMERICA PAC"
+        # collapses to "america" — which in this graph is a news-tag
+        # node about the COUNTRY ("America mentioned_with oil reserves /
+        # Trump / Saudi Arabia"), typed `unknown` and therefore mergeable
+        # into a pac anchor. The first merge dry-run planned exactly
+        # that. Nine live PACs also have names ending in "AMERICA PAC".
         name_variants=(),
+        name_is_evidence=False,
         notes=(
             "FEC committee C00879510. Musk's 2024 Super PAC. Keyed on "
             "the committee id only; the brief's C00871644 is not a real "
@@ -941,7 +960,13 @@ async def resolve_anchor_canonical(
 
     # 2. Fail-closed exact-name fallback. The label is tried first, then
     #    the declared variants, so the most canonical form wins ties.
-    for surface in (spec.label, *spec.name_variants):
+    if not spec.name_is_evidence:
+        stats.name_match_refused["name_not_evidence"] = (
+            stats.name_match_refused.get("name_not_evidence", 0) + 1
+        )
+    for surface in (
+        (spec.label, *spec.name_variants) if spec.name_is_evidence else ()
+    ):
         norm = normalize_name(surface)
         if not norm:
             continue

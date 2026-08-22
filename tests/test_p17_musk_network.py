@@ -190,6 +190,55 @@ def test_a_single_letter_name_is_not_identity_evidence() -> None:
         assert _name_is_evidence(normalize_name(spec.label)), spec.label
 
 
+@pytest.mark.parametrize("label", ["X Corp", "America PAC"])
+def test_an_anchor_whose_label_collapses_declares_it(label: str) -> None:
+    """THE THIRD P1.7 REGRESSION. domain_merge always adds the anchor's
+    OWN normalized name as a merge key, so declaring no name_variants is
+    not enough. The normalizer strips trailing legal suffixes, and for
+    these two the suffix is the part carrying the meaning:
+
+        "X Corp"      -> "x"        (4 unrelated live nodes)
+        "America PAC" -> "america"  (a news-tag node about the COUNTRY,
+                                     typed unknown, mergeable into a pac)
+
+    The first merge dry-run planned America -> AMERICA PAC on exactly
+    this. Both anchors now declare name_is_evidence=False, which empties
+    their variant set in the merge and skips the resolver's name
+    fallback."""
+    from app.services.graph.base import normalize_name
+
+    spec = next(a for a in MUSK_ANCHORS if a.label == label)
+    assert spec.name_is_evidence is False
+    assert spec.name_variants == ()
+    # The flag has to survive the round-trip into anchor_registry.
+    assert spec.external_ids.get("name_is_evidence") is False
+    # And the collapse it guards against is real.
+    assert len(normalize_name(label).split()) < len(label.split())
+
+
+def test_every_other_musk_anchor_keeps_its_name_as_evidence() -> None:
+    """The opt-out is for the two colliding labels only — it must not
+    quietly disable name resolution for anchors that depend on it
+    (Starlink and The Boring Company have no external id at all)."""
+    optouts = {a.label for a in MUSK_ANCHORS if not a.name_is_evidence}
+    assert optouts == {"X Corp", "America PAC"}
+    for label in ("Starlink", "The Boring Company"):
+        spec = next(a for a in MUSK_ANCHORS if a.label == label)
+        assert spec.name_is_evidence is True
+        assert spec.name_variants
+
+
+def test_a_non_evidence_anchor_contributes_no_merge_variants() -> None:
+    """The merge reads the flag off anchor_registry.external_ids."""
+    assert XCORP.external_ids["name_is_evidence"] is False
+    pac = next(a for a in MUSK_ANCHORS if a.label == "America PAC")
+    assert pac.external_ids["name_is_evidence"] is False
+    # Anchors that ARE name-evidence must not carry the key at all,
+    # so existing domains keep their current behaviour unchanged.
+    assert "name_is_evidence" not in TESLA.external_ids
+    assert "name_is_evidence" not in SPACEX.external_ids
+
+
 def test_america_pac_is_keyed_on_the_committee_id_that_exists() -> None:
     """The brief's C00871644 404s on the FEC registry. C00879510 is the
     real AMERICA PAC (Super PAC, Austin TX, first filed 2024-05-22) and
@@ -207,6 +256,12 @@ def test_every_musk_anchor_that_can_be_keyed_on_an_id_is() -> None:
     The Boring Company, Starlink — may fall through to a name."""
     keyless = {s.label for s in MUSK_ANCHORS if not s.identity_keys}
     assert keyless == {"X Corp", "The Boring Company", "Starlink"}
+    # Of those three, only the two with distinctive names may resolve by
+    # name; X Corp has neither an id nor a usable name and is created
+    # fresh + staged.
+    assert not next(
+        a for a in MUSK_ANCHORS if a.label == "X Corp"
+    ).name_is_evidence
 
 
 def test_both_boring_spellings_are_declared() -> None:
