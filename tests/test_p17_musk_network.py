@@ -447,6 +447,51 @@ def test_memo_rows_are_the_same_dollars_twice() -> None:
     assert (row.get("memo_code") or "").strip().upper() == MEMO_CODE
 
 
+# ─── the staged-run read-gate ───────────────────────────────────────────
+
+
+def test_the_emitters_gate_published_edges_behind_batch_id() -> None:
+    """THE SECOND P1.7 REGRESSION, and the more serious one.
+
+    ``_emit_contribution`` stages the edges it CREATES, but the
+    reuse-an-existing-edge branch was not gated at all: it incremented
+    the weight and added a citation regardless of whether that edge was
+    already published. So P1.7's "staged" Musk sweep added $30,342,500
+    of weight and 41 citations to 74 LIVE published edges, and 224 more
+    to the published affiliated_with edges. Staged work reaching the
+    public read path is the same defect class P1.5 found in the Neo4j
+    projection.
+
+    Asserted on the source because exercising it needs a live session;
+    the behaviour itself is verified against the database in the P1.7
+    report. Both emitters must consult publication_state before writing.
+    """
+    import inspect
+
+    from app.services.ingest import fec_individual as fi
+
+    for fn in (fi._emit_contribution, fi._emit_employer_affiliation):
+        src = inspect.getsource(fn)
+        reuse = src.split("stats.edges_reused += 1", 1)[-1] if (
+            fn is fi._emit_contribution
+        ) else src.split("stats.affiliation_edges_reused += 1", 1)[-1]
+        assert "PublicationState.PUBLISHED.value" in reuse, fn.__name__
+        assert "batch_id" in reuse, fn.__name__
+
+
+def test_a_truncated_sweep_is_never_reported_as_complete() -> None:
+    """Without a key the FEC API allows ~30 requests an hour and this
+    sweep is 10 periods deep. The old loop broke out of a period on the
+    first 429 and reported the partial total as the donor's giving."""
+    from app.services.ingest.fec_individual import IndividualContribStats
+
+    st = IndividualContribStats(donor="Elon Musk")
+    assert st.sweep_complete
+    st.periods_incomplete.append({"query": "MUSK, ELON", "period": 2024,
+                                  "rows_before_failure": 40})
+    assert not st.sweep_complete
+
+
 def test_widening_the_search_query_cannot_widen_what_is_accepted() -> None:
     """``search_queries`` only decides what is FETCHED; the predicate
     decides what is kept. This is the invariant that lets an operator

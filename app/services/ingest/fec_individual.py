@@ -377,6 +377,13 @@ class IndividualContribStats:
     #: Periods abandoned mid-pagination (rate limit / transport). NON-EMPTY
     #: MEANS THE TOTAL IS A FLOOR, NOT THE DONOR'S GIVING.
     periods_incomplete: list[dict] = field(default_factory=list)
+    #: Rows whose edge already exists as PUBLISHED, skipped by the
+    #: read-gate above rather than mutating a live figure.
+    published_edges_skipped: int = 0
+    published_dollars_withheld: float = 0.0
+    #: edge_id -> count of new transactions the published edge does not
+    #: yet cite. This is the operator's --repair worklist.
+    published_edges_needing_repair: dict[str, int] = field(default_factory=dict)
     errors: int = 0
 
     @property
@@ -732,6 +739,27 @@ async def _emit_contribution(
             stats.edges_staged += 1
     else:
         stats.edges_reused += 1
+        # READ-GATE. A staged run must never move a number that is
+        # already live on the public read path. When batch_id is set we
+        # are staging, and this edge already exists as PUBLISHED — so
+        # leave it exactly as it is and record what we would have added.
+        # (Without this, P1.7's "staged" Musk sweep silently added
+        # $30,342,500 of weight and 41 citations to 74 live published
+        # edges, because create-new is staged but reuse-existing was
+        # not gated at all. Reconciling a published weight against the
+        # full evidence set is what --repair is for, and that is an
+        # operator's decision, not an ingest side effect.)
+        if (
+            batch_id
+            and edge.publication_state == PublicationState.PUBLISHED.value
+        ):
+            if not await _citation_exists(session, edge.id, sub_id):
+                stats.published_edges_skipped += 1
+                stats.published_dollars_withheld += amount
+                stats.published_edges_needing_repair[str(edge.id)] = (
+                    stats.published_edges_needing_repair.get(str(edge.id), 0) + 1
+                )
+            return
 
     if await _citation_exists(session, edge.id, sub_id):
         stats.citations_skipped_already_cited += 1
@@ -785,6 +813,7 @@ async def _emit_employer_affiliation(
                 stats.affiliation_targets_unanchored.get(anchor_label, 0) + 1
             )
             continue
+        sub_id = str(row.get("sub_id") or "")
         edge = (
             await session.execute(
                 select(CanonicalEdge).where(
@@ -822,8 +851,16 @@ async def _emit_employer_affiliation(
                 stats.edges_staged += 1
         else:
             stats.affiliation_edges_reused += 1
+            # Same read-gate as _emit_contribution: a staged run does
+            # not move a live published edge, in dollars or in counts.
+            if edge.publication_state == PublicationState.PUBLISHED.value and batch_id:
+                if not await _citation_exists(session, edge.id, sub_id):
+                    stats.published_edges_skipped += 1
+                    stats.published_edges_needing_repair[str(edge.id)] = (
+                        stats.published_edges_needing_repair.get(str(edge.id), 0) + 1
+                    )
+                continue
 
-        sub_id = str(row.get("sub_id") or "")
         if not await _citation_exists(session, edge.id, sub_id):
             session.add(
                 SourceCitation(
