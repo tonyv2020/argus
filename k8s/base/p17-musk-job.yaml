@@ -1,0 +1,402 @@
+# P1.7 — the Musk network, anchored on EXTERNAL IDS.
+#
+# STAGED, NOT PUBLISHED. Every net-new entity and every edge these jobs
+# create carries publication_state=staged + the batch_id below, so
+# nothing reaches the public read path until an operator runs
+#   POST /api/admin/batches/<batch_id>/publish
+# which still refuses 409 while any batch entity lacks a scrutiny verdict.
+#
+# A Job's pod template is immutable, so pin the image + batch at apply
+# time rather than editing a live Job:
+#
+#   TAG=p17-$(git rev-parse --short=12 HEAD)
+#   BATCH=p17-musk-$(date -u +%Y%m%dT%H%M%SZ)
+#   sed -e "s|argus/api:latest|argus/api:${TAG}|" -e "s|__BATCH_ID__|${BATCH}|" \
+#     k8s/base/p17-musk-job.yaml | kubectl -n argus apply -f -
+#
+# ORDER MATTERS, exactly as in P1.6. Every downstream pass resolves its
+# subject from anchor_registry.canonical_id and REFUSES to mint one from
+# a name, so the anchor job has to land first:
+#
+#   1. argus-p17-anchors        identities + external-ID aliases
+#   2. argus-p17-sec-insiders   Form 3/4/5 → held_position (needs sec.cik)
+#      argus-p17-sources        USAspending UEI + Senate LDA
+#      argus-p17-fec-musk       Schedule A → contributes_to
+#   3. argus-p17-scrutiny       the publish precondition
+#
+# The merge jobs at the bottom are DESTRUCTIVE and separate: the dry-run
+# is read-only, the apply ships suspended.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p17-anchors
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p17-anchors
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p17-anchors
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: anchors
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.domain_anchors
+            - --domain
+            - musk_network
+            - --batch-id
+            - __BATCH_ID__
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p17-sec-insiders
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p17-sec-insiders
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p17-sec-insiders
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: sec-insiders
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.sec_insiders
+            - --priority-domain
+            - musk_network
+            - --batch-id
+            - __BATCH_ID__
+          env:
+            # SEC's fair-use policy requires a descriptive, contactable
+            # User-Agent on every request (sec.gov/os/webmaster-faq).
+            - name: SEC_USER_AGENT
+              value: "argus-ingest/1.0 (twin@achilles.tonyvigna.com)"
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p17-sources
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p17-sources
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 5400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p17-sources
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: sources
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          # USAspending (UEI-verified) + Senate LDA (pattern-gated).
+          # Only SpaceX and Tesla declare a UEI; the other five anchors
+          # have no SAM registration that resolves to them, so they
+          # contribute no contract edges BY DESIGN rather than by a
+          # fuzzy name match onto RTX / ALASKA ROAD BORING / etc.
+          command:
+            - python
+            - -m
+            - app.services.ingest.domain_sources
+            - --domain
+            - musk_network
+            - --batch-id
+            - __BATCH_ID__
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p17-fec-musk
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p17-fec-individual
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p17-fec-individual
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: fec-individual
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.fec_individual
+            - --donor
+            - musk
+            - --batch-id
+            - __BATCH_ID__
+          envFrom:
+            - secretRef:
+                name: argus-env
+            # A real FEC key is REQUIRED here: the identity predicate
+            # has to see every candidate row before it can refuse the
+            # wrong ones, and DEMO_KEY caps at ~30 requests/hour.
+            - secretRef:
+                name: argus-fec
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p17-scrutiny
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p17-scrutiny
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p17-scrutiny
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: scrutiny
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.run_scrutiny
+            - --batch-id
+            - __BATCH_ID__
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
+---
+# ─── DESTRUCTIVE: fragment collapse + mis-type repair ───────────────────
+#
+# The dry-run opens SET TRANSACTION READ ONLY, so a stray write raises
+# 25006 rather than touching live data. Run it, read the plan, and only
+# then unsuspend the apply Job.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p17-merge-dryrun
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p17-merge-dryrun
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p17-merge-dryrun
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: merge-dryrun
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.domain_merge
+            - --domain
+            - musk_network
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p17-merge-apply
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p17-merge-apply
+spec:
+  # SHIPS SUSPENDED. Unsuspend only after reading the dry-run plan:
+  #   kubectl -n argus patch job argus-p17-merge-apply \
+  #     -p '{"spec":{"suspend":false}}'
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p17-merge-apply
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: merge-apply
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.domain_merge
+            - --domain
+            - musk_network
+            - --apply
+          envFrom:
+            - secretRef:
+                name: argus-env
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
+---
+# ─── REPORT-ONLY: the pre-existing inflated Musk contributes_to edges ───
+#
+# The live graph carries 74 published contributes_to edges from Elon Musk
+# totalling $2,049,497,166.36, every one of them citing each FEC sub_id
+# exactly 7 times — the pre-P1.6 emitter re-added the dollars on every
+# run. This is the SAME defect P1.6 found on Peter Thiel (5.4x, $276M vs
+# a true $50.7M), in the same emitter.
+#
+# The dry-run below is READ-ONLY and is the only one of these two that
+# P1.7 runs. Rewriting a dollar figure that is already live on the public
+# read path about a named person is an OPERATOR decision (helen + Tony),
+# exactly as it was for Thiel — so the apply Job ships suspended and this
+# phase does not unsuspend it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p17-fec-repair-dryrun
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p17-fec-repair-dryrun
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p17-fec-repair-dryrun
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: fec-repair-dryrun
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.fec_individual
+            - --repair
+            - --donor
+            - musk
+          envFrom:
+            - secretRef:
+                name: argus-env
+            - secretRef:
+                name: argus-fec
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "3Gi", cpu: "1000m"}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: argus-p17-fec-repair-apply
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: p17-fec-repair-apply
+spec:
+  # SHIPS SUSPENDED, AND P1.7 DOES NOT UNSUSPEND IT. This rewrites live
+  # published dollar figures about a named private individual. helen +
+  # Tony decide, per the Thiel precedent:
+  #   kubectl -n argus patch job argus-p17-fec-repair-apply \
+  #     -p '{"spec":{"suspend":false}}'
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argus
+        app.kubernetes.io/component: p17-fec-repair-apply
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: fec-repair-apply
+          image: registry.lan/argus/api:latest
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - app.services.ingest.fec_individual
+            - --repair
+            - --donor
+            - musk
+            - --apply
+          envFrom:
+            - secretRef:
+                name: argus-env
+            - secretRef:
+                name: argus-fec
+          resources:
+            requests: {memory: "512Mi", cpu: "200m"}
+            limits: {memory: "3Gi", cpu: "1000m"}

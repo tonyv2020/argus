@@ -302,8 +302,11 @@ MUSK = DonorIdentity(
         r"\bX ?CORP",
         r"\bX\.?AI\b",
         r"TWITTER",
-        # Pre-Tesla cycles: Musk filed as PayPal's and Zip2's founder.
+        # Pre-Tesla cycles: Musk filed as the founder of X.com (which
+        # became PayPal) and of Zip2. ``X.COM / INFORMATION REQUESTED``
+        # is a real shape on his 2008-cycle rows.
         r"PAYPAL",
+        r"\bX\.?COM\b",
         r"ZIP ?2",
     ),
     # Austin TX since ~2021; Los Angeles / Bel Air CA before that. Rows
