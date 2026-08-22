@@ -619,6 +619,30 @@ def test_every_staged_ingester_gates_published_edges() -> None:
         assert "batch_id" in after, fn.__name__
 
 
+def test_citation_lookups_are_existence_checks_not_scalar_one() -> None:
+    """There is no unique index on (edge_id, citation_ref), and edges
+    genuinely carry the same ref twice: the fragment merge re-points a
+    fragment edge's citations onto the anchor's edge without deduping by
+    ref, so a filing both edges cited ends up on the survivor twice.
+
+    senate_lda used scalar_one_or_none here and threw
+    MultipleResultsFound on 25 SpaceX filings in the P1.7 run, dropping
+    them from the sweep. Its siblings already guarded correctly."""
+    import inspect
+
+    from app.services.ingest import senate_lda, sec_insiders, usaspending
+
+    for fn in (
+        senate_lda._emit_lobbies_edge,
+        sec_insiders._emit_position_edge,
+        usaspending._emit_contract_edge,
+    ):
+        src = inspect.getsource(fn)
+        assert "scalar_one_or_none()" not in src.split("SourceCitation")[-1], (
+            f"{fn.__name__} uses scalar_one_or_none on a citation lookup"
+        )
+
+
 def test_a_truncated_sweep_is_never_reported_as_complete() -> None:
     """Without a key the FEC API allows ~30 requests an hour and this
     sweep is 10 periods deep. The old loop broke out of a period on the

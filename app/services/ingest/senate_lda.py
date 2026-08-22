@@ -254,14 +254,22 @@ async def _emit_lobbies_edge(
         ):
             return edge.id, reused
 
+    # EXISTENCE check, never ``scalar_one_or_none`` — there is no unique
+    # index on (edge_id, citation_ref), and edges genuinely carry the
+    # same filing twice: the fragment merge re-points a fragment edge's
+    # citations onto the anchor's edge without deduping by ref, so when
+    # both cited the same filing the survivor ends up with two rows.
+    # ``sec_insiders`` and ``usaspending`` already guard this way; this
+    # module did not, and threw MultipleResultsFound on 25 SpaceX filings
+    # in the P1.7 run — silently dropping them from the sweep.
     already_cited = (
         await session.execute(
-            select(SourceCitation).where(
+            select(SourceCitation.id).where(
                 SourceCitation.edge_id == edge.id,
                 SourceCitation.citation_ref == filing_uuid,
-            )
+            ).limit(1)
         )
-    ).scalar_one_or_none()
+    ).first()
     if already_cited is None:
         session.add(
             SourceCitation(
