@@ -24,6 +24,14 @@
 #      argus-p17-fec-musk       Schedule A → contributes_to
 #   3. argus-p17-scrutiny       the publish precondition
 #
+# Re-running the anchor job after the source jobs is SAFE but not free:
+# upsert_anchor overwrites anchor_registry.external_ids, and senate_lda
+# writes the client/registrant ids it accepted back into that same
+# keyring. domain_anchors carries those two keys over rather than
+# erasing them (P1.6.3 reads the client-id list to decide that an LDA id
+# the anchor OWNS is not foreign), but any OTHER discovered key added
+# later would need the same treatment.
+#
 # The merge jobs at the bottom are DESTRUCTIVE and separate: the dry-run
 # is read-only, the apply ships suspended.
 ---

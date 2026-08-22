@@ -239,6 +239,21 @@ def test_a_non_evidence_anchor_contributes_no_merge_variants() -> None:
     assert "name_is_evidence" not in SPACEX.external_ids
 
 
+def test_declared_keyring_never_claims_the_discovered_lda_keys() -> None:
+    """``upsert_anchor`` overwrites the JSONB keyring, but lda_client_ids
+    and lda_registrant_ids are DISCOVERED by senate_lda and written back
+    as the audit record of what its patterns accepted. P1.6.3's "an LDA
+    client id the anchor OWNS is not foreign" rule reads that list, so
+    erasing it makes the fragment merge refuse the anchor's own LDA
+    nodes -- which is what a mid-phase anchors re-run did on P1.7.
+
+    No musk_network spec declares those keys, so the anchor pass must be
+    carrying them over rather than overwriting."""
+    for spec in MUSK_ANCHORS:
+        assert "lda_client_ids" not in spec.external_ids, spec.label
+        assert "lda_registrant_ids" not in spec.external_ids, spec.label
+
+
 def test_america_pac_is_keyed_on_the_committee_id_that_exists() -> None:
     """The brief's C00871644 404s on the FEC registry. C00879510 is the
     real AMERICA PAC (Super PAC, Austin TX, first filed 2024-05-22) and

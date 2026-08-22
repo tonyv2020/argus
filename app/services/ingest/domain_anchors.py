@@ -66,6 +66,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_sessionmaker
 from app.models import (
+    AnchorRegistry,
     CanonicalEntity,
     EntityAlias,
     EntityType,
@@ -1091,6 +1092,31 @@ async def materialise_domain(
                         }
                     )
 
+                # ``upsert_anchor`` OVERWRITES the JSONB keyring. Some
+                # of its keys are not declared here at all — they are
+                # DISCOVERED by the source passes and written back as the
+                # audit record of what was accepted (senate_lda records
+                # the client/registrant ids its patterns resolved to).
+                # Re-running the anchor pass after a source pass would
+                # otherwise silently erase them, and P1.6.3's "an LDA
+                # client id the anchor OWNS is not foreign" rule reads
+                # exactly that list — so wiping it makes the fragment
+                # merge refuse the anchor's own nodes. Carry them over.
+                existing = (
+                    await session.execute(
+                        select(AnchorRegistry).where(
+                            AnchorRegistry.label == spec.label,
+                            AnchorRegistry.entity_type == spec.entity_type,
+                        )
+                    )
+                ).scalar_one_or_none()
+                keyring = dict(spec.external_ids)
+                for discovered in ("lda_client_ids", "lda_registrant_ids"):
+                    if discovered in keyring:
+                        continue
+                    prior = (existing.external_ids or {}).get(discovered) if existing else None
+                    if prior:
+                        keyring[discovered] = prior
                 await upsert_anchor(
                     session,
                     label=spec.label,
@@ -1102,7 +1128,7 @@ async def materialise_domain(
                     usaspending_recipient_names=spec.usaspending_recipient_names,
                     lda_client_names=spec.lda_client_names,
                     name_variants=spec.name_variants,
-                    external_ids=spec.external_ids,
+                    external_ids=keyring,
                     surface_mode=spec.surface_mode,
                     canonical_id=canonical_id,
                     notes=spec.notes,
