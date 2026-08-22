@@ -268,9 +268,67 @@ THIEL = DonorIdentity(
     ),
 )
 
-#: Every declared mega-donor. P1.7 adds Musk here.
+MUSK = DonorIdentity(
+    label="Elon Musk",
+    last_name="MUSK",
+    first_names=frozenset({"ELON"}),
+    # Every pattern here names a Musk-CONTROLLED entity, and every one is
+    # a coined or distinctive string rather than an English word, so the
+    # employer clause stays a selector rather than a net. Verified
+    # against live Schedule A on 2026-08-22: his America PAC receipts
+    # report ``SPACE EXPLORATION TECHNOLOGIES CORP.`` / ``CEO``.
+    #
+    # Deliberately NOT declared: ``SELF``, ``SELF-EMPLOYED``,
+    # ``INVESTOR``, ``ENGINEER``, ``CEO``. The predicate matches employer
+    # and occupation as one joined blob, so a bare occupation pattern
+    # would accept ANY contributor named Elon Musk who typed "CEO" —
+    # which is exactly how the pre-P1.6 emitter attributed other real
+    # people's giving to a billionaire.
+    affiliation_patterns=(
+        # Negative lookahead: TESLA LABORATORIES INC is an unrelated DC
+        # consultancy that shows up as both an LDA client (id 161106) and
+        # a USAspending recipient. The surname clause would almost
+        # certainly reject such a row first, but the affiliation clause
+        # is meant to be the fail-closed one, so it excludes it outright.
+        r"\bTESLA\b(?!\s+LABORATOR)",
+        r"SPACE ?X",
+        r"SPACE EXPLORATION",
+        r"STARLINK",
+        r"NEURALINK",
+        r"\bBORING CO",
+        # Anchored on a word boundary so it cannot match RTX CORP,
+        # GS CALTEX CORPORATION, SAALEX CORP or SCIOLEX CORPORATION —
+        # the neighbours a bare "X CORP" substring pulls in.
+        r"\bX ?CORP",
+        r"\bX\.?AI\b",
+        r"TWITTER",
+        # Pre-Tesla cycles: Musk filed as PayPal's and Zip2's founder.
+        r"PAYPAL",
+        r"ZIP ?2",
+    ),
+    # Austin TX since ~2021; Los Angeles / Bel Air CA before that. Rows
+    # that clear the affiliation clause but sit in another state land in
+    # the ``state_mismatch`` bucket for review rather than being lost.
+    states=frozenset({"TX", "CA"}),
+    search_queries=("MUSK, ELON",),
+    # "REEVE" is his actual middle name, so ``MUSK, ELON REEVE`` is the
+    # same man; without it that row is refused as unexpected_name_tokens.
+    middle_tokens=DEFAULT_MIDDLE_TOKENS | {"REEVE"},
+    employer_anchor_patterns=(
+        (r"SPACE ?X|SPACE EXPLORATION", "SpaceX"),
+        (r"\bTESLA\b(?!\s+LABORATOR)", "Tesla"),
+        (r"\bX\.?AI\b", "xAI"),
+        (r"NEURALINK", "Neuralink"),
+        (r"\bBORING CO", "The Boring Company"),
+        (r"\bX ?CORP|TWITTER", "X Corp"),
+    ),
+)
+
+#: Every declared mega-donor. P1.7 added Musk as pure DATA — the
+#: predicate, the emitter and the repair are all unchanged from P1.6.
 DONOR_IDENTITIES: dict[str, DonorIdentity] = {
     "thiel": THIEL,
+    "musk": MUSK,
 }
 
 
@@ -313,7 +371,15 @@ class IndividualContribStats:
     alias_conflicts: list[dict] = field(default_factory=list)
     #: Per-committee totals — the report's headline table.
     by_committee: list[dict] = field(default_factory=list)
+    #: Periods abandoned mid-pagination (rate limit / transport). NON-EMPTY
+    #: MEANS THE TOTAL IS A FLOOR, NOT THE DONOR'S GIVING.
+    periods_incomplete: list[dict] = field(default_factory=list)
     errors: int = 0
+
+    @property
+    def sweep_complete(self) -> bool:
+        """True only when every declared period paginated to exhaustion."""
+        return not self.periods_incomplete
 
 
 # ─── FEC fetch ──────────────────────────────────────────────────────────
@@ -325,6 +391,69 @@ async def _fec_get(client: httpx.AsyncClient, path: str, **params) -> dict:
     r = await client.get(f"{_FEC_BASE}{path}", params=params)
     r.raise_for_status()
     return r.json()
+
+
+#: HTTP statuses worth retrying: FEC's rate limiter (429) and its
+#: transient upstream failures. Anything else is a real error.
+_RETRY_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
+
+async def _fec_get_with_retry(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    max_attempts: int = 8,
+    base_delay: float = 5.0,
+    **params,
+) -> dict:
+    """``_fec_get`` with exponential backoff on 429/5xx.
+
+    WHY THIS EXISTS. Without a key the FEC API allows ~30 requests an
+    hour per IP, and a mega-donor sweep is 10 two-year periods deep with
+    pagination on top. The pre-P1.7 loop caught the 429, counted one
+    error and **broke out of the period** — so a rate-limited run
+    silently reported a PARTIAL total as if it were the donor's
+    complete giving. For a phase whose whole point is that the published
+    dollar figure is right, a silent undercount is as bad as the
+    overcount it replaced.
+
+    Honours ``Retry-After`` when the server sends it, and otherwise
+    backs off exponentially (capped) so a long sweep survives the hour
+    boundary rather than truncating at it.
+    """
+    delay = base_delay
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return await _fec_get(client, path, **params)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in _RETRY_STATUSES:
+                raise
+            last_exc = exc
+            wait = delay
+            retry_after = exc.response.headers.get("retry-after")
+            if retry_after:
+                try:
+                    wait = max(wait, float(retry_after))
+                except ValueError:
+                    pass
+            logger.warning(
+                "FEC %s -> HTTP %d (attempt %d/%d); sleeping %.1fs",
+                path, exc.response.status_code, attempt + 1, max_attempts, wait,
+            )
+        except (httpx.TransportError, httpx.HTTPError) as exc:
+            last_exc = exc
+            wait = delay
+            logger.warning(
+                "FEC %s -> %s (attempt %d/%d); sleeping %.1fs",
+                path, type(exc).__name__, attempt + 1, max_attempts, wait,
+            )
+        if attempt == max_attempts - 1:
+            break
+        await asyncio.sleep(wait)
+        delay = min(delay * 2, 300.0)
+    assert last_exc is not None
+    raise last_exc
 
 
 async def fetch_schedule_a(
@@ -358,15 +487,23 @@ async def fetch_schedule_a(
                         params["last_index"] = last_index
                         params["last_contribution_receipt_date"] = last_date
                     try:
-                        payload = await _fec_get(
+                        payload = await _fec_get_with_retry(
                             client, "/schedules/schedule_a/", **params
                         )
                     except Exception:
                         logger.exception(
-                            "[%s] schedule_a fetch failed q=%r period=%d",
-                            identity.label, query, period,
+                            "[%s] schedule_a fetch failed after retries "
+                            "q=%r period=%d", identity.label, query, period,
                         )
                         stats.errors += 1
+                        # A period abandoned mid-pagination means the
+                        # donor's total is INCOMPLETE. Record it loudly:
+                        # the report must never present a truncated sweep
+                        # as a finished one.
+                        stats.periods_incomplete.append(
+                            {"query": query, "period": period,
+                             "rows_before_failure": fetched}
+                        )
                         break
                     batch = payload.get("results") or []
                     if not batch:

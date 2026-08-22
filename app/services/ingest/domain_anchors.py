@@ -347,10 +347,282 @@ SURVEILLANCE_ANCHORS: tuple[AnchorSpec, ...] = (
     ),
 )
 
-#: Every domain this pass can materialise. P1.7 adds ``musk_network``
-#: here and reuses the whole pass unchanged.
+
+# ─── P1.7: the Musk network ─────────────────────────────────────────────
+#
+# Every id below was verified against the issuing authority on
+# 2026-08-22: SEC ``cik-lookup-data.txt`` + the EDGAR submissions API for
+# CIKs, USAspending ``spending_by_award`` + the award-detail recipient
+# address for UEIs, lda.gov ``/clients/`` for the LDA client records.
+# The ``notes`` field records what each id IS, and — just as important —
+# which near-miss ids were REJECTED, so a later operator can re-verify
+# without re-deriving the whole set.
+#
+# The recurring hazard in this domain is that the anchors' names are
+# short, common English words ("Tesla", "Boring", "Starlink", "X"), so
+# a name-keyed pass attributes other companies' money to Musk. Measured
+# on live data 2026-08-22:
+#
+#   * USAspending ``recipient_search_text="TESLA"`` returns TESLA
+#     LABORATORIES, TESLA INDUSTRIES, TESLA GOVERNMENT, TESLA OFFSHORE,
+#     TESLA ENERGY SOLUTIONS — $79M of OTHER companies' federal money,
+#     and none of Musk's Tesla.
+#   * ``recipient_search_text="X CORP"`` returns RTX CORPORATION
+#     ($83.3B), SAALEX, SCIOLEX, ANALEX, GS CALTEX, CONDUENT.
+#   * ``"BORING COMPANY"`` returns ALASKA ROAD BORING and ATLANTIC
+#     BORING — literal drilling contractors.
+#   * ``"STARLINK"`` returns STARLINK TECHNOLOGIES LLC, unrelated.
+#
+# So every anchor here is keyed on an external id wherever one exists,
+# and the ``usaspending_recipient_names`` fuzzy fallback is left EMPTY
+# for this whole domain: the UEI is both the query and the accept gate
+# (``ingest_recipient_contracts_by_uei``), and an anchor with no UEI
+# simply contributes no contract edges rather than guessing.
+
+MUSK_ANCHORS: tuple[AnchorSpec, ...] = (
+    AnchorSpec(
+        label="Elon Musk",
+        entity_type=EntityType.PERSON.value,
+        priority_domain="musk_network",
+        # SEC Form 3/4/5 reporting-owner CIK — "Musk Elon", the filer
+        # behind the Tesla and (since the 2026 IPO) SpaceX ownership
+        # filings. 117 Form 4s as of 2026-08-22.
+        sec_owner_cik=1494730,
+        # NOT 1494731 — that is Kimbal Musk, his brother and a separate
+        # reporting owner. Nor MUSKAT DAVID A (1015045) / Musket David B
+        # (1310611), which the surname predicate rejects outright.
+        name_variants=(
+            "Elon Musk",
+            "Elon R. Musk",
+            "Elon Reeve Musk",
+            "MUSK ELON",
+            "MUSK, ELON",
+        ),
+        surface_mode=SurfaceMode.OPEN.value,
+        notes=(
+            "Public figure. SEC reporting-owner CIK 1494730. Personal "
+            "political giving lands via the FEC individual-contributor "
+            "mode (fec_individual), surname-gated. Kimbal Musk "
+            "(CIK 1494731) is a DIFFERENT person and is not this anchor."
+        ),
+    ),
+    AnchorSpec(
+        label="Tesla",
+        entity_type=EntityType.ORGANIZATION.value,
+        priority_domain="musk_network",
+        sec_cik=1318605,  # TESLA MOTORS INC → "Tesla, Inc." (TSLA)
+        # Verified via the award-detail recipient address:
+        #   TBTHGLM2G9D3 = TESLA, INC. (parent of Maxwell Technologies,
+        #                 9275 Sky Park Ct, San Diego CA)
+        #   VU8VCVEXW3L4 = TESLA MOTORS INC, 45500 Fremont Blvd,
+        #                 Fremont CA — the Fremont factory.
+        # DELIBERATELY EXCLUDED: VUEAP5535EJ6 resolves to TESLA MOTORS
+        # SINGAPORE PRIVATE LIMITED, and SXKNMH59DLX4 / ZTHKQB5ZV6J3 are
+        # the Singapore and Beijing sales entities — real Tesla
+        # subsidiaries, but separate SAM registrations whose awards are
+        # not the US parent's.
+        usaspending_uei=("TBTHGLM2G9D3", "VU8VCVEXW3L4"),
+        usaspending_recipient_names=(),
+        lda_client_names=("Tesla",),
+        # Anchored. lda.gov has 24 Tesla client records across 8 name
+        # spellings — and one imposter, id 161106 "TESLA LABORATORIES",
+        # which is the same unrelated DC consultancy that shows up in
+        # USAspending. ``^tesla( motors)?$`` accepts every real spelling
+        # (the normalizer strips the Inc/Corp suffix) and rejects it.
+        lda_client_patterns=(r"^tesla( motors)?$",),
+        name_variants=(
+            "Tesla, Inc.",
+            "Tesla Inc",
+            "Tesla",
+            "Tesla Motors",
+            "Tesla Motors, Inc.",
+            "TESLA MOTORS INC",
+        ),
+        notes=(
+            "SEC CIK 1318605 (TSLA). USAspending UEIs TBTHGLM2G9D3 + "
+            "VU8VCVEXW3L4. Tesla's federal contracting is tiny; the "
+            "large 'TESLA' award rows on USAspending belong to unrelated "
+            "companies and are refused by the UEI gate."
+        ),
+    ),
+    AnchorSpec(
+        label="SpaceX",
+        entity_type=EntityType.ORGANIZATION.value,
+        priority_domain="musk_network",
+        # Space Exploration Technologies Corp. Filed Form D since 2002;
+        # went public in 2026 (424B4 2026-06-12), so it now files 8-K,
+        # 10-Q and Form 3/4 — which is what makes the Musk→SpaceX
+        # held_position edge a filing fact rather than a claim.
+        sec_cik=1181412,
+        # C6M7C2FLKER5 = 1 Rocket Rd, Hawthorne CA (HQ) — $16.26B
+        # obligated. H5JUPMRB3KX6 = 731 Kelp Rd, Vandenberg AFB CA, whose
+        # award detail reports C6M7C2FLKER5 as its parent, so its awards
+        # belong on this node.
+        usaspending_uei=("C6M7C2FLKER5", "H5JUPMRB3KX6"),
+        usaspending_recipient_names=(),
+        lda_client_names=("Space Exploration Technologies",),
+        # lda.gov has 30+ SpaceX client records across 9 name spellings
+        # (verified 2026-08-22). Every pattern is fully anchored so that
+        # "COALITION FOR DEEP SPACE EXPLORATION" — a real, unrelated LDA
+        # client — cannot match.
+        lda_client_patterns=(
+            r"^spacex$",
+            r"^space exploration technologies( corp)?( spacex| space x)?$",
+            r"^spacex aka space exploration technologies$",
+            r"\b(obo|for|on behalf of) space exploration technologies$",
+        ),
+        name_variants=(
+            "SpaceX",
+            "Space Exploration Technologies Corp.",
+            "SPACE EXPLORATION TECHNOLOGIES CORP",
+            "SPACE EXPLORATION TECHNOLOGIES CORP. (SPACEX)",
+            "SPACE EXPLORATION TECHNOLOGIES (SPACEX)",
+            "SPACE EXPLORATION TECHNOLOGIES (SPACE X)",
+            "SPACEX (AKA SPACE EXPLORATION TECHNOLOGIES CORP.)",
+            # A news-tag surface form in the live graph. Declared
+            # deliberately: it names the company, unlike "SpaceX IPO"
+            # (an event), "SpaceXLounge" (a subreddit) or "Leveraged
+            # SpaceX ETFs" (a financial product), none of which are.
+            "Elon Musk\u2019s SpaceX",
+        ),
+        notes=(
+            "SEC CIK 1181412. USAspending UEIs C6M7C2FLKER5 (HQ) + "
+            "H5JUPMRB3KX6 (Vandenberg, child of the first). NOTE: "
+            "'SPACE EXPLORATION TECHNOLOGIES CORP. PAC' normalizes to "
+            "the same key as the company (the normalizer strips the PAC "
+            "suffix) but is typed `pac`, which is not an org-mergeable "
+            "type, so the fragment pass refuses it. It is a separate "
+            "entity and must stay one."
+        ),
+    ),
+    AnchorSpec(
+        label="xAI",
+        entity_type=EntityType.ORGANIZATION.value,
+        priority_domain="musk_network",
+        # X.AI CORP. (Nevada, Form D from 2023-12-05) and its 2025
+        # holding company X.AI Holdings Corp., which is the surviving
+        # parent after the xAI / X Corp merger.
+        sec_cik=2002695,
+        sec_ciks=(2079267,),
+        # NOT 1609052 — "x.ai, inc." is a DIFFERENT Delaware company
+        # whose Form D filings run 2014-05-30..2017-08-21, years before
+        # Musk founded xAI. Nor any of the "X.AI … A SERIES OF … LLC"
+        # CIKs, which are SPV feeder funds that HOLD xAI stock.
+        usaspending_uei=(),
+        usaspending_recipient_names=(),
+        lda_client_names=("xAI",),
+        lda_client_patterns=(r"^x ai$", r"^xai$"),
+        name_variants=("xAI", "xAI Corp", "X.AI Corp.", "X.AI Holdings Corp."),
+        notes=(
+            "SEC CIKs 2002695 (X.AI CORP.) + 2079267 (X.AI Holdings "
+            "Corp.). No federal contracting registration. Grok is xAI's "
+            "PRODUCT, not the company, so the 'Grok (xAI)' node is not a "
+            "declared variant."
+        ),
+    ),
+    AnchorSpec(
+        label="X Corp",
+        entity_type=EntityType.ORGANIZATION.value,
+        priority_domain="musk_network",
+        # X Corp has NO usable name key: every legal form of the name
+        # ("X Corp", "X Corp.", "X Corporation") normalizes to the single
+        # token "x", and the live graph already holds four different
+        # nodes on that key — X [concept], X [organization], X [place],
+        # X [unknown]. Declaring any of them as a variant would let the
+        # fragment pass absorb the concept and unknown nodes into a
+        # company. So this anchor is keyed on LDA client ids ONLY, and
+        # carries no name_variants at all.
+        #
+        # It is also NOT keyed on Twitter's CIK 1418091: SEC still calls
+        # that registrant "TWITTER, INC." (it stopped filing 2022-12-02,
+        # after the take-private), and attaching it would pull 686
+        # Twitter-era Form 4s from pre-Musk executives onto this node —
+        # the exact misattribution this phase exists to prevent.
+        usaspending_uei=(),
+        usaspending_recipient_names=(),
+        lda_client_names=("X Corp",),
+        lda_client_patterns=(r"^x$", r"^x corp(oration)?$", r"^twitter$"),
+        name_variants=(),
+        surface_mode=SurfaceMode.OPEN.value,
+        notes=(
+            "Private successor to Twitter, Inc.; merged under X.AI "
+            "Holdings Corp. in 2025. No CIK of its own, no UEI, and no "
+            "safe name key (every form normalizes to 'x', which four "
+            "unrelated live nodes already share). Keyed on LDA client "
+            "ids only. Twitter CIK 1418091 is the deregistered "
+            "predecessor and is deliberately NOT declared."
+        ),
+    ),
+    AnchorSpec(
+        label="The Boring Company",
+        entity_type=EntityType.ORGANIZATION.value,
+        priority_domain="musk_network",
+        # Private, never filed with SEC, and no SAM registration that
+        # resolves to Musk's company — the USAspending "BORING COMPANY"
+        # hits are ALASKA ROAD BORING COMPANY and ATLANTIC BORING
+        # COMPANY, literal drilling contractors. So: no external id, and
+        # therefore no contract edges. Name variants only, both spellings
+        # declared because the normalizer keeps the leading "the"
+        # ("the boring" vs "boring") and they would not otherwise meet.
+        usaspending_uei=(),
+        usaspending_recipient_names=(),
+        lda_client_names=("The Boring Company",),
+        lda_client_patterns=(r"^(the )?boring$",),
+        name_variants=("The Boring Company", "Boring Company"),
+        notes=(
+            "Private, no CIK, no UEI. The 'BORING COMPANY' rows on "
+            "USAspending are unrelated drilling contractors and are not "
+            "declared."
+        ),
+    ),
+    AnchorSpec(
+        label="Neuralink",
+        entity_type=EntityType.ORGANIZATION.value,
+        priority_domain="musk_network",
+        sec_cik=1708503,  # NEURALINK CORP. (Nevada, Form D since 2017)
+        # NOT the "NEURALINK … A SERIES OF … LLC" CIKs (2071284,
+        # 2075470, 2081339, 2082210): those are SPV feeder funds that
+        # hold Neuralink stock, the same class of noise as FXAIX holding
+        # Tesla. No USAspending registration.
+        usaspending_uei=(),
+        usaspending_recipient_names=(),
+        lda_client_names=("Neuralink",),
+        lda_client_patterns=(r"^neuralink$",),
+        name_variants=("Neuralink", "Neuralink Corp.", "Neuralink Corp"),
+        notes="SEC CIK 1708503. Private; no federal contracts.",
+    ),
+    AnchorSpec(
+        label="Starlink",
+        entity_type=EntityType.ORGANIZATION.value,
+        priority_domain="musk_network",
+        # Starlink is SpaceX's satellite-internet SERVICE, not a
+        # separate registrant: it has no CIK and no UEI of its own, and
+        # its federal money is obligated to SpaceX's UEIs. The SEC
+        # "STARLINK …" CIKs (Starlink AI Acquisition Corp, Starlink Asia
+        # Ltd, Starlink Exchange Ltd) and USAspending's STARLINK
+        # TECHNOLOGIES LLC are all unrelated companies.
+        usaspending_uei=(),
+        usaspending_recipient_names=(),
+        lda_client_names=(),
+        lda_client_patterns=(),
+        name_variants=("Starlink", "SpaceX Starlink"),
+        notes=(
+            "SpaceX service/subsidiary — no CIK, no UEI of its own. Kept "
+            "as a distinct node so Starlink-specific reporting has a "
+            "home; its affiliation to SpaceX is emitted only where a "
+            "filing cites it. The unrelated STARLINK registrants "
+            "(Starlink AI Acquisition Corp, Starlink Asia Ltd, Starlink "
+            "Technologies LLC) are not declared."
+        ),
+    ),
+)
+
+
+#: Every domain this pass can materialise. P1.7 added ``musk_network``
+#: as pure DATA — the pass itself is unchanged.
 DOMAIN_SPECS: dict[str, tuple[AnchorSpec, ...]] = {
     "surveillance": SURVEILLANCE_ANCHORS,
+    "musk_network": MUSK_ANCHORS,
 }
 
 
