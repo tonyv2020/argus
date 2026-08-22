@@ -137,6 +137,46 @@ def test_x_corp_declares_no_name_variants() -> None:
     )
 
 
+def test_a_single_letter_name_is_not_identity_evidence() -> None:
+    """THE P1.7 REGRESSION. The anchor pass tries ``spec.label`` before
+    the declared variants, so an anchor cannot opt out of name matching
+    by declaring none — and "X Corp" normalizes to "x". On the first
+    live run this resolved the X Corp anchor onto a `concept` node named
+    "X". The fix reuses ``dedup_pass._name_is_evidence``, the same guard
+    the dedup pass and the fragment merge already key on."""
+    from app.services.graph.base import normalize_name
+    from app.services.ingest.dedup_pass import _name_is_evidence
+
+    assert normalize_name("X Corp") == "x"
+    assert normalize_name("X Corp.") == "x"
+    assert normalize_name("X Corporation") == "x"
+    assert not _name_is_evidence("x")
+    # The anchors whose labels ARE distinctive keep working.
+    for spec in MUSK_ANCHORS:
+        if spec.label == "X Corp":
+            continue
+        assert _name_is_evidence(normalize_name(spec.label)), spec.label
+
+
+def test_america_pac_is_keyed_on_the_committee_id_that_exists() -> None:
+    """The brief's C00871644 404s on the FEC registry. C00879510 is the
+    real AMERICA PAC (Super PAC, Austin TX, first filed 2024-05-22) and
+    is already the committee on Musk's live Schedule A receipts."""
+    pac = next(a for a in MUSK_ANCHORS if a.label == "America PAC")
+    assert pac.entity_type == EntityType.PAC.value
+    assert pac.fec_committee_ids == ("C00879510",)
+    assert ("fec.committee", "C00879510") in pac.identity_keys
+    # Nine live PACs end in "AMERICA PAC"; a name key would claim them.
+    assert pac.name_variants == ()
+
+
+def test_every_musk_anchor_that_can_be_keyed_on_an_id_is() -> None:
+    """Only the three entities with no external id anywhere — X Corp,
+    The Boring Company, Starlink — may fall through to a name."""
+    keyless = {s.label for s in MUSK_ANCHORS if not s.identity_keys}
+    assert keyless == {"X Corp", "The Boring Company", "Starlink"}
+
+
 def test_both_boring_spellings_are_declared() -> None:
     """The normalizer keeps a leading "the", so "The Boring Company" and
     "Boring Company" land on different keys ("the boring" vs "boring")

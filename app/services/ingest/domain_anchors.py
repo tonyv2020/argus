@@ -74,6 +74,7 @@ from app.models import (
 )
 from app.services.anchor_registry import upsert_anchor
 from app.services.graph.base import normalize_name
+from app.services.ingest.dedup_pass import _name_is_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -592,6 +593,37 @@ MUSK_ANCHORS: tuple[AnchorSpec, ...] = (
         notes="SEC CIK 1708503. Private; no federal contracts.",
     ),
     AnchorSpec(
+        label="America PAC",
+        entity_type=EntityType.PAC.value,
+        priority_domain="musk_network",
+        # The P4 seed left an "America PAC" registry stub with a NULL
+        # canonical_id and no external id — exactly the unresolved-stub
+        # problem P1.6 was built to fix. helen's 2026-07-19 note on that
+        # seed says it plainly: names give "AMERICA PAC" = the FXAIX
+        # fund. So it is keyed on the committee id and nothing else.
+        #
+        # C00879510, not the C00871644 in the P1.7 brief: that id does
+        # not exist in the FEC registry (404 on /committee/C00871644/).
+        # C00879510 is AMERICA PAC, a Super PAC (Independent
+        # Expenditure-Only), Austin TX, treasurer YOUNG, CHRIS, first
+        # filed 2024-05-22 — and it is already the committee behind
+        # Musk's live Schedule A receipts.
+        fec_committee_ids=("C00879510",),
+        usaspending_uei=(),
+        usaspending_recipient_names=(),
+        lda_client_names=(),
+        lda_client_patterns=(),
+        # No name variants: "AMERICA PAC" is a common committee-name
+        # stem and the live graph holds nine different PACs whose names
+        # end in it (STAND FOR AMERICA PAC, WINNING FOR AMERICA PAC, …).
+        name_variants=(),
+        notes=(
+            "FEC committee C00879510. Musk's 2024 Super PAC. Keyed on "
+            "the committee id only; the brief's C00871644 is not a real "
+            "FEC committee id."
+        ),
+    ),
+    AnchorSpec(
         label="Starlink",
         entity_type=EntityType.ORGANIZATION.value,
         priority_domain="musk_network",
@@ -895,6 +927,20 @@ async def resolve_anchor_canonical(
     for surface in (spec.label, *spec.name_variants):
         norm = normalize_name(surface)
         if not norm:
+            continue
+        # A name too short to be distinctive is not identity. This is the
+        # SAME guard the dedup pass and the P1.6.3 fragment merge already
+        # key on (``dedup_pass._name_is_evidence``), and P1.7 is where
+        # its absence here started to matter: "X Corp" normalizes to the
+        # single token "x" — every legal form of the name does — and the
+        # live graph holds four unrelated nodes on that key, so the
+        # fallback resolved the X Corp anchor onto a `concept` node named
+        # "X". An anchor cannot opt out by declaring no name_variants,
+        # because the LABEL is always tried.
+        if not _name_is_evidence(norm):
+            stats.name_match_refused["name_not_evidence"] = (
+                stats.name_match_refused.get("name_not_evidence", 0) + 1
+            )
             continue
         for cand in await _name_candidates(session, norm):
             ok, reason = anchor_name_match_allowed(cand, spec)
