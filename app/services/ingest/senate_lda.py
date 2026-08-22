@@ -242,6 +242,17 @@ async def _emit_lobbies_edge(
     else:
         edge = existing
         reused = True
+        # READ-GATE, same rule as fec_individual and sec_insiders: a
+        # STAGED run (batch_id set) must not move an edge that is already
+        # live on the public read path. P1.7 measured this firing: the
+        # Musk lobbying sweep wrote 46 citations onto 6 PUBLISHED Tesla
+        # `lobbies` edges and raised their weights with them, from a
+        # batch that had published nothing.
+        if (
+            batch_id
+            and edge.publication_state == PublicationState.PUBLISHED.value
+        ):
+            return edge.id, reused
 
     already_cited = (
         await session.execute(

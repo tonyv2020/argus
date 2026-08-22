@@ -581,6 +581,44 @@ def test_the_emitters_gate_published_edges_behind_batch_id() -> None:
         assert "batch_id" in reuse, fn.__name__
 
 
+def test_every_staged_ingester_gates_published_edges() -> None:
+    """THE SYSTEMIC VERSION. All four ingesters that P1.7 runs share one
+    shape: create-new is staged behind batch_id, reuse-existing was not
+    gated at all. Two of them were measured firing on live data:
+
+        fec_individual  +$30,342,500 and 265 citations on 76 published
+                        Musk edges
+        senate_lda      46 citations and +46 weight on 6 published Tesla
+                        `lobbies` edges
+
+    sec_insiders and usaspending did not fire only because every edge
+    they touched happened to be new. usaspending's weights are DOLLARS
+    and it is the emitter family behind the $89B GEO artefact, so it is
+    gated too.
+
+    Asserted on the source: exercising the branch needs a live session,
+    and the behaviour is verified against the database in the report."""
+    import inspect
+
+    from app.services.ingest import fec_individual, sec_insiders
+    from app.services.ingest import senate_lda, usaspending
+
+    cases = [
+        (fec_individual._emit_contribution, "stats.edges_reused += 1"),
+        (fec_individual._emit_employer_affiliation,
+         "stats.affiliation_edges_reused += 1"),
+        (sec_insiders._emit_position_edge, "stats.edges_reused += 1"),
+        (senate_lda._emit_lobbies_edge, "reused = True"),
+        (usaspending._emit_contract_edge, "reused = True"),
+    ]
+    for fn, marker in cases:
+        src = inspect.getsource(fn)
+        assert marker in src, f"{fn.__name__}: reuse marker moved"
+        after = src.split(marker, 1)[1]
+        assert "PublicationState.PUBLISHED.value" in after, fn.__name__
+        assert "batch_id" in after, fn.__name__
+
+
 def test_a_truncated_sweep_is_never_reported_as_complete() -> None:
     """Without a key the FEC API allows ~30 requests an hour and this
     sweep is 10 periods deep. The old loop broke out of a period on the

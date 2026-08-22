@@ -354,6 +354,17 @@ async def _emit_contract_edge(
     else:
         edge = existing
         reused = True
+        # READ-GATE, same rule as fec_individual / sec_insiders /
+        # senate_lda: a STAGED run must not move a live published edge.
+        # This one did NOT fire on P1.7 (all 26 SpaceX + Tesla contract
+        # edges were new), but holds_contract weights are DOLLARS and
+        # this is the same emitter family that produced the $89B GEO
+        # artefact, so it is gated before a future domain walks into it.
+        if (
+            batch_id
+            and edge.publication_state == PublicationState.PUBLISHED.value
+        ):
+            return edge.id, reused
 
     # Per-award idempotency: (edge_id, kind, award_id) is the unique
     # identity of "this award has been counted on this edge". Repeat
