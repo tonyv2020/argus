@@ -316,14 +316,47 @@ async def _emit_contribution_edge(
             source_id=src_canonical,
             target_id=dst_canonical,
             relation=EdgeRelation.CONTRIBUTES_TO.value,
-            weight=float(amount or 0.0),
+            weight=0.0,
         )
         session.add(edge)
         await session.flush()
     else:
         edge = existing
-        edge.weight = float((edge.weight or 0.0) + (amount or 0.0))
         reused = True
+
+    # ------------------------------------------------------------------
+    # THE GUARD. Everything below the line runs at most ONCE per sub_id.
+    #
+    # Without it this function re-added the same transaction's dollars to
+    # `weight` on every run while appending a duplicate SourceCitation, so a
+    # weekly CronJob inflated live published figures without bound. The damage
+    # was $2,477,161,067 across 55 sources -- 24 named people, 22 of them
+    # sitting members of Congress -- and it was readable straight off the
+    # citations: count(citations) / count(distinct citation_ref) WAS the
+    # multiplier.
+    #
+    # `_emit_affiliation_edge`, forty lines above, has always done this
+    # correctly. The contribution path simply never got the same guard, and
+    # nothing about the call site looked any different.
+    #
+    # An EXISTENCE check, never scalar_one_or_none(): there is no unique index
+    # on (edge_id, citation_ref), and live edges genuinely carry the same
+    # sub_id up to seven times right now. Asserting uniqueness here would raise
+    # MultipleResultsFound on exactly the rows this fix exists to stop growing.
+    # ------------------------------------------------------------------
+    already_cited = (
+        await session.execute(
+            select(SourceCitation.id)
+            .where(
+                SourceCitation.edge_id == edge.id,
+                SourceCitation.citation_ref == sub_id,
+            )
+            .limit(1)
+        )
+    ).first() is not None
+    if already_cited:
+        return edge.id, reused
+
     citation_url = (
         f"https://www.fec.gov/data/receipts/individual-contributions/"
         f"?committee_id={committee_id}&transaction_id={sub_id}"
@@ -336,6 +369,10 @@ async def _emit_contribution_edge(
             citation_ref=sub_id,
         )
     )
+    # The weight moves ONLY alongside a newly-created citation, so the
+    # invariant `weight == sum of the amounts this edge cites` holds by
+    # construction rather than by discipline.
+    edge.weight = float((edge.weight or 0.0) + (amount or 0.0))
     return edge.id, reused
 
 
