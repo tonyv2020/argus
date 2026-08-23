@@ -269,8 +269,82 @@ THIEL = DonorIdentity(
 )
 
 #: Every declared mega-donor. P1.7 adds Musk here.
+# ---------------------------------------------------------------------------
+# Extracted from feat/p1.7-musk on 2026-08-23, deliberately WITHOUT merging that
+# branch. This exact identity produced the live Musk repair
+# ($2,080,143,916.36 -> $240,113,804.50, 58 edges deleted as other people's
+# giving), so without it `main` cannot reproduce what is running in production.
+#
+# P1.7 itself stays unmerged: its publish gate is blocked on FINDING 5 (two
+# real people, `Musk Kimbal`/`Kimbal Musk` and `BOTHA ROELOF`/`Roelof Botha`,
+# would be de-anonymised by publishing its staged batch). That is Tony's call,
+# and merging the branch would imply a decision nobody has made. Merging this
+# ONE dataclass does not publish anything -- the staged batch is DB state, not
+# code.
+# ---------------------------------------------------------------------------
+MUSK = DonorIdentity(
+    label="Elon Musk",
+    last_name="MUSK",
+    first_names=frozenset({"ELON"}),
+    # Every pattern here names a Musk-CONTROLLED entity, and every one is
+    # a coined or distinctive string rather than an English word, so the
+    # employer clause stays a selector rather than a net. Verified
+    # against live Schedule A on 2026-08-22: his America PAC receipts
+    # report ``SPACE EXPLORATION TECHNOLOGIES CORP.`` / ``CEO``.
+    #
+    # Deliberately NOT declared: ``SELF``, ``SELF-EMPLOYED``,
+    # ``INVESTOR``, ``ENGINEER``, ``CEO``. The predicate matches employer
+    # and occupation as one joined blob, so a bare occupation pattern
+    # would accept ANY contributor named Elon Musk who typed "CEO" —
+    # which is exactly how the pre-P1.6 emitter attributed other real
+    # people's giving to a billionaire.
+    affiliation_patterns=(
+        # Negative lookahead: TESLA LABORATORIES INC is an unrelated DC
+        # consultancy that shows up as both an LDA client (id 161106) and
+        # a USAspending recipient. The surname clause would almost
+        # certainly reject such a row first, but the affiliation clause
+        # is meant to be the fail-closed one, so it excludes it outright.
+        r"\bTESLA\b(?!\s+LABORATOR)",
+        r"SPACE ?X",
+        r"SPACE EXPLORATION",
+        r"STARLINK",
+        r"NEURALINK",
+        r"\bBORING CO",
+        # Anchored on a word boundary so it cannot match RTX CORP,
+        # GS CALTEX CORPORATION, SAALEX CORP or SCIOLEX CORPORATION —
+        # the neighbours a bare "X CORP" substring pulls in.
+        r"\bX ?CORP",
+        r"\bX\.?AI\b",
+        r"TWITTER",
+        # Pre-Tesla cycles: Musk filed as the founder of X.com (which
+        # became PayPal) and of Zip2. ``X.COM / INFORMATION REQUESTED``
+        # is a real shape on his 2008-cycle rows.
+        r"PAYPAL",
+        r"\bX\.?COM\b",
+        r"ZIP ?2",
+    ),
+    # Austin TX since ~2021; Los Angeles / Bel Air CA before that. Rows
+    # that clear the affiliation clause but sit in another state land in
+    # the ``state_mismatch`` bucket for review rather than being lost.
+    states=frozenset({"TX", "CA"}),
+    search_queries=("MUSK, ELON",),
+    # "REEVE" is his actual middle name, so ``MUSK, ELON REEVE`` is the
+    # same man; without it that row is refused as unexpected_name_tokens.
+    middle_tokens=DEFAULT_MIDDLE_TOKENS | {"REEVE"},
+    employer_anchor_patterns=(
+        (r"SPACE ?X|SPACE EXPLORATION", "SpaceX"),
+        (r"\bTESLA\b(?!\s+LABORATOR)", "Tesla"),
+        (r"\bX\.?AI\b", "xAI"),
+        (r"NEURALINK", "Neuralink"),
+        (r"\bBORING CO", "The Boring Company"),
+        (r"\bX ?CORP|TWITTER", "X Corp"),
+    ),
+)
+
+
 DONOR_IDENTITIES: dict[str, DonorIdentity] = {
     "thiel": THIEL,
+    "musk": MUSK,
 }
 
 
