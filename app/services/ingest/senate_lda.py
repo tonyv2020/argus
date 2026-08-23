@@ -31,7 +31,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 
 import httpx
 from sqlalchemy import select
@@ -44,10 +45,12 @@ from app.models import (
     EdgeRelation,
     EntityAlias,
     EntityType,
+    PublicationState,
     SourceCitation,
     SourceKind,
 )
 from app.services.graph.base import normalize_name
+from app.services.ingest.domain_anchors import attach_alias
 
 logger = logging.getLogger(__name__)
 
@@ -123,9 +126,15 @@ async def _upsert_entity(
     source_system: str,
     source_id: str,
     kind_hint: str | None = None,
+    batch_id: str | None = None,
 ) -> str:
     """Return an existing canonical id via alias-source lookup or normalized-name;
     otherwise create the canonical + attach the LDA alias.
+
+    ``batch_id`` (RG1, P1.6) stamps a NET-NEW canonical
+    ``publication_state=staged``; a canonical this resolves onto keeps
+    whatever state it already has. Default ``None`` = the published
+    column default, so the steady-state sweeps are unchanged.
 
     Mirrors the FEC ingester's shape so canonicals resolved via FEC (PACs,
     committees) and via LDA (clients, registrants) collide on
@@ -171,6 +180,11 @@ async def _upsert_entity(
         canonical_name=surface_name,
         canonical_name_normalized=norm or surface_name.lower(),
         type=entity_type,
+        publication_state=(
+            PublicationState.STAGED.value if batch_id
+            else PublicationState.PUBLISHED.value
+        ),
+        batch_id=batch_id,
     )
     session.add(ce)
     await session.flush()
@@ -193,6 +207,7 @@ async def _emit_lobbies_edge(
     client_canonical: str,
     registrant_canonical: str,
     filing_uuid: str,
+    batch_id: str | None = None,
 ) -> tuple[str, bool]:
     """Emit a LOBBIES edge (client → registrant) + attach the filing citation.
 
@@ -216,6 +231,11 @@ async def _emit_lobbies_edge(
             target_id=registrant_canonical,
             relation=EdgeRelation.LOBBIES.value,
             weight=1.0,
+            publication_state=(
+                PublicationState.STAGED.value if batch_id
+                else PublicationState.PUBLISHED.value
+            ),
+            batch_id=batch_id,
         )
         session.add(edge)
         await session.flush()
@@ -376,6 +396,297 @@ async def ingest_client_filings(
             pagination_total_pages = (payload.get("pagination") or {}).get("pages")
             if pagination_total_pages is not None and page > pagination_total_pages:
                 break
+    return stats
+
+
+# ─── P1.6 — pattern-gated, batch-aware client filings ───────────────────
+
+
+@dataclass
+class LdaDomainStats:
+    """Counters for one P1.6 lobbying sweep."""
+
+    anchors_processed: int = 0
+    filings_fetched: int = 0
+    filings_accepted: int = 0
+    filings_refused_off_anchor: int = 0
+    filings_incomplete: int = 0
+    registrants_created: int = 0
+    edges_created: int = 0
+    edges_reused: int = 0
+    citations_created: int = 0
+    entities_staged: int = 0
+    edges_staged: int = 0
+    #: Client records ACCEPTED, keyed by LDA client id — recorded back
+    #: into ``anchor_registry.external_ids.lda_client_ids``.
+    accepted_clients: dict[str, dict] = field(default_factory=dict)
+    #: Client names the patterns REFUSED, with counts. This is where
+    #: "FLOCK HOMES, INC." and "AXONIUS" show up.
+    refused_client_names: dict[str, int] = field(default_factory=dict)
+    #: Anchors with LDA patterns but no resolved canonical.
+    unanchored: list[dict] = field(default_factory=list)
+    alias_conflicts: list[dict] = field(default_factory=list)
+    by_registrant: list[dict] = field(default_factory=list)
+    errors: int = 0
+
+
+def client_name_accepted(name: str, patterns: tuple[str, ...]) -> bool:
+    """Does an LDA client name belong to the anchor these patterns describe?
+
+    Matched against the NORMALIZED name (punctuation stripped, folded to
+    lowercase) so "PALANTIR TECHNOLOGIES, INC." and "Palantir
+    Technologies Inc" are one string. Fail-closed: no pattern, no match.
+
+    This replaces the substring test the pre-P1.6 pass used
+    (:func:`_client_name_matches`), which accepts any name CONTAINING
+    the anchor — "FLOCK HOMES, INC." for "Flock", "AXONIUS" for "Axon".
+    """
+    if not patterns:
+        return False
+    norm = normalize_name(name or "")
+    if not norm:
+        return False
+    return any(re.search(p, norm) for p in patterns)
+
+
+async def ingest_client_filings_by_pattern(
+    *,
+    client_canonical: str,
+    queries: tuple[str, ...],
+    patterns: tuple[str, ...],
+    display_label: str,
+    batch_id: str | None = None,
+    max_filings: int = 600,
+    page_size: int = 25,
+    stats: LdaDomainStats | None = None,
+) -> LdaDomainStats:
+    """Fetch one anchor's LDA filings and emit cited ``lobbies`` edges.
+
+    The client side of every edge is the ANCHOR's canonical — never a
+    name-resolved node — so all 32 of Palantir's LDA client records land
+    on one Palantir. Each accepted record's ``senate_lda.client`` id is
+    attached to that canonical as an alias, which is what stops the
+    older name-keyed pass from later minting a parallel node for it.
+    """
+    stats = stats or LdaDomainStats()
+    sm = get_sessionmaker()
+    per_registrant: dict[str, dict] = {}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for query in queries:
+            page = 1
+            remaining = max_filings
+            while remaining > 0:
+                try:
+                    payload = await _lda_get(
+                        client,
+                        "/filings/",
+                        client_name=query,
+                        page=page,
+                        page_size=min(page_size, remaining),
+                        ordering="-dt_posted",
+                    )
+                except httpx.HTTPStatusError as exc:
+                    # LDA's DRF pagination 404s past the last page.
+                    if exc.response.status_code == 404:
+                        break
+                    logger.exception(
+                        "[%s] LDA fetch failed q=%r page=%d",
+                        display_label, query, page,
+                    )
+                    stats.errors += 1
+                    break
+                rows = payload.get("results") or []
+                if not rows:
+                    break
+
+                async with sm() as session:
+                    for row in rows:
+                        stats.filings_fetched += 1
+                        client_row = row.get("client") or {}
+                        registrant_row = row.get("registrant") or {}
+                        filing_uuid = row.get("filing_uuid")
+                        client_name = (client_row.get("name") or "").strip()
+
+                        if not client_name_accepted(client_name, patterns):
+                            stats.filings_refused_off_anchor += 1
+                            stats.refused_client_names[client_name] = (
+                                stats.refused_client_names.get(client_name, 0) + 1
+                            )
+                            continue
+                        client_lda_id = str(
+                            client_row.get("id") or client_row.get("client_id") or ""
+                        )
+                        registrant_lda_id = str(
+                            registrant_row.get("id")
+                            or registrant_row.get("house_registrant_id")
+                            or ""
+                        )
+                        registrant_name = (registrant_row.get("name") or "").strip()
+                        if not (
+                            filing_uuid and client_lda_id
+                            and registrant_lda_id and registrant_name
+                        ):
+                            stats.filings_incomplete += 1
+                            continue
+
+                        try:
+                            # SAVEPOINT per filing: one bad row must not
+                            # poison the page's transaction and lose
+                            # every filing after it.
+                            async with session.begin_nested():
+                                await attach_alias(
+                                    session,
+                                    client_canonical,
+                                    "senate_lda.client",
+                                    client_lda_id,
+                                    client_name,
+                                    stats=stats,
+                                    label=display_label,
+                                )
+                                before = (
+                                    await session.execute(
+                                        select(EntityAlias.id).where(
+                                            EntityAlias.source_system
+                                            == "senate_lda.registrant",
+                                            EntityAlias.source_id
+                                            == registrant_lda_id,
+                                        ).limit(1)
+                                    )
+                                ).first()
+                                registrant_canonical = await _upsert_entity(
+                                    session,
+                                    surface_name=registrant_name,
+                                    entity_type=EntityType.ORGANIZATION.value,
+                                    source_system="senate_lda.registrant",
+                                    source_id=registrant_lda_id,
+                                    kind_hint=None,
+                                    batch_id=batch_id,
+                                )
+                                _, reused = await _emit_lobbies_edge(
+                                    session,
+                                    client_canonical=client_canonical,
+                                    registrant_canonical=registrant_canonical,
+                                    filing_uuid=str(filing_uuid),
+                                    batch_id=batch_id,
+                                )
+                            stats.accepted_clients[client_lda_id] = {
+                                "client_id": int(client_lda_id),
+                                "name": client_name,
+                                "state": client_row.get("state"),
+                            }
+                            if before is None:
+                                stats.registrants_created += 1
+                                if batch_id:
+                                    stats.entities_staged += 1
+                            if reused:
+                                stats.edges_reused += 1
+                            else:
+                                stats.edges_created += 1
+                                if batch_id:
+                                    stats.edges_staged += 1
+                            stats.citations_created += 1
+                            stats.filings_accepted += 1
+                            bucket = per_registrant.setdefault(
+                                registrant_lda_id,
+                                {
+                                    "registrant_id": registrant_lda_id,
+                                    "registrant": registrant_name,
+                                    "filings": 0,
+                                },
+                            )
+                            bucket["filings"] += 1
+                        except Exception:
+                            logger.exception(
+                                "[%s] LDA row failed filing=%s",
+                                display_label, filing_uuid,
+                            )
+                            stats.errors += 1
+                    try:
+                        await session.commit()
+                    except Exception:
+                        await session.rollback()
+                        stats.errors += 1
+                        logger.exception(
+                            "[%s] LDA batch commit failed page=%d",
+                            display_label, page,
+                        )
+                remaining -= len(rows)
+                page += 1
+                if not payload.get("next"):
+                    break
+
+    stats.by_registrant.extend(
+        sorted(per_registrant.values(), key=lambda r: -r["filings"])
+    )
+    return stats
+
+
+async def ingest_domain_lobbying(
+    priority_domains: tuple[str, ...] | None = None,
+    *,
+    batch_id: str | None = None,
+    max_filings_per_anchor: int = 600,
+) -> LdaDomainStats:
+    """Sweep every registry anchor that declares LDA client patterns.
+
+    Records each accepted ``senate_lda.client`` id back into the
+    anchor's ``external_ids.lda_client_ids`` — the keyring accumulates
+    the ids the patterns resolved to, so the report can show exactly
+    which LDA registrations were treated as this company.
+    """
+    from app.models import AnchorRegistry
+    from app.services.anchor_registry import anchors_for_lda_patterns
+
+    stats = LdaDomainStats()
+    sm = get_sessionmaker()
+    async with sm() as session:
+        anchors = await anchors_for_lda_patterns(
+            session, priority_domains=priority_domains
+        )
+    for anchor in anchors:
+        if not anchor.canonical_id:
+            stats.unanchored.append({"anchor": anchor.label})
+            logger.error(
+                "LDA domain pass: %s has client patterns but no canonical — "
+                "run domain_anchors first", anchor.label,
+            )
+            continue
+        queries = tuple(anchor.lda_client_names) or (anchor.label,)
+        before_accepted = set(stats.accepted_clients)
+        await ingest_client_filings_by_pattern(
+            client_canonical=anchor.canonical_id,
+            queries=queries,
+            patterns=tuple(anchor.lda_client_patterns),
+            display_label=anchor.label,
+            batch_id=batch_id,
+            max_filings=max_filings_per_anchor,
+            stats=stats,
+        )
+        stats.anchors_processed += 1
+        # Record the ids these patterns resolved to, back onto the anchor.
+        new_ids = sorted(
+            {
+                stats.accepted_clients[k]["client_id"]
+                for k in set(stats.accepted_clients) - before_accepted
+            }
+            | set(anchor.lda_client_ids)
+        )
+        if new_ids != sorted(anchor.lda_client_ids):
+            async with sm() as session:
+                row = (
+                    await session.execute(
+                        select(AnchorRegistry).where(
+                            AnchorRegistry.label == anchor.label,
+                            AnchorRegistry.entity_type == anchor.entity_type,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if row is not None:
+                    keyring = dict(row.external_ids or {})
+                    keyring["lda_client_ids"] = new_ids
+                    row.external_ids = keyring
+                    await session.commit()
     return stats
 
 
