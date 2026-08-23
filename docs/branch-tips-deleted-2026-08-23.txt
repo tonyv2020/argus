@@ -1,0 +1,23 @@
+# argus branch tips recorded before deletion, 2026-08-23
+# restore any of these with:  git push origin <sha>:refs/heads/<branch>
+# verified before deletion: 0 files on any of these that main lacks
+7f703b061946c9c7a7f78d3961f794c9adf22f4f  p1/coverage-expansion
+9d34edf13ca04cc8a5b62840b6ae219740a3edfe  p1/prison-telecom-autoseed
+529e5cddf64b72d7192f1fc2e0403cc39b7a6cce  p1/prison-telecom-extension
+f29dbec1e0a6f7a6baed5c75997ac5014db4e2b9  p1/projection-pgid-index
+9d51597c9c9746b1ae910146fe9922bb31339aa2  p2/merge-crosswalk-infra
+6af336e8ee12bced76d5f8d29644b418067f35ab  p2/person-merge-dryrun
+1db576340ac4de8d4948948da219d490885b3fb2  p3/pac-org-linkage
+659ff322ecf19c9f58826fb3f6be5305ef8eee25  p4/anchor-registry-schema
+27df52e1ff02b72e8b02477c21424e5a6da6f711  p4/congress-roster
+8c73f22c902e43ef329bcf163571f6008526ec5a  p4/fec-individual-contributor
+4d00eeb6258a4733933bdde6499842d35df9503f  p4/hotfix-fec-scope-and-roster-canonicals
+5ff3b6611008acc9f9b08bff9c2e3cb9012fe069  p4/hotfix-individual-scope
+8e70fdd9ce2aabac433b9aeba53470fe3d8edea0  p4/refactor-lda-sec
+7b851868693aa1b070c5c2a7eb9ebbca62001adb  p4/scheduled-sweep
+55fd0c1058a013ae8be3b9ebe13c4b14d843752a  p4/seed-and-refactor-fec-usa
+abc859b10b0a2a047751a413d17080edd5e7fa6b  p5-followon/geo-merge-and-thiel-palantir
+329f16d31e47982e722968cbb8d73a153223aed4  p5/model2-beneficiary
+52a8c184322e2c6dc2b6aac7fb5f17fe771d26ab  p5/party-attribution
+19806dd814e187430592d8a442f79a684027f4ae  p5/vote-clerk-xml
+57e9750934681465ef7e09787ed41a1470c7445b  p5/vote-ingester-and-flow-polish
