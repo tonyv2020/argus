@@ -125,13 +125,24 @@ async def test_award_net_obligation_returns_none_on_detail_fetch_failure(monkeyp
 
 
 class _FakeExecute:
-    """Minimal .scalar_one_or_none() shim for async session .execute()."""
+    """Minimal Result shim for async session .execute().
+
+    Models both accessors the emitter uses: ``scalar_one_or_none`` for
+    the edge lookup (unique on source/target/relation) and ``first`` for
+    the citation EXISTENCE check — that one must not assert uniqueness,
+    because there is no unique index on (edge_id, kind, citation_ref)
+    and historical edges carry duplicates from the pre-Stage-2 emitter.
+    """
 
     def __init__(self, value):
         self._value = value
 
     def scalar_one_or_none(self):
         return self._value
+
+    def first(self):
+        """A real Result yields a Row, or None when there are no rows."""
+        return None if self._value is None else (self._value,)
 
 
 class _FakeAsyncSession:
