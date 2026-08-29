@@ -133,6 +133,7 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
         "by_registrant_type": collections.Counter(),
         "org_examples": [],
         "cohorts": collections.Counter(),
+        "eligible_by_tier": collections.Counter(),
         "eligible_pairs": {},
     }
 
@@ -228,6 +229,8 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
 
             cohort = classify(rtype, toks, hits, best, best_ids, distinct_ids)
             stats["cohorts"][cohort] += 1
+            if cohort == "ELIGIBLE":
+                stats["eligible_by_tier"][tier] += 1
             if cohort == "ELIGIBLE":
                 cid, ctype, _sm, cname, via, matched_via, edges = max(
                     hits, key=lambda h: h[0]
@@ -362,6 +365,12 @@ def _print(stats: dict) -> None:  # pragma: no cover
                  "DROP_cross_type", "DROP_true_tie", "DROP_below_tier"):
         print(f"   {name:<20} {stats['cohorts'].get(name, 0):>8,}")
     pairs = stats["eligible_pairs"]
+    print("   ELIGIBLE split by tier (rows / distinct pairs):")
+    for t in ("exact_canonical", "exact_alias"):
+        npairs = sum(1 for r in pairs.values() if r["tier"] == t)
+        thin = sum(1 for r in pairs.values() if r["tier"] == t and r["edges"] == 0)
+        print(f"      {t:<17} {stats['eligible_by_tier'].get(t,0):>7,} rows / "
+              f"{npairs:>4} pairs  ({thin} of those pairs have a 0-edge canonical)")
     print(f"   distinct eligible registrant->entity pairs: {len(pairs):,}")
 
     print("\n-- SAMPLE FOR REVIEW (distinct pairs; organisations only)")
