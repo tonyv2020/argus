@@ -44,6 +44,8 @@ from app.services.graph.base import normalize_name
 
 logger = logging.getLogger(__name__)
 
+_DUMP_ALL = bool(os.environ.get("FAA_DUMP_ALL_PAIRS"))
+
 #: FAA TYPE REGISTRANT -> the canonical entity types a match may
 #: plausibly land on. Anything else is counted as cross-type.
 _EXPECTED_TYPES: dict[str, set[str]] = {
@@ -381,6 +383,15 @@ def _print(stats: dict) -> None:  # pragma: no cover
         flag = "  <-- 0 edges" if r["edges"] == 0 else ""
         print(f"   {r['registrant'][:38]:<38} {r['canonical'][:30]:<30} "
               f"{r['score']:<6.2f} {r['edges']:>5} {r['aircraft']:>5}  {via}{flag}")
+
+    if _DUMP_ALL:
+        print("\n-- ALL ELIGIBLE 1.00 PAIRS WITH A 0-EDGE CANONICAL (collision judgment)")
+        rows = [r for r in pairs.values()
+                if r["tier"] == "exact_canonical" and r["edges"] == 0]
+        for r in sorted(rows, key=lambda x: x["registrant"]):
+            print(f"   {r['registrant'][:44]:<44} | {r['canonical'][:40]:<40} | "
+                  f"ac={r['aircraft']}")
+        print(f"   ({len(rows)} pairs)")
 
     print("\n-- examples (ORGANISATION registrants only; individuals withheld)")
     for ex in stats["org_examples"]:

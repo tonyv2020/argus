@@ -734,3 +734,84 @@ class Aircraft(Base):
         # P2 entity resolution will scan by registrant name; cheap now.
         Index("ix_aircraft_registrant_name", "registrant_name"),
     )
+
+
+class AircraftRegistrationEdge(Base):
+    """P2 — a canonical entity REGISTERS an aircraft. Fenced + cited.
+
+    NOT a ``CanonicalEdge``. A canonical edge needs both endpoints to
+    be canonical entities, and P1/P2 deliberately do not make aircraft
+    an ``EntityType`` — so a graph edge is not available without a
+    schema change nobody has approved. This is the join-table form
+    (design doc option (a)): the analytic value of "which canonicals
+    own aircraft" without adding a node kind to the read gate, the
+    Neo4j projection and the de-anon surface all at once.
+
+    **Citation is structural.** ``snapshot_id`` / ``source_url`` /
+    ``source_sha256`` are all NOT NULL, so an uncited edge cannot be
+    written — the table-level analogue of the 0-uncited-edges
+    invariant, enforced by the schema rather than by a sweep that has
+    to find violations after the fact.
+
+    Both gates are pinned closed exactly as on :class:`Aircraft`.
+    Nothing here surfaces; publishing is P3 and is Tony's call.
+    """
+
+    __tablename__ = "aircraft_registration_edges"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    canonical_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("canonical_entities.id", ondelete="CASCADE"), nullable=False
+    )
+    aircraft_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("aircraft.id", ondelete="CASCADE"), nullable=False
+    )
+    relation: Mapped[str] = mapped_column(String(16), nullable=False, server_default="registers")
+
+    # ── how this match was made (auditable, not just a score) ──
+    match_tier: Mapped[str] = mapped_column(String(24), nullable=False)
+    match_score: Mapped[float] = mapped_column(Float, nullable=False)
+    #: The alias text that matched, when the tier is alias-based. NULL
+    #: for a canonical-name match. P2 stages only the canonical tier,
+    #: so this is NULL today — it exists so a later tier cannot be
+    #: staged without recording which string produced it.
+    matched_via: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: The raw FAA registrant string this edge was derived from.
+    registrant_name_raw: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # ── citation (all NOT NULL — an uncited edge is unrepresentable) ──
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("aircraft_source_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # ── the fence ──
+    surface_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="suppress"
+    )
+    publication_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="staged"
+    )
+
+    batch_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("canonical_id", "aircraft_id", name="uq_aircraft_reg_edge_pair"),
+        CheckConstraint("relation = 'registers'", name="ck_aircraft_reg_edge_relation"),
+        CheckConstraint("surface_mode = 'suppress'", name="ck_aircraft_reg_edge_suppress"),
+        CheckConstraint("publication_state = 'staged'", name="ck_aircraft_reg_edge_staged"),
+        # Belt to the NOT NULLs' braces: an empty-string citation would
+        # satisfy NOT NULL while citing nothing.
+        CheckConstraint(
+            "length(source_url) > 0 and length(source_sha256) = 64",
+            name="ck_aircraft_reg_edge_cited",
+        ),
+        Index("ix_aircraft_reg_edge_canonical", "canonical_id"),
+        Index("ix_aircraft_reg_edge_aircraft", "aircraft_id"),
+        Index("ix_aircraft_reg_edge_batch", "batch_id"),
+    )
