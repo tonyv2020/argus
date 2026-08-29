@@ -326,8 +326,54 @@ def _chunk_size(table) -> int:
     return max(1, _PARAM_BUDGET // max(1, len(table.__table__.columns)))
 
 
+class FencedWriteError(RuntimeError):
+    """A write to a fenced aircraft table failed. Message is REDACTED.
+
+    Raised in place of the driver's own exception, never alongside it.
+    """
+
+
+def _row_ids(rows: list[dict]) -> str:
+    """Non-identifying handle for a failed chunk: tail numbers / FAA codes.
+
+    An ``n_number`` is painted on the outside of the aircraft. A
+    registrant's name and street address are not, and neither belongs
+    in an error message.
+    """
+    ids = [str(r.get("n_number") or r.get("code") or "?") for r in rows[:8]]
+    more = f" (+{len(rows) - 8} more)" if len(rows) > 8 else ""
+    return ", ".join(ids) + more
+
+
+def _redacted(exc: Exception, table, rows: list[dict]) -> FencedWriteError:
+    """Rebuild a write failure with the PII stripped out.
+
+    Postgres' ``CheckViolation`` DETAIL echoes the ENTIRE failing row —
+    registrant name, street, city, zip — and SQLAlchemy's own message
+    additionally embeds the bound parameters, i.e. the whole chunk. So
+    neither the driver message nor the SQLAlchemy wrapper may reach a
+    log, a response or a traceback. Only the constraint name (which is
+    the actionable part) and tail numbers survive.
+    """
+    constraint = None
+    diag = getattr(getattr(exc, "orig", None), "diag", None)
+    if diag is not None:
+        constraint = getattr(diag, "constraint_name", None)
+    return FencedWriteError(
+        f"{type(exc).__name__} writing {table.__tablename__}"
+        f"{f' (constraint {constraint})' if constraint else ''}"
+        f" [DETAIL REDACTED — contains registrant PII]"
+        f"; affected n_number/code: {_row_ids(rows)}"
+    )
+
+
 async def _upsert_chunk(session, table, rows: list[dict], conflict: str) -> None:
-    """Upsert one chunk, refreshing every non-key column on conflict."""
+    """Upsert one chunk, refreshing every non-key column on conflict.
+
+    Any failure is re-raised REDACTED and with the original suppressed
+    (``from None``) — a chained exception would print the very DETAIL
+    this exists to withhold.
+    """
     if not rows:
         return
     stmt = pg_insert(table).values(rows)
@@ -337,9 +383,20 @@ async def _upsert_chunk(session, table, rows: list[dict], conflict: str) -> None
         if c.name not in {conflict, "id", "created_at", "updated_at"}
     }
     update_cols["updated_at"] = func.now()
-    await session.execute(
-        stmt.on_conflict_do_update(index_elements=[conflict], set_=update_cols)
-    )
+    try:
+        await session.execute(
+            stmt.on_conflict_do_update(index_elements=[conflict], set_=update_cols)
+        )
+    except Exception as exc:
+        raise _redacted(exc, table, rows) from None
+
+
+async def _safe_commit(session, table, rows: list[dict]) -> None:
+    """Commit, redacting any deferred constraint error the same way."""
+    try:
+        await session.commit()
+    except Exception as exc:
+        raise _redacted(exc, table, rows) from None
 
 
 async def _load_stream(
@@ -369,9 +426,9 @@ async def _load_stream(
             return
         await _upsert_chunk(session, table, buf, conflict)
         written += len(buf)
-        buf = []
+        last, buf = buf, []
         if written % commit_every < size:
-            await session.commit()
+            await _safe_commit(session, table, last)
             logger.info("%s: %d rows…", table.__tablename__, written)
 
     for row in parsed:
@@ -471,7 +528,7 @@ async def ingest_faa_aircraft(
 
             snap.master_rows = summary.master_rows
             snap.acftref_rows = summary.acftref_rows
-            await session.commit()
+            await _safe_commit(session, Aircraft, [])
             logger.info("MASTER: %d rows upserted", summary.master_rows)
     finally:
         os.unlink(path)

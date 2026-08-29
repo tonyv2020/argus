@@ -121,6 +121,8 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
         "privacy_sensitive_rows": collections.Counter(),
         "by_registrant_type": collections.Counter(),
         "org_examples": [],
+        "cohorts": collections.Counter(),
+        "eligible_pairs": {},
     }
 
     with psycopg.connect(url) as conn:
@@ -213,6 +215,21 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
                     stats["privacy_sensitive_rows"][rec[2]] += 1
                     break
 
+            cohort = classify(rtype, toks, hits, best, best_ids, distinct_ids)
+            stats["cohorts"][cohort] += 1
+            if cohort == "ELIGIBLE":
+                cid, ctype, _sm, cname, via = max(hits, key=lambda h: h[0])[1]
+                key = (rname, cid)
+                rec = stats["eligible_pairs"].get(key)
+                if rec is None:
+                    stats["eligible_pairs"][key] = {
+                        "registrant": rname, "canonical": cname,
+                        "canonical_type": ctype, "tier": tier, "score": best,
+                        "rtype": rtype, "n_number": nnum, "aircraft": 1,
+                    }
+                else:
+                    rec["aircraft"] += 1
+
             # Examples are ORGANISATION-typed registrants only. An
             # individual's name plus tail number is exactly the linkage
             # the fence exists to withhold, so it never goes in a report.
@@ -235,6 +252,62 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
                 )
 
     return stats
+
+
+# ─── cohort selection (the gate helen approves) ──────────────────
+
+#: FAA registrant types that denote a natural person. Every match on
+#: one of these is HELD for Tony regardless of score — attaching a
+#: tail number to a named individual is the privacy decision itself.
+_INDIVIDUAL_TYPES = {"1", "4"}
+
+
+def classify(rtype, toks, hits, best, best_ids, distinct_ids):
+    """Return the cohort this matched row belongs to.
+
+    Order matters: a row can be disqualified several ways and the
+    STRONGEST reason wins, so a suppressed individual is reported as a
+    hold rather than quietly dropped as cross-type.
+    """
+    if any(rec[2] in ("suppress", "alias") for _s, rec in hits):
+        return "HOLD_privacy"
+    if rtype in _INDIVIDUAL_TYPES:
+        return "HOLD_individual"
+    if len(toks) == 1:
+        return "DROP_single_token"
+    expected = _EXPECTED_TYPES.get(rtype or "", set())
+    if expected and not any(rec[1] in expected for _s, rec in hits):
+        return "DROP_cross_type"
+    if len(best_ids) > 1:
+        return "DROP_true_tie"
+    if best < SCORE_EXACT_ALIAS:
+        return "DROP_below_tier"
+    return "ELIGIBLE"
+
+
+def sample_eligible(pairs: dict, want: int = 40) -> list[dict]:
+    """Deterministic sample of distinct registrant->entity pairs.
+
+    Deduped by pair, because 12 rows of the same airline tell a
+    reviewer nothing that one row does not. Deliberately over-weights
+    the weaker 0.90 tier relative to its share — that is the tier whose
+    quality is actually in question.
+    """
+    by_tier = {"exact_canonical": [], "exact_alias": []}
+    for key in sorted(pairs):
+        rec = pairs[key]
+        if rec["tier"] in by_tier:
+            by_tier[rec["tier"]].append(rec)
+    want_alias = min(len(by_tier["exact_alias"]), max(1, want // 3))
+    want_canon = want - want_alias
+    out = []
+    for tier, n in (("exact_canonical", want_canon), ("exact_alias", want_alias)):
+        rows = by_tier[tier]
+        if not rows:
+            continue
+        stride = max(1, len(rows) // max(1, n))
+        out.extend(rows[::stride][:n])
+    return out
 
 
 def _print(stats: dict) -> None:  # pragma: no cover
@@ -269,6 +342,21 @@ def _print(stats: dict) -> None:  # pragma: no cover
     print("\n-- by FAA type_registrant")
     for t, c in sorted(stats["by_registrant_type"].items()):
         print(f"   {t:<4} {c:>8,}")
+
+    print("\n-- COHORTS (the gate)")
+    for name in ("ELIGIBLE", "HOLD_privacy", "HOLD_individual", "DROP_single_token",
+                 "DROP_cross_type", "DROP_true_tie", "DROP_below_tier"):
+        print(f"   {name:<20} {stats['cohorts'].get(name, 0):>8,}")
+    pairs = stats["eligible_pairs"]
+    print(f"   distinct eligible registrant->entity pairs: {len(pairs):,}")
+
+    print("\n-- SAMPLE FOR REVIEW (distinct pairs; organisations only)")
+    print(f"   {'registrant_name':<42} {'->':2} {'matched entity':<32} "
+          f"{'tier':<16} {'score':<6} {'type':<13} {'#ac':>5}")
+    for r in sample_eligible(pairs, want=40):
+        print(f"   {r['registrant'][:42]:<42} -> {r['canonical'][:32]:<32} "
+              f"{r['tier']:<16} {r['score']:<6.2f} {r['canonical_type']:<13} "
+              f"{r['aircraft']:>5}")
 
     print("\n-- examples (ORGANISATION registrants only; individuals withheld)")
     for ex in stats["org_examples"]:
