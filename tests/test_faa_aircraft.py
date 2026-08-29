@@ -334,3 +334,112 @@ def test_batch_id_is_derived_from_content() -> None:
     the upsert is a no-op rather than a duplicate load."""
     src = inspect.getsource(faa.ingest_faa_aircraft)
     assert 'f"faa-aircraft-{sha[:12]}"' in src
+
+
+# ─── PII redaction on write failure (P2 hard requirement) ────────
+
+# A realistic driver message. Postgres' CheckViolation DETAIL echoes
+# the ENTIRE failing row, and SQLAlchemy additionally embeds the bound
+# parameters — so the raw text carries the registrant's name and home
+# address. Neither may reach a log, a response or a traceback.
+_LEAKY = (
+    '(psycopg.errors.CheckViolation) new row for relation "aircraft" '
+    'violates check constraint "ck_aircraft_p1_suppress"\n'
+    'DETAIL:  Failing row contains (af0d80ac, 00600060, 100, 5334, 7100510, '
+    '17003, 1940, 1, BENE MARY D, PO BOX 329, null, KETCHUM, OK, 743490329, '
+    '2, 097, US, [], open, staged).\n'
+    "[parameters: {'registrant_name': 'BENE MARY D', 'street': 'PO BOX 329', "
+    "'city': 'KETCHUM', 'zip_code': '743490329'}]"
+)
+
+_PII_TOKENS = ("BENE MARY D", "PO BOX 329", "KETCHUM", "743490329", "DETAIL:  Failing row")
+
+
+class _FakeDiag:
+    constraint_name = "ck_aircraft_p1_suppress"
+
+
+class _FakeOrig(Exception):
+    diag = _FakeDiag()
+
+
+class _FakeIntegrityError(Exception):
+    """Stands in for sqlalchemy.exc.IntegrityError, message and all."""
+
+    orig = _FakeOrig()
+
+    def __str__(self) -> str:
+        return _LEAKY
+
+
+def test_write_failure_message_carries_no_registrant_pii() -> None:
+    """The redacted error must not contain the name, street, city, zip
+    or the raw DETAIL — that is the whole point of the fence."""
+    err = faa._redacted(
+        _FakeIntegrityError(),
+        Aircraft,
+        [{"n_number": "100", "registrant_name": "BENE MARY D", "street": "PO BOX 329"}],
+    )
+    msg = str(err)
+    for token in _PII_TOKENS:
+        assert token not in msg, f"redacted message leaked {token!r}: {msg}"
+
+
+def test_write_failure_message_keeps_what_is_actionable() -> None:
+    """Redaction must not make the error useless: the constraint name
+    and the tail number(s) are what an operator needs."""
+    err = faa._redacted(
+        _FakeIntegrityError(), Aircraft, [{"n_number": "100"}, {"n_number": "444WN"}]
+    )
+    msg = str(err)
+    assert "ck_aircraft_p1_suppress" in msg
+    assert "100" in msg and "444WN" in msg
+    assert "aircraft" in msg
+    assert "REDACTED" in msg
+    assert isinstance(err, faa.FencedWriteError)
+
+
+def test_row_ids_caps_the_list_and_never_emits_names() -> None:
+    """A failed chunk is up to ~1.3k rows; the handle stays bounded and
+    is drawn only from tail numbers, which are painted on the outside
+    of the aircraft. Names and addresses are not."""
+    rows = [{"n_number": f"N{i}", "registrant_name": "SMITH JOHN"} for i in range(20)]
+    out = faa._row_ids(rows)
+    assert "SMITH JOHN" not in out
+    assert "+12 more" in out
+    # 8 ids listed => 7 separators.
+    assert out.count(",") == 7
+    assert out.startswith("N0, N1,")
+
+
+def test_upsert_reraises_redacted_with_original_suppressed() -> None:
+    """``from None`` matters: a chained exception prints the original
+    in the traceback, which would re-leak the DETAIL this suppresses."""
+    import asyncio
+
+    class _Session:
+        async def execute(self, *_a, **_k):
+            raise _FakeIntegrityError()
+
+    async def go():
+        await faa._upsert_chunk(
+            _Session(), Aircraft, [{"n_number": "100", "unique_id": "1"}], "unique_id"
+        )
+
+    try:
+        asyncio.run(go())
+    except faa.FencedWriteError as err:
+        assert err.__cause__ is None and err.__suppress_context__ is True
+        for token in _PII_TOKENS:
+            assert token not in str(err)
+    else:
+        raise AssertionError("expected FencedWriteError")
+
+
+def test_ingester_never_logs_a_raw_exception_on_the_write_path() -> None:
+    """Guards the other leak route: logging the caught exception (or
+    using logger.exception, which prints the traceback) would emit the
+    DETAIL even though the raised error is clean."""
+    src = inspect.getsource(faa)
+    for bad in ("logger.exception", "logger.error(exc", "print(exc", "str(exc)"):
+        assert bad not in src, f"write path must not emit the raw exception: {bad}"
