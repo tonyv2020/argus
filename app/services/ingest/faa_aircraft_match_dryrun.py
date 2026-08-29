@@ -115,6 +115,7 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
         "by_tier": collections.Counter(),
         "score_hist": collections.Counter(),
         "ambiguous_rows": 0,
+        "resolved_by_tier_rows": 0,
         "cross_type_rows": 0,
         "single_token_rows": 0,
         "privacy_sensitive_rows": collections.Counter(),
@@ -178,6 +179,15 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
             # distinct canonicals, not distinct index entries — an entity
             # matching by both its name and its alias is one candidate.
             distinct_ids = {rec[0] for _s, rec in hits}
+            # Ambiguity that MATTERS is a tie at the best score. Hits at
+            # a lower tier are already resolved by the score: the live
+            # case is "AMERICAN AIRLINES INC", which matches the carrier
+            # canonically (1.00) and its parent "American Airlines Group"
+            # only by alias (0.90). Those are two real entities, not a
+            # duplicate — the carrier is the right answer and the score
+            # already says so. Counting them as ambiguous overstates the
+            # problem and would argue for a merge that must not happen.
+            best_ids = {rec[0] for s, rec in hits if round(s, 2) == best}
 
             stats["rows_with_candidate"] += 1
             # Count distinct canonicals; raw index hits overstate by the
@@ -187,8 +197,10 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
             stats["by_tier"][tier] += 1
             stats["score_hist"][best] += 1
             stats["by_registrant_type"][rtype or "(null)"] += 1
-            if len(distinct_ids) > 1:
+            if len(best_ids) > 1:
                 stats["ambiguous_rows"] += 1
+            elif len(distinct_ids) > 1:
+                stats["resolved_by_tier_rows"] += 1
             if len(toks) == 1:
                 stats["single_token_rows"] += 1
 
@@ -218,7 +230,7 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
                         "canonical_type": ctype,
                         "score": hits[0][0],
                         "via": via,
-                        "n_candidates": len(distinct_ids),
+                        "n_candidates": len(best_ids),
                     }
                 )
 
@@ -246,7 +258,9 @@ def _print(stats: dict) -> None:  # pragma: no cover
         print(f"   {tier:<18} {c:>8,}")
 
     print("\n-- REVIEW FLAGS (why a match may be wrong)")
-    print(f"   ambiguous (>1 canonical)   {stats['ambiguous_rows']:>8,}")
+    print(f"   ambiguous AT BEST SCORE    {stats['ambiguous_rows']:>8,}   <- the real problem")
+    print(f"   multi-candidate, resolved  {stats['resolved_by_tier_rows']:>8,}   "
+          f"(lower-tier hits the score already settles, e.g. carrier vs parent)")
     print(f"   cross-type registrant      {stats['cross_type_rows']:>8,}")
     print(f"   single-token name          {stats['single_token_rows']:>8,}")
     for mode, c in stats["privacy_sensitive_rows"].items():
