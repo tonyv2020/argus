@@ -110,6 +110,7 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
         "with_registrant_name": 0,
         "distinct_registrant_names": 0,
         "candidates": 0,
+        "index_hits": 0,
         "rows_with_candidate": 0,
         "by_tier": collections.Counter(),
         "score_hist": collections.Counter(),
@@ -152,31 +153,40 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
             toks = frozenset(norm.split())
 
             hits: list[tuple] = []
-            tier = None
             for rec in exact.get(norm, []):
                 score = (
                     SCORE_EXACT_CANONICAL if rec[4] == "canonical" else SCORE_EXACT_ALIAS
                 )
                 hits.append((score, rec))
-                tier = "exact_canonical" if rec[4] == "canonical" else "exact_alias"
             if not hits and len(toks) >= 2:
                 for rec in tokenset.get(toks, []):
                     hits.append((SCORE_TOKEN_SET, rec))
-                    tier = "token_set"
 
             if not hits:
                 continue
 
-            stats["rows_with_candidate"] += 1
-            stats["candidates"] += len(hits)
-            stats["by_tier"][tier] += 1
-            best = max(h[0] for h in hits)
-            stats["score_hist"][round(best, 2)] += 1
-            stats["by_registrant_type"][rtype or "(null)"] += 1
+            # Tier follows the BEST score, not whichever hit happened to
+            # come last — a row matching a canonical AND its alias is an
+            # exact-canonical match, not an alias one.
+            best = round(max(h[0] for h in hits), 2)
+            tier = {
+                SCORE_EXACT_CANONICAL: "exact_canonical",
+                SCORE_EXACT_ALIAS: "exact_alias",
+                SCORE_TOKEN_SET: "token_set",
+            }[best]
 
             # distinct canonicals, not distinct index entries — an entity
             # matching by both its name and its alias is one candidate.
             distinct_ids = {rec[0] for _s, rec in hits}
+
+            stats["rows_with_candidate"] += 1
+            # Count distinct canonicals; raw index hits overstate by the
+            # number of aliases a big organisation happens to carry.
+            stats["candidates"] += len(distinct_ids)
+            stats["index_hits"] += len(hits)
+            stats["by_tier"][tier] += 1
+            stats["score_hist"][best] += 1
+            stats["by_registrant_type"][rtype or "(null)"] += 1
             if len(distinct_ids) > 1:
                 stats["ambiguous_rows"] += 1
             if len(toks) == 1:
@@ -223,7 +233,8 @@ def _print(stats: dict) -> None:  # pragma: no cover
     print(f"  distinct registrant names  {stats['distinct_registrant_names']:,}")
     print(f"rows with >=1 candidate      {n:,}"
           f"  ({100.0*n/max(1,stats['with_registrant_name']):.1f}% of named rows)")
-    print(f"total candidate pairs        {stats['candidates']:,}")
+    print(f"distinct candidate pairs     {stats['candidates']:,}"
+          f"   (raw index hits {stats['index_hits']:,} — inflated by alias rows)")
 
     print("\n-- score distribution (best score per row)")
     for score in sorted(stats["score_hist"], reverse=True):
