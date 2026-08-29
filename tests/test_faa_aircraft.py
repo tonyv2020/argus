@@ -22,10 +22,23 @@ from app.services.ingest import faa_aircraft as faa
 
 # ─── fixtures mirroring the real FAA layout ──────────────────────
 
+def as_source_text(header: str) -> str:
+    """Return a header string exactly as the reader sees it.
+
+    The registry files carry a UTF-8 BOM but are decoded latin-1, so
+    the BOM arrives as the three characters ``ï»¿`` — NOT U+FEFF. A
+    fixture that uses U+FEFF passes against a parser that is broken
+    on the real file, which is precisely what happened on the first
+    live dry run: the BOM stuck to ``N-NUMBER``/``CODE``, both natural
+    keys went unmapped, and all 410,331 rows dropped as malformed.
+    """
+    return ("﻿" + header).encode("utf-8").decode("latin-1")
+
+
 # The exact MASTER.txt header as served (leading BOM, a leading space
 # on " KIT MODEL", and a trailing comma that yields a 35th field).
-MASTER_HEADER = (
-    "﻿N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR,TYPE REGISTRANT,"
+MASTER_HEADER = as_source_text(
+    "N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR,TYPE REGISTRANT,"
     "NAME,STREET,STREET2,CITY,STATE,ZIP CODE,REGION,COUNTY,COUNTRY,LAST ACTION DATE,"
     "CERT ISSUE DATE,CERTIFICATION,TYPE AIRCRAFT,TYPE ENGINE,STATUS CODE,MODE S CODE,"
     "FRACT OWNER,AIR WORTH DATE,OTHER NAMES(1),OTHER NAMES(2),OTHER NAMES(3),"
@@ -43,8 +56,8 @@ _MASTER_COLS = [
     "UNIQUE ID", "KIT MFR", "KIT MODEL", "MODE S CODE HEX",
 ]
 
-ACFTREF_HEADER = (
-    "﻿CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,"
+ACFTREF_HEADER = as_source_text(
+    "CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,"
     "AC-WEIGHT,SPEED,TC-DATA-SHEET,TC-DATA-HOLDER,"
 )
 
@@ -282,6 +295,38 @@ def test_chunk_size_stays_under_the_postgres_parameter_cap() -> None:
         size = faa._chunk_size(table)
         assert size >= 1
         assert size * len(table.__table__.columns) < 65535
+
+
+def test_latin1_bom_does_not_break_the_first_column() -> None:
+    """Regression, 2026-08-29 live dry run. The BOM decodes to 'ï»¿'
+    under latin-1, so it lands on N-NUMBER and CODE — the two natural
+    keys. Stripping only U+FEFF drops 100% of both files."""
+    assert MASTER_HEADER.startswith("ï»¿N-NUMBER")
+    assert ACFTREF_HEADER.startswith("ï»¿CODE")
+    assert faa._norm_header("ï»¿N-NUMBER") == "N-NUMBER"
+    assert faa._norm_header("﻿CODE") == "CODE"
+
+    parsed, summary = parse_master_lines(
+        master_row(**{"N-NUMBER": "1234A", "UNIQUE ID": "77", "NAME": "SMITH JOHN"})
+    )
+    assert summary.master_malformed == 0
+    assert parsed[0]["n_number"] == "1234A"
+
+
+def test_unmappable_header_raises_instead_of_dropping_every_row() -> None:
+    """A header we cannot map is a source-layout change, not bad data.
+    Silently counting 316k individually-malformed rows buries the
+    cause; failing the run surfaces it."""
+    import csv
+
+    import pytest
+
+    summary = faa.IngestSummary()
+    bad = "WING-COUNT,PAINT-COLOUR,"
+    with pytest.raises(ValueError, match="missing required column"):
+        list(faa.parse_master(iter(csv.reader([bad, "1,2,"])), summary))
+    with pytest.raises(ValueError, match="missing required column"):
+        list(faa.parse_acftref(iter(csv.reader([bad, "1,2,"])), summary))
 
 
 def test_batch_id_is_derived_from_content() -> None:

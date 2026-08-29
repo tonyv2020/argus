@@ -141,10 +141,29 @@ def _as_int(value: str | None) -> int | None:
 def _norm_header(name: str) -> str:
     """Normalise a header cell — strips the UTF-8 BOM and padding.
 
-    The FAA header starts with a BOM and at least one column
-    (``KIT MODEL``) is written with a leading space.
+    The registry files are latin-1, so the UTF-8 BOM that opens each
+    header decodes to the three characters ``ï»¿`` rather than to
+    U+FEFF. Both forms are stripped: matching only U+FEFF silently
+    breaks the FIRST column of each file (``N-NUMBER`` / ``CODE``),
+    which are exactly the two natural keys — so every row fails its
+    key check and the whole load drops as "malformed".
     """
-    return name.replace("﻿", "").strip().upper()
+    return name.replace("﻿", "").replace("ï»¿", "").strip().upper()
+
+
+def _require_columns(idx: dict[str, int], required: set[str], filename: str) -> None:
+    """Fail loudly when the header does not carry the columns we map.
+
+    A header we cannot map is a source-layout change, not a data
+    problem — without this it presents as every row being individually
+    malformed, which reads like bad data and buries the real cause.
+    """
+    missing = sorted(required - idx.keys())
+    if missing:
+        raise ValueError(
+            f"{filename}: header is missing required column(s) {missing}. "
+            f"Header parsed as: {sorted(idx)}"
+        )
 
 
 # ─── parsing ─────────────────────────────────────────────────────
@@ -168,6 +187,7 @@ def parse_master(rows: Iterator[list[str]], summary: IngestSummary) -> Iterator[
     """
     header = [_norm_header(c) for c in next(rows)]
     idx = {name: i for i, name in enumerate(header)}
+    _require_columns(idx, {"N-NUMBER", "UNIQUE ID", "NAME", "MFR MDL CODE"}, "MASTER.txt")
 
     def g(row: list[str], col: str) -> str | None:
         i = idx.get(col)
@@ -240,6 +260,7 @@ def parse_acftref(rows: Iterator[list[str]], summary: IngestSummary) -> Iterator
     """Map ``ACFTREF.txt`` rows to ``aircraft_reference`` column dicts."""
     header = [_norm_header(c) for c in next(rows)]
     idx = {name: i for i, name in enumerate(header)}
+    _require_columns(idx, {"CODE", "MFR", "MODEL"}, "ACFTREF.txt")
 
     def g(row: list[str], col: str) -> str | None:
         i = idx.get(col)
