@@ -29,8 +29,21 @@ spec:
           restartPolicy: Never
           containers:
             - name: faa-aircraft-ingest
-              image: registry.lan/argus/api:local
-              imagePullPolicy: Always
+              # IMMUTABLE tag encoding the main commit it was built from
+              # (d8c3b1c), NOT a floating :local. The weekly job runs
+              # unattended, so what it executes has to be identifiable
+              # after the fact from the tag alone.
+              #
+              # This tag carries the CheckViolation PII redaction. The
+              # previous image (p1air-e867e7a42753) predates it: a failed
+              # write there puts the whole registrant row — name, street,
+              # city, zip — into the pod log.
+              image: registry.lan/argus/api:p2-d8c3b1c
+              # IfNotPresent, not Always: the tag is immutable, so a
+              # re-pull can only fetch the same digest. Always would also
+              # make the weekly run depend on the registry being up at
+              # 09:00 Sunday for no benefit.
+              imagePullPolicy: IfNotPresent
               command:
                 - python
                 - -m
