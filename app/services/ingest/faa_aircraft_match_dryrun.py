@@ -74,26 +74,37 @@ def _load_canonical_index(cur) -> tuple[dict, dict]:
     exact: dict[str, list[tuple]] = collections.defaultdict(list)
     tokenset: dict[frozenset, list[tuple]] = collections.defaultdict(list)
 
+    # Edge count is a review signal, not a filter: a canonical with 0
+    # edges is a thin news-tag entity Argus barely knows, and attaching
+    # a fleet to one is a weaker claim than the score alone suggests.
     cur.execute(
-        "select id, type, surface_mode, canonical_name, canonical_name_normalized "
-        "from canonical_entities"
+        "select e.id, e.type, e.surface_mode, e.canonical_name, e.canonical_name_normalized, "
+        "  (select count(*) from canonical_edges g "
+        "   where g.source_id=e.id or g.target_id=e.id) "
+        "from canonical_entities e"
     )
-    for cid, ctype, smode, name, norm in cur.fetchall():
+    for cid, ctype, smode, name, norm, edges in cur.fetchall():
         key = norm or normalize_name(name)
-        rec = (cid, ctype, smode, name, "canonical")
+        rec = (cid, ctype, smode, name, "canonical", name, edges)
         exact[key].append(rec)
         toks = frozenset(key.split())
         if len(toks) >= 2:
             tokenset[toks].append(rec)
 
+    # NOTE: display the CANONICAL entity's name, not the alias text.
+    # Showing the alias makes a review sample lie — "U.S. Department of
+    # Energy" is an alias string, and the reviewer needs to see which
+    # entity it actually resolves to.
     cur.execute(
-        "select a.canonical_id, e.type, e.surface_mode, a.surface_name, "
-        "       a.surface_name_normalized "
+        "select a.canonical_id, e.type, e.surface_mode, e.canonical_name, "
+        "       a.surface_name_normalized, a.surface_name, "
+        "  (select count(*) from canonical_edges g "
+        "   where g.source_id=e.id or g.target_id=e.id) "
         "from entity_aliases a join canonical_entities e on e.id = a.canonical_id"
     )
-    for cid, ctype, smode, name, norm in cur.fetchall():
-        key = norm or normalize_name(name)
-        rec = (cid, ctype, smode, name, "alias")
+    for cid, ctype, smode, cname, norm, alias_name, edges in cur.fetchall():
+        key = norm or normalize_name(alias_name)
+        rec = (cid, ctype, smode, cname, "alias", alias_name, edges)
         exact[key].append(rec)
         toks = frozenset(key.split())
         if len(toks) >= 2:
@@ -218,7 +229,9 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
             cohort = classify(rtype, toks, hits, best, best_ids, distinct_ids)
             stats["cohorts"][cohort] += 1
             if cohort == "ELIGIBLE":
-                cid, ctype, _sm, cname, via = max(hits, key=lambda h: h[0])[1]
+                cid, ctype, _sm, cname, via, matched_via, edges = max(
+                    hits, key=lambda h: h[0]
+                )[1]
                 key = (rname, cid)
                 rec = stats["eligible_pairs"].get(key)
                 if rec is None:
@@ -226,6 +239,7 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
                         "registrant": rname, "canonical": cname,
                         "canonical_type": ctype, "tier": tier, "score": best,
                         "rtype": rtype, "n_number": nnum, "aircraft": 1,
+                        "matched_via": matched_via, "edges": edges,
                     }
                 else:
                     rec["aircraft"] += 1
@@ -238,7 +252,7 @@ def run_dryrun(limit: int | None = None, examples: int = 12) -> dict:
                 and rtype in ("2", "3", "7", "8")
                 and not any(rec[2] in ("suppress", "alias") for _s, rec in hits)
             ):
-                cid, ctype, smode, cname, via = hits[0][1]
+                cid, ctype, smode, cname, via, _mv, _ed = hits[0][1]
                 stats["org_examples"].append(
                     {
                         "n_number": nnum,
@@ -351,12 +365,13 @@ def _print(stats: dict) -> None:  # pragma: no cover
     print(f"   distinct eligible registrant->entity pairs: {len(pairs):,}")
 
     print("\n-- SAMPLE FOR REVIEW (distinct pairs; organisations only)")
-    print(f"   {'registrant_name':<42} {'->':2} {'matched entity':<32} "
-          f"{'tier':<16} {'score':<6} {'type':<13} {'#ac':>5}")
+    print(f"   {'registrant_name':<38} {'canonical entity':<30} {'score':<6} "
+          f"{'edges':>5} {'#ac':>5}  matched_via (if alias)")
     for r in sample_eligible(pairs, want=40):
-        print(f"   {r['registrant'][:42]:<42} -> {r['canonical'][:32]:<32} "
-              f"{r['tier']:<16} {r['score']:<6.2f} {r['canonical_type']:<13} "
-              f"{r['aircraft']:>5}")
+        via = "" if r["tier"] == "exact_canonical" else r["matched_via"][:26]
+        flag = "  <-- 0 edges" if r["edges"] == 0 else ""
+        print(f"   {r['registrant'][:38]:<38} {r['canonical'][:30]:<30} "
+              f"{r['score']:<6.2f} {r['edges']:>5} {r['aircraft']:>5}  {via}{flag}")
 
     print("\n-- examples (ORGANISATION registrants only; individuals withheld)")
     for ex in stats["org_examples"]:
