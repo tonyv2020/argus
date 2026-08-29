@@ -1,0 +1,49 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: faa-aircraft-ingest
+  namespace: argus
+  labels:
+    app.kubernetes.io/name: argus
+    app.kubernetes.io/component: faa-aircraft-ingest
+spec:
+  # Weekly Sunday 09:00 UTC — deliberately off the scheduled-sweep slot
+  # (Mon 07:00) so the two never contend for the API pod's database.
+  # The FAA republishes the releasable database daily, but P1 is a
+  # fenced asset layer nobody reads yet; weekly is enough and the
+  # content-derived batch id makes an unchanged week a no-op upsert.
+  schedule: "0 9 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      # 73 MB download + ~316k upserts. Observed run is well under
+      # this; the ceiling exists to kill a hung fetch, not to bound
+      # normal work.
+      activeDeadlineSeconds: 5400
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: faa-aircraft-ingest
+              image: registry.lan/argus/api:local
+              imagePullPolicy: Always
+              command:
+                - python
+                - -m
+                - app.services.ingest.faa_aircraft
+              envFrom:
+                - secretRef:
+                    name: argus-env
+              resources:
+                requests:
+                  memory: "512Mi"
+                  cpu: "200m"
+                limits:
+                  # Rows stream in cap-sized chunks, so peak RSS is the
+                  # zip member buffer plus one chunk — not the file.
+                  memory: "2Gi"
+                  cpu: "1000m"

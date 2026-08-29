@@ -5,7 +5,7 @@ Every edge carries a **SourceCitation** — a relationship is not shown without 
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from uuid import uuid4
 
@@ -13,6 +13,8 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -522,4 +524,213 @@ class DisclosureRow(Base):
     reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ─── P1 aircraft asset layer (2026-08-29) ────────────────────────
+#
+# Standalone PG-truth tables. Deliberately NOT wired to the graph:
+# no ``EntityType`` member, no ``canonical_entities`` row, no Neo4j
+# projection, no read-gate participation, no entity resolution. The
+# FAA registrant name on an ``Aircraft`` row is a raw source string,
+# NOT a resolved person — connecting it to a canonical is P2 and is
+# Tony's call (helen decision doc, 2026-08-29).
+#
+# THE FENCE. ``MASTER.txt`` carries the home street address of every
+# individual registrant — ~316k rows of live PII. The fence is
+# therefore structural, not conventional: ``surface_mode`` and
+# ``publication_state`` are pinned by CHECK constraints, so an
+# UPDATE that tries to surface a row FAILS at the database. Opening
+# the fence requires dropping a named constraint in a migration —
+# a reviewable schema change, not a query someone can run by hand.
+
+
+class AircraftSourceSnapshot(Base):
+    """One download of the FAA Releasable Aircraft Database.
+
+    The provenance anchor for every row this ingest writes — the
+    aircraft analogue of :class:`DisclosureDocument`. P1 emits no
+    edges and therefore no ``SourceCitation``; when P2 emits them,
+    the citation quotes this snapshot's ``sha256``.
+
+    The zip is NOT archived to disk (194 MB uncompressed of mostly
+    PII we have no reason to keep a second copy of). The sha256 of
+    the fetched bytes is what makes the claim checkable.
+    """
+
+    __tablename__ = "aircraft_source_snapshots"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    bytes_len: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: ``Last-Modified`` as served by the FAA, when present — the
+    #: registry's own statement of vintage, distinct from when we fetched it.
+    source_last_modified: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    #: Batch id stamped onto every row written from this snapshot.
+    batch_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    master_rows: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    acftref_rows: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+    __table_args__ = (
+        UniqueConstraint("batch_id", name="uq_aircraft_snapshot_batch"),
+        Index("ix_aircraft_snapshot_sha256", "sha256"),
+    )
+
+
+class AircraftReference(Base):
+    """One ``ACFTREF.txt`` row — manufacturer/model reference data.
+
+    Pure reference data keyed by the FAA ``CODE`` that
+    ``Aircraft.mfr_mdl_code`` points at. Carries no personal data,
+    so it takes the lifecycle gate (``publication_state``) but NOT
+    ``surface_mode`` — a privacy mode on "Cessna / 172S" would be
+    meaningless, and a column that is always the same value invites
+    someone to read it as a privacy claim it is not making.
+    """
+
+    __tablename__ = "aircraft_reference"
+
+    #: FAA ``CODE`` — the join key from ``Aircraft.mfr_mdl_code``.
+    code: Mapped[str] = mapped_column(String(7), primary_key=True)
+    mfr: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model: Mapped[str | None] = mapped_column(Text, nullable=True)
+    type_acft: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    type_eng: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    ac_cat: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    build_cert_ind: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    no_eng: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    no_seats: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ac_weight: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    speed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tc_data_sheet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tc_data_holder: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    publication_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="staged"
+    )
+    snapshot_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("aircraft_source_snapshots.id", ondelete="SET NULL"), nullable=True
+    )
+    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "publication_state = 'staged'",
+            name="ck_aircraft_reference_p1_staged",
+        ),
+        Index("ix_aircraft_reference_mfr", "mfr"),
+    )
+
+
+class Aircraft(Base):
+    """One ``MASTER.txt`` row — a single FAA aircraft registration.
+
+    PII-BEARING. ``registrant_name`` / ``street`` / ``street2`` /
+    ``city`` / ``state`` / ``zip_code`` are, for a ``type_registrant``
+    of ``1`` (Individual), a private person's name and home address.
+    Nothing in P1 reads this table on any public path; both gates are
+    pinned closed by CHECK constraint (see the module comment above).
+
+    Idempotency key is ``unique_id`` — the FAA's own stable per-
+    registration id. ``n_number`` is unique in a given snapshot but
+    is reassigned across deregistration, so it is indexed, not keyed.
+    """
+
+    __tablename__ = "aircraft"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+
+    #: FAA ``UNIQUE ID`` — stable natural key, the upsert conflict target.
+    unique_id: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: Registration mark WITHOUT the leading "N" (the file stores it bare).
+    n_number: Mapped[str] = mapped_column(String(10), nullable=False)
+    serial_number: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: Join key into :class:`AircraftReference`. No FK — MASTER rows
+    #: reference codes absent from ACFTREF, and a dangling code is a
+    #: fact about the source, not a reason to reject the row.
+    mfr_mdl_code: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    eng_mfr_mdl: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    year_mfr: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ── registrant (PII) ──
+    #: FAA code: 1=Individual 2=Partnership 3=Corporation 4=Co-Owned
+    #: 5=Government 7=LLC 8=Non-Citizen Corp 9=Non-Citizen Co-Owned.
+    type_registrant: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    registrant_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    street: Mapped[str | None] = mapped_column(Text, nullable=True)
+    street2: Mapped[str | None] = mapped_column(Text, nullable=True)
+    city: Mapped[str | None] = mapped_column(Text, nullable=True)
+    state: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    zip_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    region: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    county: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    #: ``OTHER NAMES(1..5)`` collapsed to an ordered list of the
+    #: non-blank entries. Order is the source's, and is meaningful.
+    other_names: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+
+    # ── registration facts ──
+    last_action_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    cert_issue_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    certification: Mapped[str | None] = mapped_column(Text, nullable=True)
+    type_aircraft: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    type_engine: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    status_code: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    mode_s_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    mode_s_code_hex: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: ``FRACT OWNER`` — "Y" means fractional ownership; blank otherwise.
+    fract_owner: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    air_worth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    expiration_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    kit_mfr: Mapped[str | None] = mapped_column(Text, nullable=True)
+    kit_model: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # ── the fence ──
+    surface_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="suppress"
+    )
+    publication_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="staged"
+    )
+
+    # ── provenance ──
+    snapshot_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("aircraft_source_snapshots.id", ondelete="SET NULL"), nullable=True
+    )
+    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("unique_id", name="uq_aircraft_unique_id"),
+        # THE FENCE — P1 pins both gates closed at the database.
+        # Opening either is a migration that drops a named constraint,
+        # which is a reviewable change. Tony's call, not an emitter's.
+        CheckConstraint(
+            "surface_mode = 'suppress'",
+            name="ck_aircraft_p1_suppress",
+        ),
+        CheckConstraint(
+            "publication_state = 'staged'",
+            name="ck_aircraft_p1_staged",
+        ),
+        Index("ix_aircraft_n_number", "n_number"),
+        Index("ix_aircraft_mfr_mdl_code", "mfr_mdl_code"),
+        Index("ix_aircraft_batch_id", "batch_id"),
+        # P2 entity resolution will scan by registrant name; cheap now.
+        Index("ix_aircraft_registrant_name", "registrant_name"),
     )
