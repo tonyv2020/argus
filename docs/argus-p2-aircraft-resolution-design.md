@@ -65,7 +65,8 @@ score distribution      1.00  7,143    0.90  671    0.75  137
 by tier         exact_canonical 7,143  exact_alias 671  token_set 137
 
 REVIEW FLAGS
-  ambiguous (>1 canonical)     2,343   <- 29% of matched rows
+  ambiguous AT BEST SCORE        104   <- the real problem (1.3%)
+  multi-candidate, resolved    2,239   (settled by tier; see below)
   cross-type registrant          515
   single-token name            1,081
   candidate is suppress          133
@@ -84,12 +85,24 @@ political/financial reporting, so it simply does not contain most of
 the 197k private registrants. Nothing should be tuned to "improve"
 this number.
 
-**29% of matched rows are ambiguous.** 2,343 rows resolve to more
-than one canonical. The examples show why: `UNITED AIRLINES INC` hits
-**two** distinct canonicals, as do `AMERICAN AIRLINES INC` — the
-graph carries duplicate canonicals for the same organisation. **P2
-should not run before a dedup pass**, or it will attach aircraft to
-an arbitrary one of two nodes for the same company.
+**The ambiguity is mostly parent-vs-subsidiary, and the score already
+resolves it.** My first reading of 2,343 multi-candidate rows was that
+the graph held duplicate canonicals needing a dedup pass. Checking the
+live rows says otherwise:
+
+| registrant | matches | |
+|---|---|---|
+| `AMERICAN AIRLINES INC` | `AMERICAN AIRLINES` (carrier) | canonical, **1.00** |
+| | `American Airlines Group` (parent) | alias only, 0.90 |
+| `UNITED AIRLINES INC` | `UNITED AIRLINES` (carrier) | canonical, **1.00** |
+| | `United Airlines Holdings Inc` (parent) | alias only, 0.90 |
+
+These are **two real entities each**, not duplicates — merging them
+would be a mistake, and the ontology already has `subsidiary_of` to
+relate them. The carrier is what the FAA registrant names, and the
+tier ordering picks it. Measured properly — ties **at the best
+score** — genuine ambiguity is **104 rows (1.3%)**, not 2,343. Those
+104 still need a rule; the rest do not.
 
 **1,081 single-token names.** A bare surname matching a canonical is
 the classic false positive. These should be excluded outright, not
@@ -103,11 +116,19 @@ privacy-surfacing decision and **Tony's call**, not a threshold.
 
 ## Proposed gate before any edge is written
 
-1. Dedup the duplicate organisation canonicals (the United/American case).
-2. Exclude single-token and cross-type matches entirely.
+1. Exclude single-token and cross-type matches entirely (1,596 rows).
+2. Resolve the 104 best-score ties by an explicit rule, or drop them.
+   Do **not** dedup carrier-vs-parent; prefer the canonical-tier hit.
 3. Hold every `suppress`/`alias` candidate for Tony — no default.
-4. Human review of a sample of the ~5,000 surviving corporate matches.
+4. Human review of a sample of the ~6,000 surviving corporate matches.
 5. Write edges **staged + cited**, publish only after helen validates.
+
+## Operational finding from P1 worth carrying into P2
+
+Postgres `CheckViolation` `DETAIL` echoes the **entire failing row** —
+registrant name, street, city, zip. Any P2 path that surfaces a
+constraint error into a log, an API response or a report leaks exactly
+what the fence withholds. Error handling must strip `DETAIL`.
 
 ## Not decided
 
