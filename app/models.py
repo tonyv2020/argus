@@ -918,3 +918,119 @@ class AircraftIndividualAllowlist(Base):
         ),
         Index("ix_aircraft_allowlist_status", "status"),
     )
+
+
+# ─── Vessels P1 asset layer (2026-08-30) ─────────────────────────
+#
+# Second physical-asset class, mirroring the aircraft layer's isolation:
+# standalone PG-truth tables, no EntityType member, no canonical row, no
+# Neo4j projection, no read-path participation, no entity resolution.
+# Owner strings are raw source text, not resolved people.
+
+
+class VesselSourceSnapshot(Base):
+    """One download of a vessel source (OFAC SDN or USCG documentation).
+
+    The provenance anchor every vessel row cites. ``source`` is
+    constrained so a third source cannot appear without a migration.
+    """
+
+    __tablename__ = "vessel_source_snapshots"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    bytes_len: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_last_modified: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    batch_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    rows_ingested: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+    __table_args__ = (
+        UniqueConstraint("batch_id", name="uq_vessel_snapshot_batch"),
+        CheckConstraint("source IN ('ofac_sdn','uscg_nvdc')", name="ck_vessel_snapshot_source"),
+        Index("ix_vessel_snapshot_sha256", "sha256"),
+    )
+
+
+class Vessel(Base):
+    """One vessel from a registry or sanctions list. Fenced + cited.
+
+    PII-BEARING: ``owner_name_raw`` and the owner address columns are, for
+    an individually-owned vessel, a private person's name and address.
+    They are stored for future matching and are never surfaced — P1 has
+    no read path at all, which is the strongest form of that guarantee.
+
+    Natural key is ``(source, source_key)``, so USCG documentation slots
+    in beside OFAC without a schema change.
+    """
+
+    __tablename__ = "vessels"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_key: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    vessel_name: Mapped[str] = mapped_column(Text, nullable=False)
+    imo_number: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    call_sign: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    flag: Mapped[str | None] = mapped_column(Text, nullable=True)
+    vessel_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tonnage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    gross_tonnage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    hull_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # ── owner (PII) ──
+    owner_name_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
+    owner_street: Mapped[str | None] = mapped_column(Text, nullable=True)
+    owner_city: Mapped[str | None] = mapped_column(Text, nullable=True)
+    owner_state: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    owner_postal_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    owner_country: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # ── sanctions ──
+    sanctions_program: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sanctions_remarks: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_sanctioned: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+    # ── the fence ──
+    surface_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="suppress"
+    )
+    publication_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="staged"
+    )
+
+    # ── structural citation ──
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("vessel_source_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    batch_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("source", "source_key", name="uq_vessel_source_key"),
+        CheckConstraint("source IN ('ofac_sdn','uscg_nvdc')", name="ck_vessel_source"),
+        CheckConstraint("surface_mode = 'suppress'", name="ck_vessel_p1_suppress"),
+        CheckConstraint("publication_state = 'staged'", name="ck_vessel_p1_staged"),
+        CheckConstraint(
+            "length(source_url) > 0 and length(source_sha256) = 64", name="ck_vessel_cited"
+        ),
+        CheckConstraint("length(vessel_name) > 0", name="ck_vessel_named"),
+        Index("ix_vessel_name", "vessel_name"),
+        Index("ix_vessel_imo", "imo_number"),
+        Index("ix_vessel_owner_name", "owner_name_raw"),
+        Index("ix_vessel_batch", "batch_id"),
+        Index("ix_vessel_sanctioned", "is_sanctioned"),
+    )
