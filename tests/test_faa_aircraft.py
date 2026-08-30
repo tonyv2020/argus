@@ -102,19 +102,23 @@ def test_every_parsed_row_carries_the_fence() -> None:
         assert row["publication_state"] == "staged"
 
 
-def test_aircraft_model_pins_both_gates_with_check_constraints() -> None:
-    """The database is the backstop: a row can only ever be
-    suppress+staged. Opening the fence must be a migration that drops
-    a named constraint, not an UPDATE."""
+def test_aircraft_model_gates_reject_invalid_values() -> None:
+    """P1/P2 pinned these to equality so promotion was impossible.
+    P3.0 (migration 0013) relaxed them to validity checks so the
+    audited promotion op can work — see
+    tests/test_p3_aircraft_publish_gate.py, which owns the fence
+    guarantees now. What P1 still requires is that a bad value cannot
+    be written, and that the DEFAULTS keep every new row dark."""
     checks = {
         c.name: str(c.sqltext)
         for c in Aircraft.__table__.constraints
         if hasattr(c, "sqltext")
     }
-    assert "ck_aircraft_p1_suppress" in checks
-    assert "ck_aircraft_p1_staged" in checks
-    assert "suppress" in checks["ck_aircraft_p1_suppress"]
-    assert "staged" in checks["ck_aircraft_p1_staged"]
+    assert "ck_aircraft_surface_mode_valid" in checks
+    assert "ck_aircraft_publication_state_valid" in checks
+    cols = Aircraft.__table__.columns
+    assert cols["surface_mode"].server_default.arg == "suppress"
+    assert cols["publication_state"].server_default.arg == "staged"
 
 
 def test_aircraft_reference_is_staged_but_claims_no_privacy_mode() -> None:
@@ -124,7 +128,7 @@ def test_aircraft_reference_is_staged_but_claims_no_privacy_mode() -> None:
     names = {
         c.name for c in AircraftReference.__table__.constraints if hasattr(c, "sqltext")
     }
-    assert "ck_aircraft_reference_p1_staged" in names
+    assert "ck_aircraft_reference_publication_state_valid" in names
     assert "surface_mode" not in AircraftReference.__table__.columns
 
 

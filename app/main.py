@@ -22,7 +22,6 @@ from app.services.read_gate import (
     maybe_published_edge,
     maybe_published_entity,
     published_edge,
-    published_entity,
 )
 
 
@@ -779,6 +778,8 @@ async def get_entity(
                 key=lambda x: (-x["citation_count"], -(x["weight"] or 0), x["label"].lower())
             )
 
+    aircraft = await _published_aircraft_for(db, ent.id)
+
     return {
         "id": ent.id,
         "label": label,
@@ -793,7 +794,78 @@ async def get_entity(
         # `prominence.articles`.
         "articles": articles,
         "connections": connections,
+        # P3.0 — Assets → Aircraft. Published-only; empty until P3.2
+        # promotes anything. Note this section does NOT honour
+        # ``include_staged``: the preview flag exists for canonical
+        # content review, and the aircraft surface is the de-anon area
+        # that leaked on 2026-08-21. There is no code path, token or
+        # query parameter that reveals an unpublished aircraft.
+        "aircraft": aircraft,
     }
+
+
+#: The ONLY aircraft columns any public read path may emit. Street,
+#: street2, city, state, zip_code, county, registrant_name and
+#: other_names are absent by construction — the query selects this
+#: allowlist rather than the ORM row, so a future column cannot leak by
+#: being added to the model. A test asserts the PII columns stay out.
+_AIRCRAFT_PUBLIC_COLUMNS = ("n_number", "make_model", "year_mfr")
+
+
+async def _published_aircraft_for(db: AsyncSession, canonical_id: str) -> list[dict]:
+    """Published aircraft registered to this entity. Zero PII.
+
+    Both gates AND on BOTH the edge and the aircraft row: an edge is
+    only followed if it is published and non-suppressed, and the
+    aircraft it points at must independently be published and
+    non-suppressed. Promoting one without the other surfaces nothing —
+    that is deliberate, so a half-finished promotion fails closed.
+
+    Every row carries its FAA citation (dataset snapshot sha256 + the
+    registry record key), which is what makes the claim checkable.
+    """
+    from app.models import Aircraft, AircraftReference, AircraftRegistrationEdge
+    from app.services.read_gate import published_aircraft, published_registration_edge
+
+    rows = (
+        await db.execute(
+            select(
+                Aircraft.n_number,
+                Aircraft.year_mfr,
+                AircraftReference.mfr,
+                AircraftReference.model,
+                AircraftRegistrationEdge.source_url,
+                AircraftRegistrationEdge.source_sha256,
+                AircraftRegistrationEdge.match_score,
+            )
+            .select_from(AircraftRegistrationEdge)
+            .join(Aircraft, Aircraft.id == AircraftRegistrationEdge.aircraft_id)
+            .outerjoin(AircraftReference, AircraftReference.code == Aircraft.mfr_mdl_code)
+            .where(AircraftRegistrationEdge.canonical_id == canonical_id)
+            .where(published_registration_edge())
+            .where(published_aircraft())
+            .order_by(Aircraft.n_number)
+        )
+    ).all()
+
+    out: list[dict] = []
+    for n_number, year_mfr, mfr, model, src_url, src_sha, score in rows:
+        make_model = " ".join(p for p in ((mfr or "").strip(), (model or "").strip()) if p)
+        out.append(
+            {
+                "n_number": f"N{n_number}",
+                "make_model": make_model or None,
+                "year_mfr": year_mfr,
+                "citation": {
+                    "source": "FAA Releasable Aircraft Database",
+                    "url": src_url,
+                    "sha256": src_sha,
+                    "record_key": f"N{n_number}",
+                },
+                "match_score": score,
+            }
+        )
+    return out
 
 
 @app.get("/api/entities/{canonical_id}/subgraph")

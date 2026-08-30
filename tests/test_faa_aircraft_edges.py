@@ -19,11 +19,17 @@ def _checks() -> dict[str, str]:
     }
 
 
-def test_edge_fence_is_pinned_closed() -> None:
-    """Same fence as the asset rows — nothing here surfaces in P2."""
+def test_edge_gates_reject_invalid_values_and_default_dark() -> None:
+    """P2 pinned these to equality; P3.0 (migration 0013) relaxed them
+    to validity checks so promotion is possible via the audited op.
+    The guarantee P2 still owns: a bad value cannot be written, and a
+    new edge is born suppress+staged."""
     checks = _checks()
-    assert "suppress" in checks["ck_aircraft_reg_edge_suppress"]
-    assert "staged" in checks["ck_aircraft_reg_edge_staged"]
+    assert "ck_aircraft_reg_edge_surface_mode_valid" in checks
+    assert "ck_aircraft_reg_edge_publication_state_valid" in checks
+    cols = Edge.__table__.columns
+    assert cols["surface_mode"].server_default.arg == "suppress"
+    assert cols["publication_state"].server_default.arg == "staged"
 
 
 def test_an_uncited_edge_is_unrepresentable() -> None:
