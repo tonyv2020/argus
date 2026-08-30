@@ -215,7 +215,8 @@ def _main() -> None:  # pragma: no cover
     print("\n-- BEFORE")
     for b in r["before"]:
         print(f"   {b['name'][:40]:<40} [{b['type']:<12}] edges={b['edges']:<3} "
-              f"aliases={b['aliases']:<3} aircraft={b['aircraft']:<4} pub={b['aircraft_published']}")
+              f"aliases={b['aliases']:<3} aircraft={b['aircraft']:<4} "
+              f"pub={b['aircraft_published']}")
     print("\n-- MERGES")
     for m in r["merges"]:
         if m.get("error"):
@@ -228,11 +229,13 @@ def _main() -> None:  # pragma: no cover
               f"edges={m['edges_repointed']}(+{m['edges_collided_summed']} summed) "
               f"aliases={m['aliases_repointed']}(-{m['aliases_dropped_duplicate']} dup) "
               f"citations={m['citations_reparented']} "
-              f"AIRCRAFT={m['aircraft_edges_repointed']}(-{m['aircraft_edges_dropped_duplicate']} dup)")
+              f"AIRCRAFT={m['aircraft_edges_repointed']}"
+              f"(-{m['aircraft_edges_dropped_duplicate']} dup)")
     print("\n-- AFTER (survivors)")
     for a in r["after"]:
         print(f"   {a['name'][:40]:<40} [{a['type']:<12}] edges={a['edges']:<3} "
-              f"aliases={a['aliases']:<3} aircraft={a['aircraft']:<4} pub={a['aircraft_published']}")
+              f"aliases={a['aliases']:<3} aircraft={a['aircraft']:<4} "
+              f"pub={a['aircraft_published']}")
     t = r["totals"]
     print("\n-- GRAPH INTEGRITY")
     print(f"   canonicals      {t['canonicals_before']} -> {t['canonicals_after']} "
