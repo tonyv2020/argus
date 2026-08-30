@@ -447,3 +447,72 @@ def test_p3_acronym_requires_four_letters() -> None:
     assert p3.acronym("DEFENSE OF FREEDOM PAC") == "dof"
     src = inspect.getsource(p3.find_crosswalk_candidates)
     assert "len(acr) >= 4" in src
+
+
+# ── Vessels P3 apply — fence, citation, subsidiary safety ────────
+
+
+def test_vessel_owner_edge_is_fenced_and_cited() -> None:
+    from app.models import VesselOwnershipEdge as VE
+
+    checks = {c.name: str(c.sqltext) for c in VE.__table__.constraints if hasattr(c, "sqltext")}
+    assert "suppress" in checks["ck_vessel_owner_suppress"]
+    assert "staged" in checks["ck_vessel_owner_staged"]
+    assert "owns" in checks["ck_vessel_owner_relation"]
+    assert "ck_vessel_owner_cited" in checks
+    for col in ("snapshot_id", "source_url", "source_sha256"):
+        assert VE.__table__.columns[col].nullable is False
+
+
+def test_vessel_owner_pair_is_unique() -> None:
+    from app.models import VesselOwnershipEdge as VE
+
+    uniques = {
+        tuple(c.columns.keys())
+        for c in VE.__table__.constraints
+        if c.__class__.__name__ == "UniqueConstraint"
+    }
+    assert ("canonical_id", "vessel_id") in uniques
+
+
+def test_p3_apply_creates_canonicals_DARK() -> None:
+    """Created but invisible: open surface_mode (they are organisations)
+    with publication_state=staged, which the RG1 read-gate excludes from
+    every read path. Publishing is a separate Tony-gated step."""
+    from app.services.ingest import vessels_p3_apply as ap
+
+    src = inspect.getsource(ap.run)
+    assert "surface_mode=SurfaceMode.OPEN.value" in src
+    assert "publication_state=PublicationState.STAGED.value" in src
+
+
+def test_p3_apply_never_crosswalks_a_subsidiary() -> None:
+    """Only the curated CROSSWALK is consulted; the held subsidiaries
+    must not appear in it."""
+    from app.services.ingest import vessels_p3_apply as ap
+    from app.services.ingest.vessels_p3_plan import CROSSWALK, CROSSWALK_HELD
+
+    src = inspect.getsource(ap._resolve_crosswalk)
+    assert "CROSSWALK.get(ofac_name)" in src
+    for held in CROSSWALK_HELD:
+        assert held not in CROSSWALK, held
+    assert set(CROSSWALK) == {"PETROLEOS DE VENEZUELA, S.A."}
+
+
+def test_p3_apply_holds_individuals_and_defers_the_tail() -> None:
+    from app.services.ingest import vessels_p3_apply as ap
+
+    src = inspect.getsource(ap.run)
+    assert 'otype == "Individual"' in src
+    assert "held_individual_owners" in src
+    assert "len(distinct_vessels) < cutoff" in src
+    assert "deferred_owners" in src
+
+
+def test_p3_apply_edges_are_born_dark_and_cited() -> None:
+    from app.services.ingest import vessels_p3_apply as ap
+
+    src = inspect.getsource(ap.run)
+    assert "surface_mode=SurfaceMode.SUPPRESS.value" in src
+    assert "source_sha256=snap.sha256" in src
+    assert "snapshot_id=snap.id" in src
