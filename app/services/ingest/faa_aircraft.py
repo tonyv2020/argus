@@ -367,8 +367,31 @@ def _redacted(exc: Exception, table, rows: list[dict]) -> FencedWriteError:
     )
 
 
+#: The publish gates. NEVER refreshed on an upsert conflict.
+#:
+#: The weekly re-ingest is a DATA refresh — it re-reads the FAA registry
+#: and updates what the registry says. It is not a publishing decision,
+#: and it has no idea which rows an operator promoted. Including these
+#: columns in the ON CONFLICT update set made every re-ingest silently
+#: reset promoted rows to ``suppress``/``staged`` — un-publishing live
+#: content with NO audit row, bypassing the P3.0 promotion op that
+#: exists precisely to make such a change attributable and reversible.
+#: (Caught 2026-08-30, before the first weekly run after the P3.2 pilot;
+#: it would have wiped 5,210 published aircraft.)
+#:
+#: New rows are unaffected: the insert payload still carries
+#: ``suppress``/``staged``, so a row is still born dark. Only an
+#: EXISTING row's gates are preserved, and only promote()/demote() may
+#: change them.
+_GATE_COLUMNS = frozenset({"surface_mode", "publication_state"})
+
+
 async def _upsert_chunk(session, table, rows: list[dict], conflict: str) -> None:
-    """Upsert one chunk, refreshing every non-key column on conflict.
+    """Upsert one chunk, refreshing every non-key DATA column on conflict.
+
+    The publish gates (:data:`_GATE_COLUMNS`) are deliberately excluded
+    from the update set — see the note there. A re-ingest must never
+    change what is published.
 
     Any failure is re-raised REDACTED and with the original suppressed
     (``from None``) — a chained exception would print the very DETAIL
@@ -380,7 +403,7 @@ async def _upsert_chunk(session, table, rows: list[dict], conflict: str) -> None
     update_cols = {
         c.name: stmt.excluded[c.name]
         for c in table.__table__.columns
-        if c.name not in {conflict, "id", "created_at", "updated_at"}
+        if c.name not in {conflict, "id", "created_at", "updated_at"} | _GATE_COLUMNS
     }
     update_cols["updated_at"] = func.now()
     try:

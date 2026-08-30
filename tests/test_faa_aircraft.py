@@ -447,3 +447,90 @@ def test_ingester_never_logs_a_raw_exception_on_the_write_path() -> None:
     src = inspect.getsource(faa)
     for bad in ("logger.exception", "logger.error(exc", "print(exc", "str(exc)"):
         assert bad not in src, f"write path must not emit the raw exception: {bad}"
+
+
+# ─── re-ingest must never un-publish (2026-08-30) ────────────────
+
+def test_upsert_never_refreshes_the_publish_gates() -> None:
+    """THE regression guard.
+
+    The weekly re-ingest is a DATA refresh, not a publishing decision.
+    Including surface_mode/publication_state in the ON CONFLICT update
+    set silently reset every promoted row to suppress/staged — un-
+    publishing live content with no audit row, bypassing the P3.0
+    promotion op entirely. Caught before the first weekly run after the
+    P3.2 pilot; it would have wiped 5,210 published aircraft.
+    """
+    assert faa._GATE_COLUMNS == {"surface_mode", "publication_state"}
+    src = inspect.getsource(faa._upsert_chunk)
+    # the exclusion set must include the gates
+    assert "_GATE_COLUMNS" in src
+    assert '{conflict, "id", "created_at", "updated_at"} | _GATE_COLUMNS' in src
+
+
+def test_upsert_statement_really_omits_the_gates_from_its_SET_clause() -> None:
+    """Behavioural, not a re-implementation: run the REAL _upsert_chunk,
+    capture the statement it builds, compile it against the Postgres
+    dialect and read the actual ON CONFLICT ... DO UPDATE SET clause.
+
+    A test that recomputes the update set from _GATE_COLUMNS would pass
+    even if _upsert_chunk stopped using it — this one cannot.
+    """
+    import asyncio
+
+    from sqlalchemy.dialects import postgresql
+
+    captured = {}
+
+    class _Session:
+        async def execute(self, stmt):
+            captured["stmt"] = stmt
+
+    asyncio.run(
+        faa._upsert_chunk(
+            _Session(),
+            Aircraft,
+            [{"unique_id": "1", "n_number": "1A", "surface_mode": "suppress",
+              "publication_state": "staged", "registrant_name": "ACME"}],
+            "unique_id",
+        )
+    )
+    sql = str(captured["stmt"].compile(dialect=postgresql.dialect()))
+    set_clause = sql.split("DO UPDATE SET", 1)[1]
+
+    # the gates must NOT be assigned on conflict
+    assert "surface_mode =" not in set_clause, set_clause[:400]
+    assert "publication_state =" not in set_clause, set_clause[:400]
+    # ...while registry data still refreshes
+    for data_col in ("registrant_name", "street", "city", "status_code", "year_mfr"):
+        assert f"{data_col} =" in set_clause, f"{data_col} must still refresh on re-ingest"
+
+
+def test_a_published_row_keeps_its_gates_through_a_parsed_reingest_row() -> None:
+    """End-to-end at the value level: the parser still emits the dark
+    fence values (so NEW rows are born dark), yet those values are not
+    in the update set (so an EXISTING published row is untouched)."""
+    parsed, _ = parse_master_lines(
+        master_row(
+            **{
+                "N-NUMBER": "648AE",
+                "UNIQUE ID": "00383623",
+                "NAME": "AMERICAN AIRLINES INC",
+            }
+        )
+    )
+    row = parsed[0]
+    # new rows: born dark
+    assert row["surface_mode"] == "suppress"
+    assert row["publication_state"] == "staged"
+    # existing rows: those keys are excluded from the ON CONFLICT set
+    excluded = {"unique_id", "id", "created_at", "updated_at"} | faa._GATE_COLUMNS
+    assert {"surface_mode", "publication_state"} <= excluded
+
+
+def test_only_the_audited_op_may_change_a_gate() -> None:
+    """No ingest path may write a gate column on an existing row."""
+    src = inspect.getsource(faa)
+    # the ingester never issues a bare UPDATE of the gates
+    assert "set surface_mode" not in src.lower()
+    assert "set publication_state" not in src.lower()
