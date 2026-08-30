@@ -28,8 +28,20 @@ spec:
           restartPolicy: Never
           containers:
             - name: sweep
-              image: registry.lan/argus/api:local
-              imagePullPolicy: Always
+              # IMMUTABLE tag encoding the main commit it was built from
+              # (d8c3b1c), matching the api Deployment and the FAA ingest
+              # CronJob — repo == deployed across all three.
+              #
+              # The sweep runs FEC/LDA/SEC/USAspending and never touches
+              # the aircraft tables, so this is parity rather than a leak
+              # fix; the PII redaction it now also carries is incidental
+              # to it.
+              image: registry.lan/argus/api:p2-d8c3b1c
+              # IfNotPresent, not Always: the tag is immutable, so a
+              # re-pull can only fetch the same digest. Always would also
+              # make the weekly run depend on the registry being up at
+              # 07:00 Monday for no benefit.
+              imagePullPolicy: IfNotPresent
               command:
                 - python
                 - -m
