@@ -29,16 +29,17 @@ spec:
           restartPolicy: Never
           containers:
             - name: faa-aircraft-ingest
-              # IMMUTABLE tag encoding the main commit it was built from
-              # (d8c3b1c), NOT a floating :local. The weekly job runs
-              # unattended, so what it executes has to be identifiable
-              # after the fact from the tag alone.
+              # IMMUTABLE tag encoding the commit it was built from, NOT
+              # a floating :local. The weekly job runs unattended, so what
+              # it executes has to be identifiable from the tag alone.
               #
-              # This tag carries the CheckViolation PII redaction. The
-              # previous image (p1air-e867e7a42753) predates it: a failed
-              # write there puts the whole registrant row — name, street,
-              # city, zip — into the pod log.
-              image: registry.lan/argus/api:p2-d8c3b1c
+              # This tag carries the fix that stops a re-ingest from
+              # un-publishing promoted rows. The previous image
+              # (p2-d8c3b1c) refreshed surface_mode/publication_state on
+              # upsert conflict, which would have silently reverted the
+              # 5,210-aircraft P3.2 pilot with no audit row. It also
+              # carries the CheckViolation PII redaction.
+              image: registry.lan/argus/api:ingestfix-2de2ee04c101
               # IfNotPresent, not Always: the tag is immutable, so a
               # re-pull can only fetch the same digest. Always would also
               # make the weekly run depend on the registry being up at

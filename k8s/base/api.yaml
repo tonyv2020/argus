@@ -29,7 +29,7 @@ spec:
         - name: alembic-upgrade
           # Immutable tag encoding the main commit it was built from,
           # matching both weekly CronJobs — repo == deployed.
-          image: registry.lan/argus/api:p2-d8c3b1c
+          image: registry.lan/argus/api:p32-1c4b1801f099
           command:
             - sh
             - -c
@@ -41,7 +41,7 @@ spec:
         - name: api
           # Immutable tag encoding the main commit it was built from,
           # matching both weekly CronJobs — repo == deployed.
-          image: registry.lan/argus/api:p2-d8c3b1c
+          image: registry.lan/argus/api:p32-1c4b1801f099
           imagePullPolicy: Always
           envFrom:
             - secretRef:
