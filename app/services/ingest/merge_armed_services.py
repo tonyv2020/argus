@@ -45,6 +45,24 @@ MERGES: list[tuple[str, list[str], str]] = [
         "with 10 holds_contract edges — the richest and semantically right.",
     ),
     (
+        "Department Of The Army",
+        ["US Army"],
+        "Round 2 (Tony, 2026-08-30). 'US Army' carries the aliases 'Army'/"
+        "'U.S. Army'/'United States Army'. Survivor is the agency-typed row "
+        "with 16 holds_contract edges. Tartan Army, Nigerian army, Dutch "
+        "Army, Continental Army, Kosovo Liberation Army, the Army depots, "
+        "Army Corps of Engineers and 'Swiss Army knife' are all DISTINCT "
+        "canonicals and are untouched.",
+    ),
+    (
+        "U.S. Coast Guard",
+        ["coast guard"],
+        "Round 2. Lowercase organization row carrying 'Coast Guard'/"
+        "'coast guard'; survivor is the agency-typed row with 4 edges. "
+        "Taiwan Coast Guard and both Coast Guard Academy rows are "
+        "DISTINCT and untouched.",
+    ),
+    (
         "Department Of The Navy",
         ["United States Navy", "Navy", "Department of the Navy"],
         "'Navy' carries aliases 'U.S. Navy'/'US Navy'; 'Department of the "
@@ -79,8 +97,22 @@ HELD: list[tuple[str, str]] = [
     ),
     (
         "Space Force",
-        "Sits inside the Department of the Air Force but is a DISTINCT "
-        "service. Not merged.",
+        "Asked to dedup in round 2, but there is NOTHING to merge: exactly "
+        "one 'Space Force' canonical exists (org, 2 edges, aliases "
+        "'U.S. Space Force'/'US Space Force'). The only other match is "
+        "'Major Space Force Contract', an unknown-typed news tag about a "
+        "contract — not the service. Merging it would assert that a "
+        "contract IS the Space Force. Left alone.",
+    ),
+    (
+        "Coast Guard Academy (place) + U.S. Coast Guard Academy (org)",
+        "A genuine duplicate pair, but it is the ACADEMY, not the service — "
+        "same reasoning as Air Force One. Flagged, not merged.",
+    ),
+    (
+        "Army Corps of Engineers + U.S. Army Corps",
+        "Also a genuine duplicate pair, and also NOT the Army — the Corps of "
+        "Engineers is a distinct sub-entity. Flagged, not merged.",
     ),
     (
         "United States Air Force and Navy",
