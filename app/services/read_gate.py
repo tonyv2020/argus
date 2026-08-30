@@ -15,7 +15,7 @@ Design doc: helen-k3s/docs/argus-read-gate-hardening-design.md.
 
 from __future__ import annotations
 
-from app.models import CanonicalEdge, CanonicalEntity, PublicationState
+from app.models import CanonicalEdge, CanonicalEntity, PublicationState, SurfaceMode
 
 _PUBLISHED = PublicationState.PUBLISHED.value
 
@@ -64,3 +64,52 @@ def maybe_published_edge(include_staged: bool):
 
         return true()
     return published_edge()
+
+
+# ─── P3.0 aircraft gate (2026-08-30) ─────────────────────────────
+#
+# Aircraft carry BOTH gates and they AND together, same as canonicals:
+# a row is readable only when publication_state='published' AND
+# surface_mode<>'suppress'.
+#
+# These predicates differ from the canonical ones above in one way that
+# matters. ``is_published_entity`` treats a NULL publication_state as
+# published, to keep old fixtures usable — a fail-OPEN default that is
+# tolerable there because those rows predate the column. Aircraft have
+# no such history: every row was written after 0011 with NOT NULL
+# columns, so a missing/unknown value can only mean a bug or a hand-
+# built object. The aircraft checks therefore fail CLOSED — unknown is
+# not published. This is the de-anon surface that leaked on 2026-08-21;
+# the default has to be "hide".
+
+from app.models import Aircraft, AircraftRegistrationEdge  # noqa: E402
+
+_SUPPRESS = SurfaceMode.SUPPRESS.value
+
+
+def published_aircraft():
+    """SQLAlchemy predicate: aircraft row is live on the public read path."""
+    return (Aircraft.publication_state == _PUBLISHED) & (
+        Aircraft.surface_mode != _SUPPRESS
+    )
+
+
+def published_registration_edge():
+    """SQLAlchemy predicate: REGISTERS edge is live on the public read path."""
+    return (AircraftRegistrationEdge.publication_state == _PUBLISHED) & (
+        AircraftRegistrationEdge.surface_mode != _SUPPRESS
+    )
+
+
+def is_published_aircraft(row) -> bool:
+    """Materialized-row check. Fail-CLOSED: unknown is not published.
+
+    Accepts an ``Aircraft`` or an ``AircraftRegistrationEdge`` — both
+    carry the same two gate columns, and callers on the render path
+    should not have to care which they hold.
+    """
+    return (
+        getattr(row, "publication_state", None) == _PUBLISHED
+        and getattr(row, "surface_mode", None) != _SUPPRESS
+        and getattr(row, "surface_mode", None) is not None
+    )

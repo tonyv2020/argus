@@ -271,6 +271,25 @@ function renderPanel(entity) {
   const connections = entity.connections || {};
   // Render each relation's neighbours, sorted by citation_count desc (already done server-side).
   const relKeys = Object.keys(connections).sort((a, b) => connections[b].length - connections[a].length);
+
+  // P3.0 — Assets → Aircraft. The API returns ONLY published,
+  // non-suppressed aircraft, so this renders whatever it is given; the
+  // gate is server-side, never here. Empty until P3.2 promotes rows.
+  // The payload carries no street, city or registrant name by
+  // construction — see _AIRCRAFT_PUBLIC_COLUMNS in app/main.py.
+  const aircraft = Array.isArray(entity.aircraft) ? entity.aircraft : [];
+  const aircraftBlock = aircraft.length === 0 ? '' : `
+    <h2>Assets — Aircraft</h2>
+    <div class="disclosure-note">FAA Releasable Aircraft Database; each row links to the registry snapshot it was read from.</div>
+    <ul>${aircraft.map(a => {
+      const cite = a.citation || {};
+      const mm = a.make_model ? esc(a.make_model) : 'unknown type';
+      const yr = a.year_mfr ? ` · ${a.year_mfr}` : '';
+      return `<li class="neighbor" style="cursor:default;">
+        <strong>${esc(a.n_number || '')}</strong> — ${mm}${yr}
+        ${cite.url ? `<a class="receipt-chip" href="${esc(cite.url)}" target="_blank" rel="noopener">FAA registry</a>` : ''}
+      </li>`;
+    }).join('')}</ul>`;
   // D4: separate the OGE disclosure relations into their own section so
   // holdings / income / creditors / positions / trades render with page
   // receipts + the value/amount band from edge_metadata. Non-disclosure
@@ -406,6 +425,7 @@ function renderPanel(entity) {
              }).join('')}${articles.length > 25 ? `<li class="article" style="color:var(--muted);border:none;">+${articles.length - 25} more…</li>` : ''}</ul>`}
       `}
     ${disclosureBlocks ? `<h2>Financial disclosure</h2><div class="disclosure-note">Cited to OGE 278e/278-T public filings; each row links to the source PDF page.</div>${disclosureBlocks}` : ''}
+    ${aircraftBlock}
     <h2>Connections</h2>
     ${otherRelKeys.length === 0 && !disclosureBlocks ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No connections surfaced yet.</div>' : (otherRelKeys.length === 0 ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No non-disclosure connections.</div>' : relBlocks)}
   `;

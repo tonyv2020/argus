@@ -31,12 +31,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_sessionmaker
 from app.models import (
+    Aircraft,
+    AircraftReference,
+    AircraftRegistrationEdge,
     CanonicalEdge,
     CanonicalEntity,
     PublicationState,
     SurfaceMode,
 )
 from app.services.graph.neo4j_projection import Neo4jProjection
+from app.services.read_gate import published_aircraft, published_registration_edge
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +62,10 @@ class ProjectionStats:
     edges_failed: int = 0
     stale_nodes_pruned: int = 0
     stale_rels_pruned: int = 0
+    #: P3.0 aircraft counters. Zero until P3.2 promotes something.
+    aircraft_projected: int = 0
+    aircraft_failed: int = 0
+    stale_aircraft_pruned: int = 0
 
 
 def _ensure_pg_id_index(projection: Neo4jProjection) -> None:
@@ -148,6 +156,39 @@ async def project_all(session: AsyncSession, projection: Neo4jProjection) -> Pro
     stats.stale_nodes_pruned, stats.stale_rels_pruned = projection.prune_missing(
         projectable_entity_ids(entities), projectable_edge_ids(edges)
     )
+
+    # P3.0 — published aircraft. The SELECT is the gate: both rows must
+    # be published and non-suppressed, so an unpublished aircraft is
+    # never even fetched, let alone projected. Returns 0 rows until
+    # P3.2 promotes something.
+    aircraft_rows = (
+        await session.execute(
+            select(
+                AircraftRegistrationEdge,
+                Aircraft,
+                AircraftReference.mfr,
+                AircraftReference.model,
+            )
+            .join(Aircraft, Aircraft.id == AircraftRegistrationEdge.aircraft_id)
+            .outerjoin(AircraftReference, AircraftReference.code == Aircraft.mfr_mdl_code)
+            .where(published_registration_edge())
+            .where(published_aircraft())
+        )
+    ).all()
+    live_aircraft_ids: set[str] = set()
+    for edge, aircraft, mfr, model in aircraft_rows:
+        make_model = " ".join(p for p in ((mfr or "").strip(), (model or "").strip()) if p)
+        if await projection.project_aircraft(session, edge, aircraft, make_model or None):
+            stats.aircraft_projected += 1
+            live_aircraft_ids.add(aircraft.id)
+        else:
+            stats.aircraft_failed += 1
+    # Prune whatever Postgres no longer says is published — a demotion
+    # has to remove the node, or the reversal in the audit trail would
+    # be a lie about what Cypher can still see.
+    stats.stale_aircraft_pruned, _ = projection.prune_unpublished_aircraft(live_aircraft_ids)
+    await session.commit()
+
     return stats
 
 

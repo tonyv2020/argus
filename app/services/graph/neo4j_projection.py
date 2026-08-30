@@ -12,6 +12,7 @@ here as a defense-in-depth mirror of the PG-side gate.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from sqlalchemy import select
@@ -216,3 +217,77 @@ class Neo4jProjection:
         edge.projected_at = _now()
         session.add(edge)
         return True
+
+    # ── P3.0 aircraft projection (2026-08-30) ────────────────────
+
+    async def project_aircraft(
+        self, session: AsyncSession, edge, aircraft, make_model: str | None
+    ) -> bool:
+        """MERGE an ``Aircraft`` node + its ``REGISTERS`` rel. Zero PII.
+
+        Design decision #1: published aircraft are first-class nodes
+        under their OWN label, deliberately NOT an ``EntityType`` member
+        — ``EntityType`` stays person/org-centric and the read-gate for
+        canonicals does not have to learn about assets.
+
+        The node carries exactly ``n_number`` and ``make_model``. Not
+        the registrant name, not the street, not the city or zip. Those
+        are never passed into this method, so a Cypher reader cannot
+        reach them even by bypassing the API — the same defense-in-depth
+        reasoning as the D2 suppress gate.
+
+        BOTH gates on BOTH rows are checked here as well as in the
+        caller's query. That is redundant on purpose: this is the
+        surface that failed open on 2026-08-21, and the projector is
+        the last place a mistake becomes a Cypher-reachable leak.
+        """
+        if not self.available:
+            return False
+        from app.services.read_gate import is_published_aircraft
+
+        if not is_published_aircraft(edge) or not is_published_aircraft(aircraft):
+            return False
+        try:
+            self._run(
+                "MATCH (c:Canonical {pg_id: $cid}) "
+                "MERGE (a:Aircraft {pg_id: $aid}) "
+                "SET a.n_number=$n, a.make_model=$mm "
+                "MERGE (c)-[r:REGISTERS {pg_id: $eid}]->(a) "
+                "SET r.source_sha256=$sha",
+                cid=edge.canonical_id,
+                aid=aircraft.id,
+                eid=edge.id,
+                n=f"N{aircraft.n_number}",
+                mm=make_model,
+                sha=edge.source_sha256,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Log the ids and the failure only — never the row.
+            logger.warning("neo4j project_aircraft failed for edge %s: %s", edge.id, exc)
+            return False
+        return True
+
+    def prune_unpublished_aircraft(self, live_aircraft_ids: Iterable[str]) -> tuple[int, int]:
+        """Delete ``Aircraft`` nodes that are no longer published.
+
+        Projection is MERGE-only, so demoting a row in Postgres would
+        otherwise leave its node reachable in Cypher forever — exactly
+        the rot that left 6,855 suppressed canonicals projected before
+        the P2 prune. Driven by Postgres state, never by what this run
+        managed to write, so a transient Neo4j error cannot turn into a
+        mass deletion.
+        """
+        if not self.available:
+            return (0, 0)
+        keep = list(live_aircraft_ids)
+        rec = self._run(
+            "MATCH (a:Aircraft) WHERE NOT a.pg_id IN $keep "
+            "DETACH DELETE a RETURN count(a) AS n",
+            keep=keep,
+        )
+        n = 0
+        try:
+            n = int((rec[0] or {}).get("n", 0)) if rec else 0
+        except Exception:  # noqa: BLE001
+            n = 0
+        return (n, 0)

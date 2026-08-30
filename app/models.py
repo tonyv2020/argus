@@ -625,8 +625,8 @@ class AircraftReference(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "publication_state = 'staged'",
-            name="ck_aircraft_reference_p1_staged",
+            "publication_state IN ('staged','published')",
+            name="ck_aircraft_reference_publication_state_valid",
         ),
         Index("ix_aircraft_reference_mfr", "mfr"),
     )
@@ -717,16 +717,18 @@ class Aircraft(Base):
 
     __table_args__ = (
         UniqueConstraint("unique_id", name="uq_aircraft_unique_id"),
-        # THE FENCE — P1 pins both gates closed at the database.
-        # Opening either is a migration that drops a named constraint,
-        # which is a reviewable change. Tony's call, not an emitter's.
+        # P3.0 (migration 0013): the P1 equality fence became a
+        # VALIDITY fence. Promotion is now possible, but only through
+        # the audited op — the column DEFAULTS are still suppress/staged,
+        # so a row written by any existing path is born dark, and the
+        # read-gate excludes anything not published.
         CheckConstraint(
-            "surface_mode = 'suppress'",
-            name="ck_aircraft_p1_suppress",
+            "surface_mode IN ('suppress','alias','open')",
+            name="ck_aircraft_surface_mode_valid",
         ),
         CheckConstraint(
-            "publication_state = 'staged'",
-            name="ck_aircraft_p1_staged",
+            "publication_state IN ('staged','published')",
+            name="ck_aircraft_publication_state_valid",
         ),
         Index("ix_aircraft_n_number", "n_number"),
         Index("ix_aircraft_mfr_mdl_code", "mfr_mdl_code"),
@@ -803,8 +805,14 @@ class AircraftRegistrationEdge(Base):
     __table_args__ = (
         UniqueConstraint("canonical_id", "aircraft_id", name="uq_aircraft_reg_edge_pair"),
         CheckConstraint("relation = 'registers'", name="ck_aircraft_reg_edge_relation"),
-        CheckConstraint("surface_mode = 'suppress'", name="ck_aircraft_reg_edge_suppress"),
-        CheckConstraint("publication_state = 'staged'", name="ck_aircraft_reg_edge_staged"),
+        CheckConstraint(
+            "surface_mode IN ('suppress','alias','open')",
+            name="ck_aircraft_reg_edge_surface_mode_valid",
+        ),
+        CheckConstraint(
+            "publication_state IN ('staged','published')",
+            name="ck_aircraft_reg_edge_publication_state_valid",
+        ),
         # Belt to the NOT NULLs' braces: an empty-string citation would
         # satisfy NOT NULL while citing nothing.
         CheckConstraint(
@@ -814,4 +822,47 @@ class AircraftRegistrationEdge(Base):
         Index("ix_aircraft_reg_edge_canonical", "canonical_id"),
         Index("ix_aircraft_reg_edge_aircraft", "aircraft_id"),
         Index("ix_aircraft_reg_edge_batch", "batch_id"),
+    )
+
+
+class AircraftPromotionAudit(Base):
+    """P3.0 — one row per aircraft promotion or demotion.
+
+    The mechanism that replaces P1/P2's equality fence. Promotion is
+    per-row, attributed and reversible; this table is what makes a
+    mistaken promotion diagnosable and undoable rather than merely
+    overwritten.
+
+    ``actor`` and ``reason`` are NOT NULL and CHECK-ed non-empty — an
+    unattributed promotion is exactly what this exists to prevent.
+
+    **Nothing in P3.0 writes to this table.** The op exists; no caller
+    invokes it. P3.2 is the first phase that promotes anything, and only
+    after Tony approves the surfacing list.
+    """
+
+    __tablename__ = "aircraft_promotion_audit"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    target_table: Mapped[str] = mapped_column(String(48), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    from_surface_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    to_surface_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    from_publication_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    to_publication_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("action IN ('promote','demote')", name="ck_aircraft_promotion_action"),
+        CheckConstraint(
+            "length(actor) > 0 and length(reason) > 0",
+            name="ck_aircraft_promotion_attributed",
+        ),
+        Index("ix_aircraft_promotion_target", "target_table", "target_id"),
+        Index("ix_aircraft_promotion_created", "created_at"),
     )
