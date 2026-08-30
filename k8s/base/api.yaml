@@ -27,7 +27,9 @@ spec:
     spec:
       initContainers:
         - name: alembic-upgrade
-          image: registry.lan/argus/api:local
+          # Immutable tag encoding the main commit it was built from,
+          # matching both weekly CronJobs — repo == deployed.
+          image: registry.lan/argus/api:p2-d8c3b1c
           command:
             - sh
             - -c
@@ -37,7 +39,9 @@ spec:
                 name: argus-env
       containers:
         - name: api
-          image: registry.lan/argus/api:local
+          # Immutable tag encoding the main commit it was built from,
+          # matching both weekly CronJobs — repo == deployed.
+          image: registry.lan/argus/api:p2-d8c3b1c
           imagePullPolicy: Always
           envFrom:
             - secretRef:
