@@ -59,6 +59,29 @@ MISTYPED_PERSON_CANONICALS = frozenset(
 )
 
 
+#: Canonical types that can actually OWN an aircraft. An aircraft is
+#: registered to an organisation, an agency, a PAC — or a person. It is
+#: never registered to a concept or a place-name.
+#:
+#: This replaces the old cross-type rule, which compared the canonical
+#: against the FAA registrant code. That rule was doing TWO jobs: it
+#: wrongly excluded FAA-miscoded companies (the bug), and it
+#: incidentally blocked concept/place matches (load-bearing). Removing
+#: it fixed the first and broke the second — a re-stage then matched
+#: "MILITARY TECH INC" to the CONCEPT "military tech" and staged 24
+#: aircraft against it, plus "THIN AIR INC" -> "thin air", "RED STATE
+#: LLC" -> the place "red state". Caught while staged; none surfaced.
+OWNER_CAPABLE_TYPES = frozenset({"organization", "agency", "pac"})
+
+
+def is_owner_capable(canonical_type: str | None) -> bool:
+    """True when a canonical of this type can own an aircraft.
+
+    Fail-closed: unknown types are not owner-capable.
+    """
+    return canonical_type in OWNER_CAPABLE_TYPES
+
+
 def is_individual_entity(canonical_type: str | None, canonical_name: str | None) -> bool:
     """True when the resolved canonical denotes a natural person.
 

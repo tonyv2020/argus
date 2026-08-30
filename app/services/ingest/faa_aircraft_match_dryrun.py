@@ -40,7 +40,7 @@ import os
 
 import psycopg
 
-from app.services.aircraft_identity import is_individual_entity
+from app.services.aircraft_identity import is_individual_entity, is_owner_capable
 from app.services.graph.base import normalize_name
 
 logger = logging.getLogger(__name__)
@@ -303,6 +303,10 @@ def classify(rtype, toks, hits, best, best_ids, distinct_ids):
         return "HOLD_individual"
     if len(toks) == 1:
         return "DROP_single_token"
+    # An aircraft is owned by an org/agency/PAC — or by a person, which
+    # is already held above. Never by a concept or a place-name.
+    if best_hit is not None and not is_owner_capable(best_hit[1]):
+        return "DROP_not_owner_capable"
     # NOTE: the old DROP_cross_type rule compared the canonical's type
     # against the FAA TYPE REGISTRANT code. It is deliberately gone.
     #

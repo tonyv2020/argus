@@ -225,3 +225,28 @@ def test_classify_holds_a_person_and_frees_a_miscoded_company() -> None:
     toks = frozenset({"a", "b"})
     assert m.classify("1", toks, person, 1.0, {"c1"}, {"c1"}) == "HOLD_individual"
     assert m.classify("1", toks, company, 1.0, {"c2"}, {"c2"}) != "HOLD_individual"
+
+
+def test_only_owner_capable_types_can_hold_an_aircraft() -> None:
+    """Regression, caught live 2026-08-30. Removing the FAA-code
+    cross-type rule also removed the thing incidentally blocking
+    concept/place matches: a re-stage then matched 'MILITARY TECH INC'
+    to the CONCEPT 'military tech' and staged 24 aircraft against it.
+    Nothing surfaced — it was caught while staged."""
+    assert ident.is_owner_capable("organization") is True
+    assert ident.is_owner_capable("agency") is True
+    assert ident.is_owner_capable("pac") is True
+    for junk in ("concept", "place", "topic", "event", "bill", "unknown", None, ""):
+        assert ident.is_owner_capable(junk) is False, junk
+
+
+def test_classify_drops_a_concept_or_place_match() -> None:
+    from app.services.ingest import faa_aircraft_match_dryrun as m
+
+    toks = frozenset({"military", "tech"})
+    concept = [(1.0, ("c1", "concept", "open", "military tech", "canonical", "x", 0))]
+    place = [(1.0, ("c2", "place", "open", "red state", "canonical", "x", 0))]
+    org = [(1.0, ("c3", "organization", "open", "UNITED AIRLINES", "canonical", "x", 1))]
+    assert m.classify("3", toks, concept, 1.0, {"c1"}, {"c1"}) == "DROP_not_owner_capable"
+    assert m.classify("3", toks, place, 1.0, {"c2"}, {"c2"}) == "DROP_not_owner_capable"
+    assert m.classify("3", toks, org, 1.0, {"c3"}, {"c3"}) == "ELIGIBLE"
