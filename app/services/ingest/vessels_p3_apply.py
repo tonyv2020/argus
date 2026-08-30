@@ -146,9 +146,20 @@ async def run(cutoff: int = CUTOFF, dry_run: bool = True, cache: str | None = No
                 if ent is not None:
                     stats["canonicals_reused"] += 1
                 elif dry_run:
+                    # Count the canonical AND its edges. An earlier
+                    # version returned here, so the dry run reported 40
+                    # edges (only the crosswalked owner) against ~1,000
+                    # real ones — a preview that under-reports its own
+                    # blast radius is worse than no preview.
                     stats["canonicals_created"] += 1
                     stats["created_names"].append(name)
-                    continue  # nothing to stage against in a dry run
+                    stats["edges_staged"] += len(
+                        {v for v, _, _ in rows if v in vessel_ids}
+                    )
+                    stats["vessels_not_in_table"] += len(
+                        {v for v, _, _ in rows if v not in vessel_ids}
+                    )
+                    continue
                 else:
                     ent = CanonicalEntity(
                         id=_new_id(),
