@@ -96,14 +96,22 @@ def test_publish_scripts_use_the_guard_not_the_faa_code() -> None:
 # ── PART A: the allowlist ────────────────────────────────────────
 
 
-def test_allowlist_ships_empty_and_nothing_is_proposed_into_the_db() -> None:
-    """This phase writes nothing. The proposal lives in code so it is
-    reviewable in the PR diff, not as rows someone might approve by
-    accident."""
-    src = inspect.getsource(al)
-    assert "PROPOSED_ENTRIES" in src
-    # no INSERT of allowlist rows anywhere in the module
-    assert "AircraftIndividualAllowlist(" not in src
+def test_approving_is_separate_from_promoting_and_needs_an_approver() -> None:
+    """Approval is the human decision; promotion is its mechanical
+    consequence. Two explicit commands, and an approved row must record
+    WHO approved it — so a promotion can never be the side effect of
+    running the promote path."""
+    assert "PROPOSED_ENTRIES" in inspect.getsource(al)
+
+    # the PROMOTION path must not create allowlist rows
+    promote_src = inspect.getsource(al.promote_allowlisted)
+    assert "AircraftIndividualAllowlist(" not in promote_src
+
+    # approval is its own function and demands an approver + status
+    approve_src = inspect.getsource(al.approve_proposed)
+    assert "approved_by=approved_by" in approve_src
+    assert 'status="approved"' in approve_src
+    assert "approved_at" in approve_src
 
 
 def test_gate_reads_only_approved_entries() -> None:

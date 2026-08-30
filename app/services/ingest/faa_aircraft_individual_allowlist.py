@@ -225,16 +225,68 @@ async def promote_allowlisted(session, dry_run: bool = True) -> dict:
     return stats
 
 
+async def approve_proposed(session, approved_by: str) -> list[str]:
+    """Insert :data:`PROPOSED_ENTRIES` as APPROVED rows. Idempotent.
+
+    Separate from promotion on purpose: approving is the human decision
+    and promoting is the mechanical consequence, so they are two
+    explicit commands with the approver recorded on the row.
+    """
+    from datetime import UTC, datetime
+
+    inserted: list[str] = []
+    for e in PROPOSED_ENTRIES:
+        ent = await session.scalar(
+            select(CanonicalEntity).where(CanonicalEntity.canonical_name == e.canonical_name)
+        )
+        if ent is None:
+            logger.warning("approve: canonical %r not found", e.canonical_name)
+            continue
+        existing = await session.scalar(
+            select(AircraftIndividualAllowlist).where(
+                AircraftIndividualAllowlist.n_number == e.n_number,
+                AircraftIndividualAllowlist.canonical_id == ent.id,
+            )
+        )
+        if existing is not None:
+            continue
+        session.add(
+            AircraftIndividualAllowlist(
+                id=_new_id(),
+                n_number=e.n_number,
+                registrant_name=e.registrant_name,
+                canonical_id=ent.id,
+                evidence=e.evidence,
+                source=e.source,
+                added_by=ACTOR,
+                status="approved",
+                approved_by=approved_by,
+                approved_at=datetime.now(UTC),
+            )
+        )
+        inserted.append(e.n_number)
+    await session.commit()
+    return inserted
+
+
 def _main() -> None:  # pragma: no cover
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(description="P3.4 individual allowlist promotion.")
     ap.add_argument("--apply", action="store_true")
+    ap.add_argument(
+        "--approve-proposed",
+        metavar="APPROVER",
+        help="Insert PROPOSED_ENTRIES as approved rows, attributed to APPROVER.",
+    )
     args = ap.parse_args()
 
     from app.db import get_sessionmaker
 
     async def go():
         async with get_sessionmaker()() as s:
+            if args.approve_proposed:
+                added = await approve_proposed(s, args.approve_proposed)
+                print(f"approved into the allowlist: {added or '(already present)'}")
             return await promote_allowlisted(s, dry_run=not args.apply)
 
     s = asyncio.run(go())
