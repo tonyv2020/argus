@@ -128,12 +128,11 @@ def test_promote_refuses_to_promote_into_suppress() -> None:
     assert "is a no-op by definition" in src
 
 
-def test_promotion_has_exactly_one_caller() -> None:
-    """P3.0 asserted NOBODY invoked promotion. P3.2 (Tony-approved
-    2026-08-30) introduced the one legitimate caller, so the invariant
-    tightens rather than disappears: the pilot script is the ONLY module
-    that may promote. Anything else acquiring the ability is the thing
-    this test exists to catch."""
+def test_promotion_callers_are_an_explicit_allowlist() -> None:
+    """P3.0 asserted NOBODY invoked promotion. Each approved phase adds
+    exactly one caller, so the invariant narrows to an allowlist rather
+    than disappearing: only the named publish scripts may promote.
+    Anything else acquiring the ability is what this test catches."""
     import pathlib
 
     root = pathlib.Path(aircraft_publish.__file__).resolve().parents[1]  # app/
@@ -144,7 +143,11 @@ def test_promotion_has_exactly_one_caller() -> None:
         "aircraft_publish.promote(",
         "aircraft_publish.demote(",
     )
-    allowed = {"aircraft_publish.py", "faa_aircraft_p32_pilot_publish.py"}
+    allowed = {
+        "aircraft_publish.py",                  # the op itself
+        "faa_aircraft_p32_pilot_publish.py",    # P3.2 pilot   (Tony, 2026-08-30)
+        "faa_aircraft_p33_publish.py",          # P3.3 remainder (Tony, 2026-08-30)
+    }
     offenders = []
     for path in root.rglob("*.py"):
         if path.name in allowed:
@@ -152,7 +155,30 @@ def test_promotion_has_exactly_one_caller() -> None:
         text = path.read_text(encoding="utf-8", errors="ignore")
         if any(m in text for m in call_markers):
             offenders.append(str(path.relative_to(root)))
-    assert offenders == [], f"only the P3.2 pilot script may promote: {offenders}"
+    assert offenders == [], f"only the approved publish scripts may promote: {offenders}"
+
+
+def test_p33_can_never_promote_an_individual() -> None:
+    """Same hard post-filter as the pilot. P3.1 measured ~90% false
+    positives on individual name matching; zero individuals surface."""
+    from app.services.ingest import faa_aircraft_p33_publish as p33
+
+    src = inspect.getsource(p33.select_cohort)
+    assert '("1", "4")' in src
+    assert "type_registrant" in src
+
+
+def test_p33_promotes_both_gates_and_keeps_the_exclusions() -> None:
+    """Edge AND aircraft together (the read-gate needs both), and the
+    N/A placeholder stays excluded."""
+    from app.services.ingest import faa_aircraft_p33_publish as p33
+
+    src = inspect.getsource(p33.run)
+    assert 'target_table="aircraft_registration_edges"' in src
+    assert 'target_table="aircraft"' in src
+    sel = inspect.getsource(p33.select_cohort)
+    assert "EXCLUDED_CANONICAL_NAMES" in sel
+    assert 'match_tier == "exact_canonical"' in sel
 
 
 def test_pilot_can_never_promote_an_individual() -> None:
