@@ -40,6 +40,7 @@ import os
 
 import psycopg
 
+from app.services.aircraft_identity import is_individual_entity, is_owner_capable
 from app.services.graph.base import normalize_name
 
 logger = logging.getLogger(__name__)
@@ -287,16 +288,34 @@ def classify(rtype, toks, hits, best, best_ids, distinct_ids):
     Order matters: a row can be disqualified several ways and the
     STRONGEST reason wins, so a suppressed individual is reported as a
     hold rather than quietly dropped as cross-type.
+
+    "Is this an individual" resolves from the ARGUS CANONICAL, not the
+    FAA ``TYPE REGISTRANT`` code. The FAA miscodes ~20 companies as
+    individuals (UNITED AIRLINES INC, SOUTHWEST AIRLINES CO, MOTOROLA
+    SOLUTIONS INC …); gating on its code held them out of staging
+    entirely, which is why they have no REGISTERS edge to publish. See
+    :mod:`app.services.aircraft_identity`.
     """
     if any(rec[2] in ("suppress", "alias") for _s, rec in hits):
         return "HOLD_privacy"
-    if rtype in _INDIVIDUAL_TYPES:
+    best_hit = max(hits, key=lambda h: h[0])[1] if hits else None
+    if best_hit is not None and is_individual_entity(best_hit[1], best_hit[3]):
         return "HOLD_individual"
     if len(toks) == 1:
         return "DROP_single_token"
-    expected = _EXPECTED_TYPES.get(rtype or "", set())
-    if expected and not any(rec[1] in expected for _s, rec in hits):
-        return "DROP_cross_type"
+    # An aircraft is owned by an org/agency/PAC — or by a person, which
+    # is already held above. Never by a concept or a place-name.
+    if best_hit is not None and not is_owner_capable(best_hit[1]):
+        return "DROP_not_owner_capable"
+    # NOTE: the old DROP_cross_type rule compared the canonical's type
+    # against the FAA TYPE REGISTRANT code. It is deliberately gone.
+    #
+    # It was the SECOND place the unreliable FAA code excluded rows, and
+    # it caught exactly the case we now want to allow: a company the FAA
+    # filed as an individual, matching an organisation canonical. With
+    # the code removed as an authority, the rule has nothing left to
+    # protect — an org-coded row reaching a PERSON canonical is already
+    # HOLD_individual above, which is the direction that matters.
     if len(best_ids) > 1:
         return "DROP_true_tie"
     if best < SCORE_EXACT_ALIAS:

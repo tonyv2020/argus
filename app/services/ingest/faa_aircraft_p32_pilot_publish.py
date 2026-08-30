@@ -39,6 +39,7 @@ from app.models import (
     PublicationState,
     SurfaceMode,
 )
+from app.services.aircraft_identity import is_individual_entity
 from app.services.aircraft_publish import promote
 
 logger = logging.getLogger(__name__)
@@ -98,10 +99,16 @@ async def select_pilot(session) -> list[tuple]:
     # Belt and braces: no individual may reach the promotion loop, whatever
     # the predicate above did. P3.1 is the reason this is a hard filter and
     # not a comment.
-    safe = [r for r in rows if (r[1].type_registrant or "") not in ("1", "4")]
+    #
+    # Identity comes from the ARGUS CANONICAL, never from the FAA
+    # TYPE REGISTRANT code — the FAA miscodes companies as individuals
+    # (UNITED AIRLINES INC, SOUTHWEST AIRLINES CO and ~20 others are
+    # filed 1/4), and gating on that code wrongly withheld them. See
+    # app/services/aircraft_identity.
+    safe = [r for r in rows if not is_individual_entity(r[2].type, r[2].canonical_name)]
     dropped = len(rows) - len(safe)
     if dropped:
-        logger.warning("refused %d individual-registrant rows at the safety filter", dropped)
+        logger.warning("refused %d person-typed rows at the identity guard", dropped)
     return safe
 
 
