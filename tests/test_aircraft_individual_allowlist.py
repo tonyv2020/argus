@@ -23,6 +23,26 @@ def _checks(model) -> dict[str, str]:
     }
 
 
+def test_every_migration_revision_id_fits_alembic_version_column() -> None:
+    """``alembic_version.version_num`` is varchar(32). A longer revision
+    id creates the table, then fails on the final version UPDATE — the
+    migration rolls back and the pod CrashLoopBackOffs. Caught live on
+    0014 ('0014_aircraft_individual_allowlist' is 34 chars)."""
+    import pathlib
+
+    import app
+
+    versions = pathlib.Path(app.__file__).resolve().parents[1] / "alembic" / "versions"
+    long_ids = []
+    for path in versions.glob("*.py"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("revision = "):
+                rev = line.split("=", 1)[1].strip().strip("\"'")
+                if len(rev) > 32:
+                    long_ids.append((path.name, rev, len(rev)))
+    assert long_ids == [], f"revision ids over 32 chars: {long_ids}"
+
+
 # ── PART B: the identity data-guard ──────────────────────────────
 
 

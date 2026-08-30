@@ -1,6 +1,6 @@
 """P3.4 mechanism — curated individual allowlist. Surfaces nothing yet.
 
-Revision ID: 0014_aircraft_individual_allowlist
+Revision ID: 0014_aircraft_allowlist
 Revises: 0013_aircraft_publish_mechanism
 Create Date: 2026-08-30
 
@@ -32,7 +32,7 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "0014_aircraft_individual_allowlist"
+revision = "0014_aircraft_allowlist"
 down_revision = "0013_aircraft_publish_mechanism"
 branch_labels = None
 depends_on = None
