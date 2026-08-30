@@ -128,30 +128,75 @@ def test_promote_refuses_to_promote_into_suppress() -> None:
     assert "is a no-op by definition" in src
 
 
-def test_nothing_in_p3_0_invokes_promotion() -> None:
-    """THE phase invariant: the mechanism exists, nobody uses it."""
+def test_promotion_has_exactly_one_caller() -> None:
+    """P3.0 asserted NOBODY invoked promotion. P3.2 (Tony-approved
+    2026-08-30) introduced the one legitimate caller, so the invariant
+    tightens rather than disappears: the pilot script is the ONLY module
+    that may promote. Anything else acquiring the ability is the thing
+    this test exists to catch."""
     import pathlib
 
     root = pathlib.Path(aircraft_publish.__file__).resolve().parents[1]  # app/
-    # "Invokes" means imports the module or calls promote/demote.
-    # Defining the model (models.py) and creating its table (the
-    # migration) are the mechanism existing, which is the point.
     call_markers = (
         "from app.services.aircraft_publish import",
         "from app.services import aircraft_publish",
         "import app.services.aircraft_publish",
         "aircraft_publish.promote(",
         "aircraft_publish.demote(",
-        ".promote(",
     )
+    allowed = {"aircraft_publish.py", "faa_aircraft_p32_pilot_publish.py"}
     offenders = []
     for path in root.rglob("*.py"):
-        if path.name == "aircraft_publish.py":
+        if path.name in allowed:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         if any(m in text for m in call_markers):
             offenders.append(str(path.relative_to(root)))
-    assert offenders == [], f"P3.0 must not call the promotion op: {offenders}"
+    assert offenders == [], f"only the P3.2 pilot script may promote: {offenders}"
+
+
+def test_pilot_can_never_promote_an_individual() -> None:
+    """P3.1 measured ~90% false positives on individual name matching, so
+    zero individuals surface. The pilot filters on registrant type as a
+    hard post-filter, not only in the SQL predicate — a query edit must
+    not be able to let one through."""
+    from app.services.ingest import faa_aircraft_p32_pilot_publish as pilot
+
+    src = inspect.getsource(pilot.select_pilot)
+    assert '("1", "4")' in src
+    assert "type_registrant" in src
+
+
+def test_pilot_excludes_are_named_with_reasons() -> None:
+    """A silent exclusion is unreviewable."""
+    from app.services.ingest import faa_aircraft_p32_pilot_publish as pilot
+
+    assert "N/A" in pilot.EXCLUDED_CANONICAL_NAMES
+    for name, why in pilot.EXCLUDED_CANONICAL_NAMES.items():
+        assert why and len(why) > 20, f"{name} excluded without a stated reason"
+
+
+def test_pilot_promotes_both_gates_together() -> None:
+    """The read-gate requires the edge AND the aircraft published, so a
+    run that promoted only one would surface nothing — fail closed, not
+    half-open. Both promotions are in the same loop iteration."""
+    from app.services.ingest import faa_aircraft_p32_pilot_publish as pilot
+
+    src = inspect.getsource(pilot.run)
+    assert 'target_table="aircraft_registration_edges"' in src
+    assert 'target_table="aircraft"' in src
+    assert "ACTOR" in src and "REASON" in src
+
+
+def test_pilot_requires_the_entity_to_be_known_and_open() -> None:
+    """>=1 existing edge (Argus substantively knows them), open, published."""
+    from app.services.ingest import faa_aircraft_p32_pilot_publish as pilot
+
+    src = inspect.getsource(pilot.select_pilot)
+    assert "edge_count >= 1" in src
+    assert "SurfaceMode.OPEN.value" in src
+    assert "PublicationState.PUBLISHED.value" in src
+    assert 'match_tier == "exact_canonical"' in src
 
 
 # ── 5. the read-gate ─────────────────────────────────────────────
