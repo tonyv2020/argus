@@ -202,22 +202,35 @@ def test_ingester_touches_no_graph_or_read_path() -> None:
         assert forbidden not in src, f"P1 must not reference {forbidden}"
 
 
-def test_no_read_path_references_vessels_at_all() -> None:
-    """P1 isolation, checked across the whole app rather than asserted."""
+def test_no_READ_PATH_module_references_vessels() -> None:
+    """P1/P2 isolation, stated precisely.
+
+    Ingest and analysis modules legitimately handle vessels — that is
+    their job. The invariant is that no module on the READ or
+    PROJECTION path knows vessels exist, so there is nothing to surface
+    through even by accident.
+    """
     app_dir = pathlib.Path(inspect.getfile(ofac)).resolve().parents[2]
+    read_path = [
+        app_dir / "main.py",
+        app_dir / "services" / "read_gate.py",
+        *(app_dir / "services" / "graph").rglob("*.py"),
+        app_dir / "services" / "ingest" / "project_to_neo4j.py",
+        app_dir / "static" / "index.html",
+    ]
     scanned = 0
     offenders = []
-    for path in app_dir.rglob("*.py"):
-        if path.name in {"models.py", "ofac_sdn_vessels.py"}:
+    for path in read_path:
+        if not path.exists():
             continue
         scanned += 1
         text = path.read_text(encoding="utf-8", errors="ignore")
         if "Vessel" in text or "vessels" in text:
-            offenders.append(str(path.relative_to(app_dir)))
-    # Guard against a vacuous pass: an empty scan proves nothing, and the
-    # first version of this test walked a directory that did not exist.
-    assert scanned > 20, f"scan found only {scanned} modules — wrong root"
-    assert offenders == [], f"vessels must not reach any other module in P1: {offenders}"
+            offenders.append(path.name)
+    # Guard against a vacuous pass: an earlier version of this test
+    # walked a directory that did not exist and passed on an empty scan.
+    assert scanned >= 5, f"scan covered only {scanned} read-path files"
+    assert offenders == [], f"the read path must not know vessels exist: {offenders}"
 
 
 def test_migration_revision_id_fits_the_version_column() -> None:
@@ -285,3 +298,91 @@ def test_imo_is_extracted_not_guessed() -> None:
 def test_batch_id_is_derived_from_content() -> None:
     src = inspect.getsource(ofac.ingest_ofac_vessels)
     assert 'f"ofac-sdn-{sha[:12]}"' in src
+
+
+# ── Vessels P2 owner-resolution dry run (writes nothing) ─────────
+
+
+def test_p2_dryrun_writes_nothing() -> None:
+    """Read-only by construction: the DB refuses a write, and no
+    INSERT/UPDATE of any vessel or edge appears in the module."""
+    from app.services.ingest import ofac_vessel_owner_dryrun as p2
+
+    src = inspect.getsource(p2)
+    assert "conn.read_only = True" in src
+    for forbidden in ("insert(", "INSERT", "session.add", "commit()", "AircraftRegistrationEdge"):
+        assert forbidden not in src, f"P2 dry run must not {forbidden}"
+
+
+def test_p2_only_counts_ownership_relations() -> None:
+    """'Providing support to' and 'Associate Of' are real relationships
+    but they are not ownership — treating them as such would put a
+    support entity's name on an asset it does not own."""
+    from app.services.ingest import ofac_vessel_owner_dryrun as p2
+
+    assert "Owned or Controlled By" in p2.OWNERSHIP_RELATIONS
+    assert "Owns, controls, or operates" in p2.OWNERSHIP_RELATIONS
+    for not_ownership in ("Providing support to", "Associate Of", "Family member of",
+                          "Acting for or on behalf of", "Leader or official of"):
+        assert not_ownership not in p2.OWNERSHIP_RELATIONS
+
+
+def test_p2_holds_individual_owners_and_blocks_non_owner_types() -> None:
+    """Corporate-first: an OFAC 'Individual' owner is held for the
+    curated allowlist, and a concept/place canonical can never own."""
+    from app.services.ingest import ofac_vessel_owner_dryrun as p2
+
+    src = inspect.getsource(p2.run)
+    assert 'otype == "Individual"' in src
+    assert "HELD_individual_owner" in src
+    assert "is_owner_capable" in src
+    assert "is_individual_entity" in src
+    assert "HELD_privacy" in src
+    assert "DROP_ambiguous" in src
+    assert "DROP_single_token" in src
+
+
+def test_p2_parses_the_real_enhanced_shape() -> None:
+    """The vessel→owner link is <relationship><type>…</type>
+    <relatedEntity entityId=…>, and the entity id IS the SDN ent_num."""
+    import xml.etree.ElementTree as ET
+
+    from app.services.ingest import ofac_vessel_owner_dryrun as p2
+
+    xml = """<sanctionsData xmlns="urn:x">
+      <entity id="15036">
+        <generalInfo><entityType>Vessel</entityType></generalInfo>
+        <names><name><translations><translation>
+          <formattedFullName>ARTAVIL</formattedFullName>
+        </translation></translations></name></names>
+        <relationships>
+          <relationship id="144">
+            <type>Owned or Controlled By</type>
+            <relatedEntity entityId="15117">NATIONAL IRANIAN TANKER COMPANY</relatedEntity>
+          </relationship>
+          <relationship id="145">
+            <type>Providing support to</type>
+            <relatedEntity entityId="999">SOME SUPPORTER</relatedEntity>
+          </relationship>
+        </relationships>
+      </entity>
+      <entity id="15117">
+        <generalInfo><entityType>Entity</entityType></generalInfo>
+        <names><name><translations><translation>
+          <formattedFullName>NATIONAL IRANIAN TANKER COMPANY</formattedFullName>
+        </translation></translations></name></names>
+      </entity>
+    </sanctionsData>"""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as fh:
+        fh.write(xml)
+        path = fh.name
+    ET.parse(path)  # well-formed
+    entities, links = p2.parse_entities(path)
+    assert entities["15036"] == ("Vessel", "ARTAVIL")
+    assert entities["15117"] == ("Entity", "NATIONAL IRANIAN TANKER COMPANY")
+    # only the OWNERSHIP relationship is captured
+    assert len(links) == 1
+    vid, vname, rtype, oid, oname = links[0]
+    assert (vid, vname, rtype, oid) == ("15036", "ARTAVIL", "Owned or Controlled By", "15117")
