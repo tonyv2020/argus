@@ -187,6 +187,25 @@ def test_staging_classify_uses_the_guard_not_the_faa_code() -> None:
     assert "rtype in _INDIVIDUAL_TYPES" not in src
 
 
+def test_no_classify_rule_still_keys_off_the_faa_registrant_code() -> None:
+    """The FAA code excluded rows in TWO places — HOLD_individual and
+    DROP_cross_type. Fixing only the first left the miscoded companies
+    dropped by the second. Neither may consult it now."""
+    from app.services.ingest import faa_aircraft_match_dryrun as m
+
+    # Strip comments and the docstring: the code explains WHY the rule
+    # is gone, so a naive grep matches the explanation. Same trap the
+    # Neo4j projector test hit.
+    src = inspect.getsource(m.classify)
+    body = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+    )
+    body = body.split('"""')[-1]
+    assert "_EXPECTED_TYPES" not in body
+    assert "DROP_cross_type" not in body
+    assert "is_individual_entity" in body
+
+
 def test_classify_holds_a_person_and_frees_a_miscoded_company() -> None:
     """Behavioural: same FAA individual code, opposite outcomes,
     decided by the canonical."""

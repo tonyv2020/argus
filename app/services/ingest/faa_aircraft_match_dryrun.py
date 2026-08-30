@@ -303,9 +303,15 @@ def classify(rtype, toks, hits, best, best_ids, distinct_ids):
         return "HOLD_individual"
     if len(toks) == 1:
         return "DROP_single_token"
-    expected = _EXPECTED_TYPES.get(rtype or "", set())
-    if expected and not any(rec[1] in expected for _s, rec in hits):
-        return "DROP_cross_type"
+    # NOTE: the old DROP_cross_type rule compared the canonical's type
+    # against the FAA TYPE REGISTRANT code. It is deliberately gone.
+    #
+    # It was the SECOND place the unreliable FAA code excluded rows, and
+    # it caught exactly the case we now want to allow: a company the FAA
+    # filed as an individual, matching an organisation canonical. With
+    # the code removed as an authority, the rule has nothing left to
+    # protect — an org-coded row reaching a PERSON canonical is already
+    # HOLD_individual above, which is the direction that matters.
     if len(best_ids) > 1:
         return "DROP_true_tie"
     if best < SCORE_EXACT_ALIAS:
