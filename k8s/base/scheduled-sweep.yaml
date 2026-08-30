@@ -28,15 +28,13 @@ spec:
           restartPolicy: Never
           containers:
             - name: sweep
-              # IMMUTABLE tag encoding the main commit it was built from
-              # (d8c3b1c), matching the api Deployment and the FAA ingest
-              # CronJob — repo == deployed across all three.
+              # IMMUTABLE tag encoding the commit it was built from,
+              # matching the FAA ingest CronJob.
               #
               # The sweep runs FEC/LDA/SEC/USAspending and never touches
-              # the aircraft tables, so this is parity rather than a leak
-              # fix; the PII redaction it now also carries is incidental
-              # to it.
-              image: registry.lan/argus/api:p2-d8c3b1c
+              # the aircraft tables, so the aircraft fixes this tag
+              # carries are incidental to it — this bump is parity.
+              image: registry.lan/argus/api:ingestfix-2de2ee04c101
               # IfNotPresent, not Always: the tag is immutable, so a
               # re-pull can only fetch the same digest. Always would also
               # make the weekly run depend on the registry being up at
