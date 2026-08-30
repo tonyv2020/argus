@@ -1034,3 +1034,63 @@ class Vessel(Base):
         Index("ix_vessel_batch", "batch_id"),
         Index("ix_vessel_sanctioned", "is_sanctioned"),
     )
+
+
+class VesselOwnershipEdge(Base):
+    """Vessels P3 — a canonical entity OWNS a vessel. Fenced + cited.
+
+    The join between the standalone ``vessels`` table and the graph.
+    Deliberately NOT a ``CanonicalEdge``: a canonical edge needs both
+    endpoints in ``canonical_entities``, and vessels are not an
+    ``EntityType`` — the same shape as the aircraft REGISTERS table.
+
+    ``ofac_relation`` keeps WHICH OFAC relationship produced the edge, so
+    a reader can weigh "Owned or Controlled By" against "Property in the
+    interest of" rather than seeing an undifferentiated "owns".
+    """
+
+    __tablename__ = "vessel_ownership_edges"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    canonical_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("canonical_entities.id", ondelete="CASCADE"), nullable=False
+    )
+    vessel_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("vessels.id", ondelete="CASCADE"), nullable=False
+    )
+    relation: Mapped[str] = mapped_column(String(16), nullable=False, server_default="owns")
+    ofac_relation: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_name_raw: Mapped[str] = mapped_column(Text, nullable=False)
+    ofac_owner_id: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    snapshot_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("vessel_source_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    surface_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="suppress"
+    )
+    publication_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="staged"
+    )
+    batch_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("canonical_id", "vessel_id", name="uq_vessel_owner_pair"),
+        CheckConstraint("relation = 'owns'", name="ck_vessel_owner_relation"),
+        CheckConstraint("surface_mode = 'suppress'", name="ck_vessel_owner_suppress"),
+        CheckConstraint("publication_state = 'staged'", name="ck_vessel_owner_staged"),
+        CheckConstraint(
+            "length(source_url) > 0 and length(source_sha256) = 64",
+            name="ck_vessel_owner_cited",
+        ),
+        Index("ix_vessel_owner_canonical", "canonical_id"),
+        Index("ix_vessel_owner_vessel", "vessel_id"),
+        Index("ix_vessel_owner_batch", "batch_id"),
+    )

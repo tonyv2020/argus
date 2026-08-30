@@ -202,22 +202,35 @@ def test_ingester_touches_no_graph_or_read_path() -> None:
         assert forbidden not in src, f"P1 must not reference {forbidden}"
 
 
-def test_no_read_path_references_vessels_at_all() -> None:
-    """P1 isolation, checked across the whole app rather than asserted."""
+def test_no_READ_PATH_module_references_vessels() -> None:
+    """P1/P2 isolation, stated precisely.
+
+    Ingest and analysis modules legitimately handle vessels — that is
+    their job. The invariant is that no module on the READ or
+    PROJECTION path knows vessels exist, so there is nothing to surface
+    through even by accident.
+    """
     app_dir = pathlib.Path(inspect.getfile(ofac)).resolve().parents[2]
+    read_path = [
+        app_dir / "main.py",
+        app_dir / "services" / "read_gate.py",
+        *(app_dir / "services" / "graph").rglob("*.py"),
+        app_dir / "services" / "ingest" / "project_to_neo4j.py",
+        app_dir / "static" / "index.html",
+    ]
     scanned = 0
     offenders = []
-    for path in app_dir.rglob("*.py"):
-        if path.name in {"models.py", "ofac_sdn_vessels.py"}:
+    for path in read_path:
+        if not path.exists():
             continue
         scanned += 1
         text = path.read_text(encoding="utf-8", errors="ignore")
         if "Vessel" in text or "vessels" in text:
-            offenders.append(str(path.relative_to(app_dir)))
-    # Guard against a vacuous pass: an empty scan proves nothing, and the
-    # first version of this test walked a directory that did not exist.
-    assert scanned > 20, f"scan found only {scanned} modules — wrong root"
-    assert offenders == [], f"vessels must not reach any other module in P1: {offenders}"
+            offenders.append(path.name)
+    # Guard against a vacuous pass: an earlier version of this test
+    # walked a directory that did not exist and passed on an empty scan.
+    assert scanned >= 5, f"scan covered only {scanned} read-path files"
+    assert offenders == [], f"the read path must not know vessels exist: {offenders}"
 
 
 def test_migration_revision_id_fits_the_version_column() -> None:
@@ -285,3 +298,221 @@ def test_imo_is_extracted_not_guessed() -> None:
 def test_batch_id_is_derived_from_content() -> None:
     src = inspect.getsource(ofac.ingest_ofac_vessels)
     assert 'f"ofac-sdn-{sha[:12]}"' in src
+
+
+# ── Vessels P2 owner-resolution dry run (writes nothing) ─────────
+
+
+def test_p2_dryrun_writes_nothing() -> None:
+    """Read-only by construction: the DB refuses a write, and no
+    INSERT/UPDATE of any vessel or edge appears in the module."""
+    from app.services.ingest import ofac_vessel_owner_dryrun as p2
+
+    src = inspect.getsource(p2)
+    assert "conn.read_only = True" in src
+    for forbidden in ("insert(", "INSERT", "session.add", "commit()", "AircraftRegistrationEdge"):
+        assert forbidden not in src, f"P2 dry run must not {forbidden}"
+
+
+def test_p2_only_counts_ownership_relations() -> None:
+    """'Providing support to' and 'Associate Of' are real relationships
+    but they are not ownership — treating them as such would put a
+    support entity's name on an asset it does not own."""
+    from app.services.ingest import ofac_vessel_owner_dryrun as p2
+
+    assert "Owned or Controlled By" in p2.OWNERSHIP_RELATIONS
+    assert "Owns, controls, or operates" in p2.OWNERSHIP_RELATIONS
+    for not_ownership in ("Providing support to", "Associate Of", "Family member of",
+                          "Acting for or on behalf of", "Leader or official of"):
+        assert not_ownership not in p2.OWNERSHIP_RELATIONS
+
+
+def test_p2_holds_individual_owners_and_blocks_non_owner_types() -> None:
+    """Corporate-first: an OFAC 'Individual' owner is held for the
+    curated allowlist, and a concept/place canonical can never own."""
+    from app.services.ingest import ofac_vessel_owner_dryrun as p2
+
+    src = inspect.getsource(p2.run)
+    assert 'otype == "Individual"' in src
+    assert "HELD_individual_owner" in src
+    assert "is_owner_capable" in src
+    assert "is_individual_entity" in src
+    assert "HELD_privacy" in src
+    assert "DROP_ambiguous" in src
+    assert "DROP_single_token" in src
+
+
+def test_p2_parses_the_real_enhanced_shape() -> None:
+    """The vessel→owner link is <relationship><type>…</type>
+    <relatedEntity entityId=…>, and the entity id IS the SDN ent_num."""
+    import xml.etree.ElementTree as ET
+
+    from app.services.ingest import ofac_vessel_owner_dryrun as p2
+
+    xml = """<sanctionsData xmlns="urn:x">
+      <entity id="15036">
+        <generalInfo><entityType>Vessel</entityType></generalInfo>
+        <names><name><translations><translation>
+          <formattedFullName>ARTAVIL</formattedFullName>
+        </translation></translations></name></names>
+        <relationships>
+          <relationship id="144">
+            <type>Owned or Controlled By</type>
+            <relatedEntity entityId="15117">NATIONAL IRANIAN TANKER COMPANY</relatedEntity>
+          </relationship>
+          <relationship id="145">
+            <type>Providing support to</type>
+            <relatedEntity entityId="999">SOME SUPPORTER</relatedEntity>
+          </relationship>
+        </relationships>
+      </entity>
+      <entity id="15117">
+        <generalInfo><entityType>Entity</entityType></generalInfo>
+        <names><name><translations><translation>
+          <formattedFullName>NATIONAL IRANIAN TANKER COMPANY</formattedFullName>
+        </translation></translations></name></names>
+      </entity>
+    </sanctionsData>"""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as fh:
+        fh.write(xml)
+        path = fh.name
+    ET.parse(path)  # well-formed
+    entities, links = p2.parse_entities(path)
+    assert entities["15036"] == ("Vessel", "ARTAVIL")
+    assert entities["15117"] == ("Entity", "NATIONAL IRANIAN TANKER COMPANY")
+    # only the OWNERSHIP relationship is captured
+    assert len(links) == 1
+    vid, vname, rtype, oid, oname = links[0]
+    assert (vid, vname, rtype, oid) == ("15036", "ARTAVIL", "Owned or Controlled By", "15117")
+
+
+# ── Vessels P3 plan (dry run; creates nothing, stages nothing) ───
+
+
+def test_p3_plan_creates_and_stages_nothing() -> None:
+    from app.services.ingest import vessels_p3_plan as p3
+
+    src = inspect.getsource(p3)
+    assert "conn.read_only = True" in src
+    for forbidden in ("INSERT", "insert(", "session.add", "commit()", "CanonicalEntity("):
+        assert forbidden not in src, f"the P3 PLAN must not {forbidden}"
+
+
+def test_p3_crosswalk_is_curated_with_evidence_not_scored() -> None:
+    """The crosswalk is the dangerous half. Every accepted entry states
+    why it is the SAME legal entity, not merely a related company."""
+    from app.services.ingest import vessels_p3_plan as p3
+
+    assert p3.CROSSWALK, "expected at least the PDVSA entry"
+    for name, e in p3.CROSSWALK.items():
+        assert e["canonical"], name
+        assert len(e["evidence"]) > 80, f"{name} needs real evidence"
+
+
+def test_p3_never_crosswalks_a_subsidiary_to_its_parent() -> None:
+    """The aircraft carrier-vs-parent lesson: FedEx Freight is not FedEx
+    and Rolls-Royce Corp is not the plc. Rosnefteflot is not Rosneft."""
+    from app.services.ingest import vessels_p3_plan as p3
+
+    for sub in (
+        "JOINT STOCK COMPANY ROSNEFTEFLOT",
+        "GAZPROMNEFT MARINE BUNKER LIMITED LIABILITY COMPANY",
+    ):
+        assert sub in p3.CROSSWALK_HELD, sub
+        assert sub not in p3.CROSSWALK, f"{sub} must NOT be crosswalked"
+        assert len(p3.CROSSWALK_HELD[sub]) > 60
+
+
+def test_p3_holds_the_country_vs_state_company_trap() -> None:
+    """IRISL's substring candidate is the COUNTRY 'Islamic Republic of
+    Iran', which exists as an ORGANIZATION canonical — so the
+    owner-capable guard does not block it. 121 vessels would have been
+    attributed to a sovereign nation."""
+    from app.services.ingest import vessels_p3_plan as p3
+
+    irisl = "ISLAMIC REPUBLIC OF IRAN SHIPPING LINES"
+    assert irisl in p3.CROSSWALK_HELD
+    assert irisl not in p3.CROSSWALK
+
+
+def test_p3_acronym_requires_four_letters() -> None:
+    """At three letters the strategy collided on live data: DALIAN OCEAN
+    FISHING COMPANY and DEFENSE OF FREEDOM PAC both reduce to 'dof'."""
+    from app.services.ingest import vessels_p3_plan as p3
+
+    assert p3.acronym("PETROLEOS DE VENEZUELA, S.A.") == "pdvsa"
+    assert p3.acronym("DALIAN OCEAN FISHING COMPANY LIMITED") == "dof"
+    assert p3.acronym("DEFENSE OF FREEDOM PAC") == "dof"
+    src = inspect.getsource(p3.find_crosswalk_candidates)
+    assert "len(acr) >= 4" in src
+
+
+# ── Vessels P3 apply — fence, citation, subsidiary safety ────────
+
+
+def test_vessel_owner_edge_is_fenced_and_cited() -> None:
+    from app.models import VesselOwnershipEdge as VE
+
+    checks = {c.name: str(c.sqltext) for c in VE.__table__.constraints if hasattr(c, "sqltext")}
+    assert "suppress" in checks["ck_vessel_owner_suppress"]
+    assert "staged" in checks["ck_vessel_owner_staged"]
+    assert "owns" in checks["ck_vessel_owner_relation"]
+    assert "ck_vessel_owner_cited" in checks
+    for col in ("snapshot_id", "source_url", "source_sha256"):
+        assert VE.__table__.columns[col].nullable is False
+
+
+def test_vessel_owner_pair_is_unique() -> None:
+    from app.models import VesselOwnershipEdge as VE
+
+    uniques = {
+        tuple(c.columns.keys())
+        for c in VE.__table__.constraints
+        if c.__class__.__name__ == "UniqueConstraint"
+    }
+    assert ("canonical_id", "vessel_id") in uniques
+
+
+def test_p3_apply_creates_canonicals_DARK() -> None:
+    """Created but invisible: open surface_mode (they are organisations)
+    with publication_state=staged, which the RG1 read-gate excludes from
+    every read path. Publishing is a separate Tony-gated step."""
+    from app.services.ingest import vessels_p3_apply as ap
+
+    src = inspect.getsource(ap.run)
+    assert "surface_mode=SurfaceMode.OPEN.value" in src
+    assert "publication_state=PublicationState.STAGED.value" in src
+
+
+def test_p3_apply_never_crosswalks_a_subsidiary() -> None:
+    """Only the curated CROSSWALK is consulted; the held subsidiaries
+    must not appear in it."""
+    from app.services.ingest import vessels_p3_apply as ap
+    from app.services.ingest.vessels_p3_plan import CROSSWALK, CROSSWALK_HELD
+
+    src = inspect.getsource(ap._resolve_crosswalk)
+    assert "CROSSWALK.get(ofac_name)" in src
+    for held in CROSSWALK_HELD:
+        assert held not in CROSSWALK, held
+    assert set(CROSSWALK) == {"PETROLEOS DE VENEZUELA, S.A."}
+
+
+def test_p3_apply_holds_individuals_and_defers_the_tail() -> None:
+    from app.services.ingest import vessels_p3_apply as ap
+
+    src = inspect.getsource(ap.run)
+    assert 'otype == "Individual"' in src
+    assert "held_individual_owners" in src
+    assert "len(distinct_vessels) < cutoff" in src
+    assert "deferred_owners" in src
+
+
+def test_p3_apply_edges_are_born_dark_and_cited() -> None:
+    from app.services.ingest import vessels_p3_apply as ap
+
+    src = inspect.getsource(ap.run)
+    assert "surface_mode=SurfaceMode.SUPPRESS.value" in src
+    assert "source_sha256=snap.sha256" in src
+    assert "snapshot_id=snap.id" in src
