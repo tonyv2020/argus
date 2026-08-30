@@ -173,9 +173,11 @@ def run(cache: str | None = None) -> dict:
 
     # owner id -> the vessels it owns (dedupe the owner-side work)
     by_owner: dict[str, list] = collections.defaultdict(list)
+    # DISTINCT vessels, not links — a vessel can carry more than one
+    # ownership relationship, so counting links overstated this past the
+    # total row count (1,545 "in Argus" against 1,540 rows).
+    rep["vessels_in_argus"] = len({v for v, *_ in links if v in argus_vessels})
     for vid, vname, rtype, oid, oname in links:
-        if vid in argus_vessels:
-            rep["vessels_in_argus"] += 1
         by_owner[oid].append((vid, vname, rtype, oname))
 
     for oid, rows in by_owner.items():
