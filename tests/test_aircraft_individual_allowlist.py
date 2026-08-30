@@ -170,3 +170,31 @@ def test_the_proposal_is_small_and_justified() -> None:
         assert len(e.evidence) > 120, f"{e.n_number} needs real evidence"
         assert e.source
         assert e.canonical_name and e.registrant_name
+
+
+def test_staging_classify_uses_the_guard_not_the_faa_code() -> None:
+    """The guard has to bite where the exclusion actually happened.
+
+    Wiring it only into the publish path changed nothing: the ~20
+    FAA-miscoded companies were held out at P2 STAGING, so they never
+    got a REGISTERS edge to publish in the first place. Measured live:
+    0 existing edges were blocked by either filter.
+    """
+    from app.services.ingest import faa_aircraft_match_dryrun as m
+
+    src = inspect.getsource(m.classify)
+    assert "is_individual_entity" in src
+    assert "rtype in _INDIVIDUAL_TYPES" not in src
+
+
+def test_classify_holds_a_person_and_frees_a_miscoded_company() -> None:
+    """Behavioural: same FAA individual code, opposite outcomes,
+    decided by the canonical."""
+    from app.services.ingest import faa_aircraft_match_dryrun as m
+
+    # rec = (cid, ctype, surface_mode, canonical_name, via, matched_via, edges)
+    person = [(1.0, ("c1", "person", "open", "Sam Graves", "canonical", "Sam Graves", 3))]
+    company = [(1.0, ("c2", "organization", "open", "UNITED AIRLINES", "canonical", "x", 1))]
+    toks = frozenset({"a", "b"})
+    assert m.classify("1", toks, person, 1.0, {"c1"}, {"c1"}) == "HOLD_individual"
+    assert m.classify("1", toks, company, 1.0, {"c2"}, {"c2"}) != "HOLD_individual"
