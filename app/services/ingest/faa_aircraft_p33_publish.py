@@ -37,6 +37,7 @@ from app.models import (
     PublicationState,
     SurfaceMode,
 )
+from app.services.aircraft_identity import is_individual_entity
 from app.services.aircraft_publish import promote
 from app.services.ingest.faa_aircraft_p32_pilot_publish import EXCLUDED_CANONICAL_NAMES
 
@@ -65,10 +66,12 @@ async def select_cohort(session) -> list[tuple]:
         )
     ).all()
     # Belt and braces, same as the pilot: no individual reaches the
-    # promotion loop whatever the predicate above did.
-    safe = [r for r in rows if (r[1].type_registrant or "") not in ("1", "4")]
+    # promotion loop whatever the predicate above did. Identity comes
+    # from the ARGUS CANONICAL, never the FAA TYPE REGISTRANT code —
+    # see app/services/aircraft_identity.
+    safe = [r for r in rows if not is_individual_entity(r[2].type, r[2].canonical_name)]
     if len(rows) != len(safe):
-        logger.warning("refused %d individual rows at the safety filter", len(rows) - len(safe))
+        logger.warning("refused %d person-typed rows at the identity guard", len(rows) - len(safe))
     return safe
 
 

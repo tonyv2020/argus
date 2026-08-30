@@ -866,3 +866,55 @@ class AircraftPromotionAudit(Base):
         Index("ix_aircraft_promotion_target", "target_table", "target_id"),
         Index("ix_aircraft_promotion_created", "created_at"),
     )
+
+
+class AircraftIndividualAllowlist(Base):
+    """P3.4 — the curated exception to "no individual surfaces".
+
+    P3.1 measured ~90% false positives on individual name matching, so
+    individuals are blanket-held. This table is the narrow way one gets
+    out: an explicit per-aircraft approval carrying its evidence.
+
+    Keyed per ``(n_number, canonical_id)`` — approval is per AIRCRAFT,
+    not per person, so approving one tail number cannot silently sweep
+    in another that appears under the same name in a later FAA snapshot.
+
+    ``evidence``/``source``/``added_by`` are NOT NULL and CHECK-ed
+    non-empty, and an ``approved`` row must name its approver. The gate
+    reads only ``status='approved'``; the table ships empty.
+    """
+
+    __tablename__ = "aircraft_individual_allowlist"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    n_number: Mapped[str] = mapped_column(String(10), nullable=False)
+    registrant_name: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("canonical_entities.id", ondelete="RESTRICT"), nullable=False
+    )
+    evidence: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    added_by: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="proposed")
+    approved_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("n_number", "canonical_id", name="uq_aircraft_allowlist_pair"),
+        CheckConstraint(
+            "status IN ('proposed','approved','rejected')",
+            name="ck_aircraft_allowlist_status",
+        ),
+        CheckConstraint(
+            "length(evidence) > 0 and length(source) > 0 and length(added_by) > 0",
+            name="ck_aircraft_allowlist_justified",
+        ),
+        CheckConstraint(
+            "status <> 'approved' or (approved_by is not null and approved_at is not null)",
+            name="ck_aircraft_allowlist_approval_attributed",
+        ),
+        Index("ix_aircraft_allowlist_status", "status"),
+    )

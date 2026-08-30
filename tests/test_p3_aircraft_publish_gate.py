@@ -147,6 +147,7 @@ def test_promotion_callers_are_an_explicit_allowlist() -> None:
         "aircraft_publish.py",                  # the op itself
         "faa_aircraft_p32_pilot_publish.py",    # P3.2 pilot   (Tony, 2026-08-30)
         "faa_aircraft_p33_publish.py",          # P3.3 remainder (Tony, 2026-08-30)
+        "faa_aircraft_individual_allowlist.py",  # P3.4 mechanism — promotes NOTHING yet
     }
     offenders = []
     for path in root.rglob("*.py"):
@@ -164,8 +165,10 @@ def test_p33_can_never_promote_an_individual() -> None:
     from app.services.ingest import faa_aircraft_p33_publish as p33
 
     src = inspect.getsource(p33.select_cohort)
-    assert '("1", "4")' in src
-    assert "type_registrant" in src
+    # Identity now comes from the Argus canonical, never the FAA code —
+    # the FAA miscodes companies as individuals. See aircraft_identity.
+    assert "is_individual_entity" in src
+    assert 'type_registrant or ""' not in src
 
 
 def test_p33_promotes_both_gates_and_keeps_the_exclusions() -> None:
@@ -189,8 +192,8 @@ def test_pilot_can_never_promote_an_individual() -> None:
     from app.services.ingest import faa_aircraft_p32_pilot_publish as pilot
 
     src = inspect.getsource(pilot.select_pilot)
-    assert '("1", "4")' in src
-    assert "type_registrant" in src
+    assert "is_individual_entity" in src
+    assert 'type_registrant or ""' not in src
 
 
 def test_pilot_excludes_are_named_with_reasons() -> None:
