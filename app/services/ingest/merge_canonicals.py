@@ -68,6 +68,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_sessionmaker
 from app.models import (
+    AircraftRegistrationEdge,
     AliasCrosswalk,
     AnchorRegistry,
     CanonicalEdge,
@@ -99,6 +100,11 @@ class MergeStats:
     """Per-merge counters for post-run audit."""
 
     edges_repointed: int = 0
+    #: P3 aircraft REGISTERS edges moved from drop to keep. These have an
+    #: ON DELETE CASCADE FK to canonical_entities, so failing to re-point
+    #: them means the delete below DESTROYS them silently.
+    aircraft_edges_repointed: int = 0
+    aircraft_edges_dropped_duplicate: int = 0
     edges_collided_summed: int = 0
     citations_reparented: int = 0
     aliases_repointed: int = 0
@@ -315,18 +321,62 @@ async def merge_two_canonicals(
         raise ScrutinyRepointFailed(stats.refused_reason)
 
     # ── 6. Delete drop canonical (edges/citations already re-parented) ─
+    # ── AIRCRAFT REGISTERS edges (P3) — MUST run before the delete ──
+    #
+    # ``aircraft_registration_edges.canonical_id`` has ON DELETE CASCADE.
+    # This helper predates that table, so without this block the
+    # ``session.delete(drop)`` below silently destroys every aircraft
+    # edge belonging to the dropped canonical — 45 of them on the first
+    # armed-services merge, verified against the live DB before the fix.
+    # Nothing would have failed; the rows would simply have ceased to
+    # exist, and the publish state that P3.2 audited would be gone with
+    # no audit row saying so.
+    #
+    # Each edge keeps its OWN publication_state/surface_mode across the
+    # re-point: a merge is an identity correction, not a publishing
+    # decision, so it must not surface or hide anything.
+    drop_aircraft = (
+        await session.execute(
+            select(AircraftRegistrationEdge).where(
+                AircraftRegistrationEdge.canonical_id == drop_id
+            )
+        )
+    ).scalars().all()
+    for ac_edge in drop_aircraft:
+        collision = (
+            await session.execute(
+                select(AircraftRegistrationEdge).where(
+                    AircraftRegistrationEdge.canonical_id == keep_id,
+                    AircraftRegistrationEdge.aircraft_id == ac_edge.aircraft_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if collision is not None:
+            # (canonical_id, aircraft_id) is UNIQUE — keep already claims
+            # this aircraft, so the duplicate goes rather than the row
+            # violating the constraint.
+            await session.delete(ac_edge)
+            stats.aircraft_edges_dropped_duplicate += 1
+        else:
+            ac_edge.canonical_id = keep_id
+            session.add(ac_edge)
+            stats.aircraft_edges_repointed += 1
+    await session.flush()
+
     await session.delete(drop)
     await session.flush()
 
     logger.info(
         "merge_two_canonicals: keep=%s drop=%s edges_repointed=%d "
         "collided_summed=%d citations_reparented=%d "
-        "aliases_repointed=%d aliases_dropped=%d anchors=%d scrutiny=%d",
+        "aliases_repointed=%d aliases_dropped=%d anchors=%d scrutiny=%d "
+        "aircraft_repointed=%d aircraft_dropped=%d",
         keep_id, drop_id,
         stats.edges_repointed, stats.edges_collided_summed,
         stats.citations_reparented, stats.aliases_repointed,
         stats.aliases_dropped_duplicate, stats.anchors_repointed,
         stats.scrutiny_repointed,
+        stats.aircraft_edges_repointed, stats.aircraft_edges_dropped_duplicate,
     )
     return stats
 
