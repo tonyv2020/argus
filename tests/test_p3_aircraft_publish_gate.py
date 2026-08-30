@@ -334,3 +334,55 @@ def test_demoted_aircraft_are_pruned_from_neo4j() -> None:
     assert hasattr(neo4j_projection.Neo4jProjection, "prune_unpublished_aircraft")
     src = inspect.getsource(project_to_neo4j.project_all)
     assert "prune_unpublished_aircraft" in src
+
+
+# ── merging a canonical must not destroy its aircraft edges ──────
+
+
+def test_merge_repoints_aircraft_edges_before_deleting_the_canonical() -> None:
+    """``aircraft_registration_edges.canonical_id`` is ON DELETE CASCADE,
+    and ``merge_two_canonicals`` predates that table. Without an explicit
+    re-point BEFORE ``session.delete(drop)``, merging a canonical
+    silently destroys every aircraft edge it owns — verified against the
+    live DB as 45 lost edges on the first armed-services merge.
+
+    Ordering is the whole property, so it is asserted as ordering.
+    """
+    import inspect
+
+    from app.services.ingest import merge_canonicals as mc
+
+    src = inspect.getsource(mc.merge_two_canonicals)
+    assert "AircraftRegistrationEdge" in src, "merge must handle aircraft edges"
+
+    repoint_at = src.index("AircraftRegistrationEdge.canonical_id == drop_id")
+    delete_at = src.index("await session.delete(drop)")
+    assert repoint_at < delete_at, "aircraft re-point must precede the canonical delete"
+
+
+def test_merge_preserves_each_aircraft_edge_publish_state() -> None:
+    """A merge is an identity correction, not a publishing decision. The
+    re-point must not touch surface_mode/publication_state — otherwise
+    merging would surface or hide rows with no audit row."""
+    import inspect
+
+    from app.services.ingest import merge_canonicals as mc
+
+    src = inspect.getsource(mc.merge_two_canonicals)
+    block = src[src.index("drop_aircraft = ("):src.index("await session.delete(drop)")]
+    assert "publication_state" not in block
+    assert "surface_mode" not in block
+    assert "ac_edge.canonical_id = keep_id" in block
+
+
+def test_merge_handles_the_unique_pair_collision() -> None:
+    """(canonical_id, aircraft_id) is UNIQUE — if keep already claims the
+    aircraft, the duplicate must be dropped rather than the re-point
+    violating the constraint mid-merge."""
+    import inspect
+
+    from app.services.ingest import merge_canonicals as mc
+
+    src = inspect.getsource(mc.merge_two_canonicals)
+    assert "aircraft_edges_dropped_duplicate" in src
+    assert "AircraftRegistrationEdge.aircraft_id == ac_edge.aircraft_id" in src
