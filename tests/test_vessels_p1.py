@@ -386,3 +386,64 @@ def test_p2_parses_the_real_enhanced_shape() -> None:
     assert len(links) == 1
     vid, vname, rtype, oid, oname = links[0]
     assert (vid, vname, rtype, oid) == ("15036", "ARTAVIL", "Owned or Controlled By", "15117")
+
+
+# ── Vessels P3 plan (dry run; creates nothing, stages nothing) ───
+
+
+def test_p3_plan_creates_and_stages_nothing() -> None:
+    from app.services.ingest import vessels_p3_plan as p3
+
+    src = inspect.getsource(p3)
+    assert "conn.read_only = True" in src
+    for forbidden in ("INSERT", "insert(", "session.add", "commit()", "CanonicalEntity("):
+        assert forbidden not in src, f"the P3 PLAN must not {forbidden}"
+
+
+def test_p3_crosswalk_is_curated_with_evidence_not_scored() -> None:
+    """The crosswalk is the dangerous half. Every accepted entry states
+    why it is the SAME legal entity, not merely a related company."""
+    from app.services.ingest import vessels_p3_plan as p3
+
+    assert p3.CROSSWALK, "expected at least the PDVSA entry"
+    for name, e in p3.CROSSWALK.items():
+        assert e["canonical"], name
+        assert len(e["evidence"]) > 80, f"{name} needs real evidence"
+
+
+def test_p3_never_crosswalks_a_subsidiary_to_its_parent() -> None:
+    """The aircraft carrier-vs-parent lesson: FedEx Freight is not FedEx
+    and Rolls-Royce Corp is not the plc. Rosnefteflot is not Rosneft."""
+    from app.services.ingest import vessels_p3_plan as p3
+
+    for sub in (
+        "JOINT STOCK COMPANY ROSNEFTEFLOT",
+        "GAZPROMNEFT MARINE BUNKER LIMITED LIABILITY COMPANY",
+    ):
+        assert sub in p3.CROSSWALK_HELD, sub
+        assert sub not in p3.CROSSWALK, f"{sub} must NOT be crosswalked"
+        assert len(p3.CROSSWALK_HELD[sub]) > 60
+
+
+def test_p3_holds_the_country_vs_state_company_trap() -> None:
+    """IRISL's substring candidate is the COUNTRY 'Islamic Republic of
+    Iran', which exists as an ORGANIZATION canonical — so the
+    owner-capable guard does not block it. 121 vessels would have been
+    attributed to a sovereign nation."""
+    from app.services.ingest import vessels_p3_plan as p3
+
+    irisl = "ISLAMIC REPUBLIC OF IRAN SHIPPING LINES"
+    assert irisl in p3.CROSSWALK_HELD
+    assert irisl not in p3.CROSSWALK
+
+
+def test_p3_acronym_requires_four_letters() -> None:
+    """At three letters the strategy collided on live data: DALIAN OCEAN
+    FISHING COMPANY and DEFENSE OF FREEDOM PAC both reduce to 'dof'."""
+    from app.services.ingest import vessels_p3_plan as p3
+
+    assert p3.acronym("PETROLEOS DE VENEZUELA, S.A.") == "pdvsa"
+    assert p3.acronym("DALIAN OCEAN FISHING COMPANY LIMITED") == "dof"
+    assert p3.acronym("DEFENSE OF FREEDOM PAC") == "dof"
+    src = inspect.getsource(p3.find_crosswalk_candidates)
+    assert "len(acr) >= 4" in src
