@@ -32,11 +32,18 @@ def _checks(model) -> dict[str, str]:
 # ── the fence ────────────────────────────────────────────────────
 
 
-def test_vessel_fence_is_pinned_closed() -> None:
-    """P1 surfaces nothing; both gates are pinned by equality CHECK."""
+def test_vessel_gates_reject_invalid_values() -> None:
+    """P1 pinned these to equality so promotion was impossible. The
+    publish mechanism (migration 0017) relaxed them to validity checks —
+    tests/test_vessels_publish_gate.py owns the fence guarantees now.
+    What P1 still requires: a bad value cannot be written, and the
+    DEFAULTS keep every new row dark."""
     checks = _checks(Vessel)
-    assert "suppress" in checks["ck_vessel_p1_suppress"]
-    assert "staged" in checks["ck_vessel_p1_staged"]
+    assert "ck_vessel_surface_mode_valid" in checks
+    assert "ck_vessel_publication_state_valid" in checks
+    cols = Vessel.__table__.columns
+    assert cols["surface_mode"].server_default.arg == "suppress"
+    assert cols["publication_state"].server_default.arg == "staged"
 
 
 def test_vessel_defaults_are_dark() -> None:
@@ -202,35 +209,34 @@ def test_ingester_touches_no_graph_or_read_path() -> None:
         assert forbidden not in src, f"P1 must not reference {forbidden}"
 
 
-def test_no_READ_PATH_module_references_vessels() -> None:
-    """P1/P2 isolation, stated precisely.
+def test_every_read_path_that_knows_vessels_also_GATES_them() -> None:
+    """P1/P2 asserted the read path did not know vessels existed. The
+    publish mechanism deliberately changed that — so the invariant
+    tightens rather than disappears: every read-path module that
+    mentions vessels must also apply the vessel gate.
 
-    Ingest and analysis modules legitimately handle vessels — that is
-    their job. The invariant is that no module on the READ or
-    PROJECTION path knows vessels exist, so there is nothing to surface
-    through even by accident.
+    A module that learned about vessels WITHOUT learning about the gate
+    is exactly the regression this now catches.
     """
     app_dir = pathlib.Path(inspect.getfile(ofac)).resolve().parents[2]
     read_path = [
         app_dir / "main.py",
-        app_dir / "services" / "read_gate.py",
-        *(app_dir / "services" / "graph").rglob("*.py"),
+        app_dir / "services" / "graph" / "neo4j_projection.py",
         app_dir / "services" / "ingest" / "project_to_neo4j.py",
-        app_dir / "static" / "index.html",
     ]
     scanned = 0
-    offenders = []
+    ungated = []
     for path in read_path:
         if not path.exists():
             continue
         scanned += 1
         text = path.read_text(encoding="utf-8", errors="ignore")
-        if "Vessel" in text or "vessels" in text:
-            offenders.append(path.name)
-    # Guard against a vacuous pass: an earlier version of this test
-    # walked a directory that did not exist and passed on an empty scan.
-    assert scanned >= 5, f"scan covered only {scanned} read-path files"
-    assert offenders == [], f"the read path must not know vessels exist: {offenders}"
+        knows = "Vessel" in text or "vessels" in text
+        gates = "published_vessel" in text or "is_published_vessel" in text
+        if knows and not gates:
+            ungated.append(path.name)
+    assert scanned == 3, f"scan covered only {scanned} read-path files"
+    assert ungated == [], f"these know about vessels but do not gate them: {ungated}"
 
 
 def test_migration_revision_id_fits_the_version_column() -> None:
@@ -456,8 +462,11 @@ def test_vessel_owner_edge_is_fenced_and_cited() -> None:
     from app.models import VesselOwnershipEdge as VE
 
     checks = {c.name: str(c.sqltext) for c in VE.__table__.constraints if hasattr(c, "sqltext")}
-    assert "suppress" in checks["ck_vessel_owner_suppress"]
-    assert "staged" in checks["ck_vessel_owner_staged"]
+    # Validity checks since migration 0017; defaults still dark.
+    assert "ck_vessel_owner_surface_mode_valid" in checks
+    assert "ck_vessel_owner_publication_state_valid" in checks
+    assert VE.__table__.columns["surface_mode"].server_default.arg == "suppress"
+    assert VE.__table__.columns["publication_state"].server_default.arg == "staged"
     assert "owns" in checks["ck_vessel_owner_relation"]
     assert "ck_vessel_owner_cited" in checks
     for col in ("snapshot_id", "source_url", "source_sha256"):

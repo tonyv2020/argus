@@ -1022,8 +1022,18 @@ class Vessel(Base):
     __table_args__ = (
         UniqueConstraint("source", "source_key", name="uq_vessel_source_key"),
         CheckConstraint("source IN ('ofac_sdn','uscg_nvdc')", name="ck_vessel_source"),
-        CheckConstraint("surface_mode = 'suppress'", name="ck_vessel_p1_suppress"),
-        CheckConstraint("publication_state = 'staged'", name="ck_vessel_p1_staged"),
+        # Publish mechanism (migration 0017): the P1 equality fence
+        # became a VALIDITY fence. Defaults are still suppress/staged, so
+        # a row written by the ingest path is born dark; only the audited
+        # op flips one.
+        CheckConstraint(
+            "surface_mode IN ('suppress','alias','open')",
+            name="ck_vessel_surface_mode_valid",
+        ),
+        CheckConstraint(
+            "publication_state IN ('staged','published')",
+            name="ck_vessel_publication_state_valid",
+        ),
         CheckConstraint(
             "length(source_url) > 0 and length(source_sha256) = 64", name="ck_vessel_cited"
         ),
@@ -1084,8 +1094,14 @@ class VesselOwnershipEdge(Base):
     __table_args__ = (
         UniqueConstraint("canonical_id", "vessel_id", name="uq_vessel_owner_pair"),
         CheckConstraint("relation = 'owns'", name="ck_vessel_owner_relation"),
-        CheckConstraint("surface_mode = 'suppress'", name="ck_vessel_owner_suppress"),
-        CheckConstraint("publication_state = 'staged'", name="ck_vessel_owner_staged"),
+        CheckConstraint(
+            "surface_mode IN ('suppress','alias','open')",
+            name="ck_vessel_owner_surface_mode_valid",
+        ),
+        CheckConstraint(
+            "publication_state IN ('staged','published')",
+            name="ck_vessel_owner_publication_state_valid",
+        ),
         CheckConstraint(
             "length(source_url) > 0 and length(source_sha256) = 64",
             name="ck_vessel_owner_cited",
@@ -1093,4 +1109,38 @@ class VesselOwnershipEdge(Base):
         Index("ix_vessel_owner_canonical", "canonical_id"),
         Index("ix_vessel_owner_vessel", "vessel_id"),
         Index("ix_vessel_owner_batch", "batch_id"),
+    )
+
+
+class VesselPromotionAudit(Base):
+    """One row per vessel promotion or demotion. Mirrors the aircraft one.
+
+    ``actor`` and ``reason`` are NOT NULL and CHECK-ed non-empty — an
+    unattributed promotion is exactly what this exists to prevent.
+    Nothing writes to it until Tony approves a publish.
+    """
+
+    __tablename__ = "vessel_promotion_audit"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    target_table: Mapped[str] = mapped_column(String(48), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    from_surface_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    to_surface_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    from_publication_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    to_publication_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("action IN ('promote','demote')", name="ck_vessel_promotion_action"),
+        CheckConstraint(
+            "length(actor) > 0 and length(reason) > 0",
+            name="ck_vessel_promotion_attributed",
+        ),
+        Index("ix_vessel_promotion_target", "target_table", "target_id"),
     )

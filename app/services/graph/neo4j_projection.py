@@ -291,3 +291,58 @@ class Neo4jProjection:
         except Exception:  # noqa: BLE001
             n = 0
         return (n, 0)
+
+    # ── Vessel projection (2026-08-31) ───────────────────────────
+
+    async def project_vessel(self, session: AsyncSession, edge, vessel) -> bool:
+        """MERGE a ``Vessel`` node + its ``OWNS`` rel. Zero PII.
+
+        A distinct node label, deliberately NOT an ``EntityType`` member
+        — the same choice as ``Aircraft``. The node carries exactly
+        ``vessel_name``, ``imo`` and ``flag``. Never the owner name,
+        never the owner address; those are not passed in, so a Cypher
+        reader cannot reach them even by bypassing the API.
+
+        Both gates on BOTH rows are re-checked here as well as in the
+        caller's query — redundant on purpose, because the projector is
+        the last place a mistake becomes Cypher-reachable.
+        """
+        if not self.available:
+            return False
+        from app.services.read_gate import is_published_vessel
+
+        if not is_published_vessel(edge) or not is_published_vessel(vessel):
+            return False
+        try:
+            self._run(
+                "MATCH (c:Canonical {pg_id: $cid}) "
+                "MERGE (v:Vessel {pg_id: $vid}) "
+                "SET v.vessel_name=$name, v.imo=$imo, v.flag=$flag "
+                "MERGE (c)-[r:OWNS {pg_id: $eid}]->(v) "
+                "SET r.source_sha256=$sha, r.ofac_relation=$rel",
+                cid=edge.canonical_id, vid=vessel.id, eid=edge.id,
+                name=vessel.vessel_name, imo=vessel.imo_number, flag=vessel.flag,
+                sha=edge.source_sha256, rel=edge.ofac_relation,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("neo4j project_vessel failed for edge %s: %s", edge.id, exc)
+            return False
+        return True
+
+    def prune_unpublished_vessels(self, live_vessel_ids: Iterable[str]) -> int:
+        """Delete ``Vessel`` nodes Postgres no longer says are published.
+
+        Projection is MERGE-only, so a demotion would otherwise leave the
+        node Cypher-reachable forever — the rot that left 6,855
+        suppressed canonicals projected before the aircraft prune.
+        """
+        if not self.available:
+            return 0
+        rec = self._run(
+            "MATCH (v:Vessel) WHERE NOT v.pg_id IN $keep DETACH DELETE v RETURN count(v) AS n",
+            keep=list(live_vessel_ids),
+        )
+        try:
+            return int((rec[0] or {}).get("n", 0)) if rec else 0
+        except Exception:  # noqa: BLE001
+            return 0

@@ -779,6 +779,7 @@ async def get_entity(
             )
 
     aircraft = await _published_aircraft_for(db, ent.id)
+    vessels = await _published_vessels_for(db, ent.id)
 
     return {
         "id": ent.id,
@@ -801,7 +802,64 @@ async def get_entity(
         # that leaked on 2026-08-21. There is no code path, token or
         # query parameter that reveals an unpublished aircraft.
         "aircraft": aircraft,
+        # Assets → Vessels. Published-only; empty until a Tony-approved
+        # publish. Like the aircraft section it deliberately does NOT
+        # honour ``include_staged`` — that flag previews canonical
+        # content, and vessel owner rows carry names and addresses.
+        "vessels": vessels,
     }
+
+
+#: The ONLY vessel columns any public read path may emit. Owner name and
+#: the owner address columns are absent by construction — the query
+#: selects this allowlist rather than the ORM row, so a column added to
+#: the model later cannot leak by being picked up implicitly.
+_VESSEL_PUBLIC_COLUMNS = ("vessel_name", "imo_number", "flag")
+
+
+async def _published_vessels_for(db: AsyncSession, canonical_id: str) -> list[dict]:
+    """Published vessels owned by this entity. Zero owner PII.
+
+    Both gates AND on BOTH the edge and the vessel row: promoting one
+    without the other surfaces nothing, so a half-finished publish fails
+    closed rather than half-open.
+    """
+    from app.models import Vessel, VesselOwnershipEdge
+    from app.services.read_gate import published_vessel, published_vessel_edge
+
+    rows = (
+        await db.execute(
+            select(
+                Vessel.vessel_name,
+                Vessel.imo_number,
+                Vessel.flag,
+                VesselOwnershipEdge.ofac_relation,
+                VesselOwnershipEdge.source_url,
+                VesselOwnershipEdge.source_sha256,
+            )
+            .select_from(VesselOwnershipEdge)
+            .join(Vessel, Vessel.id == VesselOwnershipEdge.vessel_id)
+            .where(VesselOwnershipEdge.canonical_id == canonical_id)
+            .where(published_vessel_edge())
+            .where(published_vessel())
+            .order_by(Vessel.vessel_name)
+        )
+    ).all()
+    return [
+        {
+            "vessel_name": name,
+            "imo_number": imo,
+            "flag": flag,
+            "ofac_relation": rel,
+            "citation": {
+                "source": "OFAC Specially Designated Nationals list",
+                "url": url,
+                "sha256": sha,
+                "record_key": imo or name,
+            },
+        }
+        for name, imo, flag, rel, url, sha in rows
+    ]
 
 
 #: The ONLY aircraft columns any public read path may emit. Street,

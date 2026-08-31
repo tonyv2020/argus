@@ -113,3 +113,39 @@ def is_published_aircraft(row) -> bool:
         and getattr(row, "surface_mode", None) != _SUPPRESS
         and getattr(row, "surface_mode", None) is not None
     )
+
+
+# ─── Vessel gate (2026-08-31) ────────────────────────────────────
+#
+# Same contract as the aircraft gate and, deliberately, the same
+# fail-CLOSED behaviour: unknown is NOT published. Vessels carry owner
+# names and addresses, so an unclassifiable row is withheld.
+
+from app.models import Vessel, VesselOwnershipEdge  # noqa: E402
+
+
+def published_vessel():
+    """SQLAlchemy predicate: vessel row is live on the public read path."""
+    return (Vessel.publication_state == _PUBLISHED) & (Vessel.surface_mode != _SUPPRESS)
+
+
+def published_vessel_edge():
+    """SQLAlchemy predicate: vessel→owner edge is live on the read path."""
+    return (VesselOwnershipEdge.publication_state == _PUBLISHED) & (
+        VesselOwnershipEdge.surface_mode != _SUPPRESS
+    )
+
+
+def is_published_vessel(row) -> bool:
+    """Materialized-row check. Fail-CLOSED: unknown is not published.
+
+    Accepts a ``Vessel`` or a ``VesselOwnershipEdge`` — both carry the
+    same two gate columns. A row MISSING a gate column (not merely
+    holding None) must also fail closed; the aircraft equivalent had a
+    ``getattr`` default that let that case through.
+    """
+    return (
+        getattr(row, "publication_state", None) == _PUBLISHED
+        and getattr(row, "surface_mode", None) != _SUPPRESS
+        and getattr(row, "surface_mode", None) is not None
+    )
