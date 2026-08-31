@@ -7,12 +7,17 @@ and live Neo4j**, because those are the three places a reader can reach.
 
   1. **What surfaced** — the cohort is published in PG, and each owner's
      LIVE dossier actually returns its vessels WITH an OFAC citation.
-  2. **What must not** — every owner-PII value in the vessels table, and
-     every held individual owner's name, is searched for in the body of
-     every live response fetched. Zero occurrences, or this fails.
+  2. **What must not** — every owner-PII value in the vessels table and
+     every held individual owner's name is searched for, in two scopes:
+     the ``vessels[]`` payload each dossier returns (zero occurrences,
+     no exemptions — that array IS the panel), and whole response bodies
+     (one exempt class, a sanctioned owner's own published label, and
+     every exemption is printed).
   3. **What stayed dark** — the individual and long-tail owners OFAC
      itself names are re-derived from the source XML and checked against
-     PG: no canonical published, no edge, no vessel.
+     PG **by OFAC id**, not by name: an unrelated canonical that merely
+     shares a name is a collision, and is reported with the evidence
+     (no OFAC alias, no vessel) rather than counted either way.
   4. **What was untouched** — the aircraft layer's published counts.
 
 Plus the Neo4j surface: ``Vessel`` node property keys are compared
@@ -41,6 +46,7 @@ from app.models import (
     Aircraft,
     AircraftRegistrationEdge,
     CanonicalEntity,
+    EntityAlias,
     PublicationState,
     SurfaceMode,
     Vessel,
@@ -175,7 +181,7 @@ async def _pg_state(session) -> dict:
     }
 
 
-async def _held_owners_are_dark(session, res: Result, cache: str | None) -> None:
+async def _held_owners_are_dark(session, res: Result, cache: str | None) -> dict:
     """Re-derive the held classes from OFAC and prove PG never published them.
 
     Source of truth is the SDN XML, not our own notes about it: an owner
@@ -188,7 +194,7 @@ async def _held_owners_are_dark(session, res: Result, cache: str | None) -> None
         entities, links = parse_entities(download(cache=cache))
     except Exception as exc:  # noqa: BLE001
         res.check(False, "held-class re-derivation from OFAC", f"could not parse source: {exc}")
-        return
+        return {}
 
     by_owner: dict[str, set[str]] = collections.defaultdict(set)
     for vid, _vname, _rtype, oid, _oname in links:
@@ -217,39 +223,62 @@ async def _held_owners_are_dark(session, res: Result, cache: str | None) -> None
         f"found {len(longtail)}",
     )
 
-    # Held owners must have NO published canonical and NO edge. Matched on
-    # the normalized name, the same key the P3 apply resolved on.
+    # Held owners must have no OFAC identity in Argus and no vessel edge.
+    #
+    # IDENTITY, NOT NAME. The link between an OFAC owner and an Argus
+    # canonical is the ``ofac.sdn`` alias carrying the OFAC id — that is
+    # what vessels P3 wrote, and it is the only thing that means "this
+    # canonical IS that owner". Matching on the normalized name instead
+    # produces false positives: an unrelated published canonical named
+    # "Patriot" (type ``unknown``, from hollywood.entity_tags, no OFAC
+    # alias, no vessel edge) collides with a held long-tail owner of the
+    # same name and looks like a leak that isn't one.
     held = {**individuals, **longtail}
-    norms = {normalize_name(n) for n in held.values() if n}
-    if norms:
-        rows = (
-            await session.execute(
-                select(CanonicalEntity, func.count(VesselOwnershipEdge.id))
-                .outerjoin(
-                    VesselOwnershipEdge,
-                    VesselOwnershipEdge.canonical_id == CanonicalEntity.id,
-                )
-                .where(CanonicalEntity.canonical_name_normalized.in_(list(norms)))
-                .group_by(CanonicalEntity.id)
+    alias_rows = (
+        await session.execute(
+            select(EntityAlias.source_id, CanonicalEntity)
+            .join(CanonicalEntity, CanonicalEntity.id == EntityAlias.canonical_id)
+            .where(EntityAlias.source_system == "ofac.sdn")
+            .where(EntityAlias.source_id.in_(list(held)))
+        )
+    ).all()
+    res.check(
+        not alias_rows,
+        "no held individual or long-tail owner is identified by an OFAC alias in Argus",
+        f"{len(alias_rows)} linked",
+    )
+
+    norms = {normalize_name(n): n for n in held.values() if n}
+    rows = (
+        await session.execute(
+            select(CanonicalEntity, func.count(VesselOwnershipEdge.id))
+            .outerjoin(
+                VesselOwnershipEdge,
+                VesselOwnershipEdge.canonical_id == CanonicalEntity.id,
             )
-        ).all()
-        published = [
-            c.canonical_name
-            for c, _n in rows
-            if c.publication_state == PublicationState.PUBLISHED.value
-            and c.surface_mode != SurfaceMode.SUPPRESS.value
-        ]
-        with_edges = [c.canonical_name for c, n in rows if n]
-        res.check(
-            not published,
-            "no held individual or long-tail owner has a PUBLISHED canonical",
-            f"{len(published)} published: {published[:5]}",
+            .where(CanonicalEntity.canonical_name_normalized.in_(list(norms)))
+            .group_by(CanonicalEntity.id)
         )
-        res.check(
-            not with_edges,
-            "no held individual or long-tail owner has a vessel edge",
-            f"{len(with_edges)} with edges: {with_edges[:5]}",
-        )
+    ).all()
+    with_edges = [c.canonical_name for c, n in rows if n]
+    res.check(
+        not with_edges,
+        "no canonical name-matching a held owner has a vessel edge",
+        f"{len(with_edges)} with edges: {with_edges[:5]}",
+    )
+    # Same-name canonicals that ARE published are reported, never assumed
+    # innocent: each one is asserted to carry no OFAC identity and no
+    # vessel, which is what makes it a collision rather than a publish.
+    collisions = [
+        c.canonical_name
+        for c, n in rows
+        if c.publication_state == PublicationState.PUBLISHED.value
+        and c.surface_mode != SurfaceMode.SUPPRESS.value
+        and not n
+    ]
+    if collisions:
+        print(f"  note: {len(collisions)} published name-collision(s), no OFAC id, "
+              f"no vessel: {collisions}")
 
     return individuals
 
@@ -262,6 +291,10 @@ async def _live_surface(state: dict, individuals: dict, res: Result) -> None:
     fetched too, to prove the route serves and to widen the PII scan.
     """
     bodies: list[tuple[str, str]] = []
+    #: The vessel surface in isolation — the `vessels` array of every
+    #: dossier, i.e. exactly the bytes the Assets—Vessels panel renders.
+    #: Nothing in the PII corpus may appear HERE, no exemptions.
+    vessel_payloads: list[tuple[str, str]] = []
     with_vessels = 0
     total_listed = 0
     uncited = 0
@@ -280,6 +313,7 @@ async def _live_surface(state: dict, individuals: dict, res: Result) -> None:
             bodies.append((f"api/entities/{name[:40]}", r.text))
             data = r.json()
             vessels = data.get("vessels") or []
+            vessel_payloads.append((f"vessels[] of {name[:40]}", json.dumps(vessels)))
             if vessels:
                 with_vessels += 1
             total_listed += len(vessels)
@@ -303,20 +337,31 @@ async def _live_surface(state: dict, individuals: dict, res: Result) -> None:
             )
             bodies.append((f"entity/{name[:36]}", h.text))
 
-        # Search must not surface a held individual owner by name.
+        # Search must not surface a held individual owner by name. Scan
+        # the RESULTS only: /api/search echoes `q` back in its body, so
+        # a whole-body scan reports our own query as a hit.
         leaked_search = []
-        for oid, person in list(individuals.items())[:40]:
-            s = await client.get("/api/search", params={"q": person, "limit": 5})
-            bodies.append((f"search/{oid}", s.text))
-            if s.status_code == 200:
-                hits = (s.json() or {}).get("results") or []
-                for h in hits:
-                    if normalize_name(h.get("label") or "") == normalize_name(person):
-                        leaked_search.append(person)
+        for oid, person in individuals.items():
+            s = await client.get("/api/search", params={"q": person, "limit": 10})
+            if s.status_code != 200:
+                res.check(False, f"live search for a held owner ({oid})", f"HTTP {s.status_code}")
+                continue
+            hits = (s.json() or {}).get("results") or []
+            bodies.append((f"search-results/{oid}", json.dumps(hits)))
+            surname = person.split(",")[0].strip()
+            for h in hits:
+                label = h.get("label") or ""
+                # Stricter than equality: any label CONTAINING the held
+                # name — or their surname — is a hit worth failing on.
+                if normalize_name(person) in normalize_name(label) or (
+                    len(surname) > 3 and normalize_name(surname) in normalize_name(label)
+                ):
+                    leaked_search.append(f"{person!r} -> {label!r}")
         res.check(
             not leaked_search,
-            "live /api/search returns no held individual vessel owner by name",
-            f"{len(leaked_search)} leaked",
+            f"live /api/search surfaces none of the {len(individuals)} held individual "
+            "owners by name",
+            f"{len(leaked_search)} leaked: {leaked_search[:5]}",
         )
 
     res.check(
@@ -335,20 +380,53 @@ async def _live_surface(state: dict, individuals: dict, res: Result) -> None:
         res.check(spot.get(name) == want, f"spot-check LIVE: {name[:44]} = {want}",
                   f"got {spot.get(name)}")
 
-    # ── the PII scan, over every body fetched above ──
+    # ── the PII scan ──
+    #
+    # Two scopes, because "does this string appear on the page" and "did
+    # the vessel surface disclose it" are different questions.
     corpus = state["pii_values"] | {n for n in individuals.values() if len(n) > 3}
-    hits: list[str] = []
-    for needle in corpus:
-        low = needle.lower()
-        for where, body in bodies:
-            if low in body.lower():
-                hits.append(f"{needle!r} in {where}")
-                break
+
+    def _scan(targets: list[tuple[str, str]], needles: set[str]) -> list[str]:
+        found = []
+        for needle in needles:
+            low = needle.lower()
+            for where, body in targets:
+                if low in body.lower():
+                    found.append(f"{needle!r} in {where}")
+                    break
+        return found
+
+    # SCOPE 1 — the vessel surface itself. No exemptions: not one value
+    # from any owner-PII column, and not one held individual's name, may
+    # appear in the bytes the Vessels panel renders.
     res.check(
-        not hits,
-        f"owner PII absent from all {len(bodies)} live response bodies "
-        f"({len(corpus)} strings searched)",
-        f"{len(hits)} hits: {hits[:5]}",
+        not _scan(vessel_payloads, corpus),
+        f"owner PII absent from all {len(vessel_payloads)} live vessels[] payloads "
+        f"({len(corpus)} strings searched, zero exemptions)",
+        f"hits: {_scan(vessel_payloads, corpus)[:5]}",
+    )
+
+    # SCOPE 2 — whole response bodies. Here ONE class is exempt and is
+    # printed rather than hidden: a value that is itself the published
+    # canonical_name of a sanctioned owner. `vessels.owner_name_raw` for
+    # an OFAC vessel is the designated COMPANY, and that company's own
+    # dossier is published on purpose — its name appearing on its own
+    # page is the publish working, not owner PII leaking. Every such
+    # exemption is listed below so the claim can be audited.
+    published_labels = {n.lower() for n in state["by_owner"]}
+    exempt = {
+        v for v in corpus
+        if any(v.lower() in lbl or lbl in v.lower() for lbl in published_labels)
+    }
+    if exempt:
+        print(f"  note: {len(exempt)} PII-column value(s) exempt from the whole-body "
+              f"scan as published owner labels: {sorted(exempt)}")
+    body_hits = _scan(bodies, corpus - exempt)
+    res.check(
+        not body_hits,
+        f"owner PII absent from all {len(bodies)} whole live response bodies "
+        f"({len(corpus - exempt)} strings searched, {len(exempt)} exempt and listed)",
+        f"{len(body_hits)} hits: {body_hits[:5]}",
     )
 
 
