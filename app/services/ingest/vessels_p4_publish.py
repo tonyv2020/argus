@@ -55,7 +55,7 @@ from app.models import (
     VesselOwnershipEdge,
 )
 from app.services.aircraft_identity import is_individual_entity, is_owner_capable
-from app.services.vessel_publish import promote
+from app.services.vessel_publish import demote, promote
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,70 @@ async def select_cohort(session) -> list[tuple]:
             len(rows) - len(safe),
         )
     return safe
+
+
+async def run_reversal(owner: str, dry_run: bool = True) -> dict:
+    """Withdraw ONE owner from the public surface. The unwind drill.
+
+    ``demote`` is only meaningfully reversible if someone has run it, so
+    this lives beside the publish rather than in a shell one-liner: the
+    withdrawal goes through the audited op, leaves its own audit rows,
+    and re-running :func:`run` restores the owner exactly.
+
+    A vessel co-owned by another PUBLISHED owner is left alone and
+    reported. Darkening it would take that owner's row off the surface
+    too — the read gate ANDs the vessel with the edge — and a withdrawal
+    that silently damages a neighbour is not a clean reversal.
+    """
+    stats: dict = {
+        "dry_run": dry_run, "owner": owner, "demoted_owner": 0,
+        "demoted_edges": 0, "demoted_vessels": 0, "vessels_kept_shared": 0,
+    }
+    sm = get_sessionmaker()
+    async with sm() as session:
+        rows = [r for r in await select_cohort(session) if r[2].canonical_name == owner]
+        if not rows:
+            raise SystemExit(f"no published cohort rows for owner {owner!r}")
+
+        owner_ids = {r[2].id for r in rows}
+        for edge, vessel, _ent in rows:
+            others = (
+                await session.execute(
+                    select(VesselOwnershipEdge)
+                    .where(VesselOwnershipEdge.vessel_id == vessel.id)
+                    .where(VesselOwnershipEdge.canonical_id.notin_(list(owner_ids)))
+                    .where(
+                        VesselOwnershipEdge.publication_state
+                        == PublicationState.PUBLISHED.value
+                    )
+                )
+            ).scalars().all()
+            if not dry_run:
+                await demote(
+                    session, target_table="vessel_ownership_edges", target_id=edge.id,
+                    actor=ACTOR, reason=f"reversal drill: withdraw {owner}",
+                )
+            stats["demoted_edges"] += 1
+            if others:
+                stats["vessels_kept_shared"] += 1
+                continue
+            if not dry_run:
+                await demote(
+                    session, target_table="vessels", target_id=vessel.id,
+                    actor=ACTOR, reason=f"reversal drill: withdraw {owner}",
+                )
+            stats["demoted_vessels"] += 1
+
+        for cid in owner_ids:
+            if not dry_run:
+                await demote(
+                    session, target_table="canonical_entities", target_id=cid,
+                    actor=ACTOR, reason=f"reversal drill: withdraw {owner}",
+                )
+            stats["demoted_owner"] += 1
+        if not dry_run:
+            await session.commit()
+    return stats
 
 
 async def run(dry_run: bool = True) -> dict:
@@ -187,7 +251,18 @@ def _main() -> None:  # pragma: no cover
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(description="Vessels P4 publish (all 135 operators).")
     ap.add_argument("--apply", action="store_true", help="Commit. Default is a dry run.")
+    ap.add_argument(
+        "--demote-owner",
+        help="Reversal drill: withdraw ONE owner by canonical_name. "
+        "Re-run without it to restore.",
+    )
     args = ap.parse_args()
+    if args.demote_owner:
+        d = asyncio.run(run_reversal(args.demote_owner, dry_run=not args.apply))
+        print(f"\n=== VESSELS REVERSAL ({'APPLY' if args.apply else 'DRY RUN'}) ===")
+        for k, v in d.items():
+            print(f"  {k:<22} {v}")
+        return
     s = asyncio.run(run(dry_run=not args.apply))
     print(f"\n=== VESSELS PUBLISH ALL-135 ({'APPLY' if args.apply else 'DRY RUN'}) ===")
     for k in (
