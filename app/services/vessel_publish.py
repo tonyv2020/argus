@@ -1,8 +1,10 @@
 """The audited, reversible vessel promotion op.
 
-**Nothing calls this yet.** The mechanism exists so a Tony-approved
-publish has a reviewed path; no code path, endpoint or job invokes it in
-this phase, and a test asserts that.
+Callers are an **explicit allowlist** — the approved publish scripts and
+nothing else. A test enforces it. (Through the P4 mechanism phase the
+invariant was the stronger "nobody calls this at all"; the 2026-08-31
+all-135 publish is the first approved caller, so the invariant narrows
+rather than disappears.)
 
 Mirrors :mod:`app.services.aircraft_publish`, including why each
 property is enforced here rather than by convention:
@@ -13,6 +15,19 @@ property is enforced here rather than by convention:
   * **Reversible.** :func:`demote` is the exact inverse and is itself
     audited, so an unwind leaves a trail rather than erasing one.
   * **Per-row.** No bulk "publish everything" verb. Callers pass ids.
+
+THE OWNER CANONICAL IS A THIRD TARGET TABLE. Vessels P3 created the
+shadow-fleet operators ``surface_mode='open', publication_state=
+'staged'``, so the owner's own dossier is dark until it is published
+too. Publishing the edge alone would surface nothing — the entity 404s.
+Routing the owner through the SAME op is what keeps the whole publish in
+one audit trail and makes :func:`demote` a complete unwind; a hand-run
+``UPDATE canonical_entities`` would leave no row to reverse.
+
+That extra reach is deliberately narrow: :func:`promote` REFUSES a
+canonical that is not owner-capable, so this op cannot publish a person
+canonical whatever a caller passes. :func:`demote` has no such guard —
+withdrawing is always allowed.
 """
 
 from __future__ import annotations
@@ -23,16 +38,22 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
+    CanonicalEntity,
     PublicationState,
     SurfaceMode,
     Vessel,
     VesselOwnershipEdge,
     VesselPromotionAudit,
 )
+from app.services.aircraft_identity import is_individual_entity, is_owner_capable
 
 logger = logging.getLogger(__name__)
 
-_TABLES = {"vessels": Vessel, "vessel_ownership_edges": VesselOwnershipEdge}
+_TABLES = {
+    "vessels": Vessel,
+    "vessel_ownership_edges": VesselOwnershipEdge,
+    "canonical_entities": CanonicalEntity,
+}
 
 
 class VesselPromotionError(RuntimeError):
@@ -83,6 +104,27 @@ async def _apply(
     return audit
 
 
+async def _refuse_unless_owner_capable(session: AsyncSession, canonical_id: str) -> None:
+    """Refuse to publish an owner canonical that could be a natural person.
+
+    The last line of defence, below every cohort predicate: even a caller
+    that hand-picked ids cannot make this op surface a person. Identity
+    comes from the ARGUS canonical ``type``, and both helpers fail closed
+    on an unknown one, so an unclassifiable owner is withheld.
+    """
+    ent = await session.scalar(
+        select(CanonicalEntity).where(CanonicalEntity.id == canonical_id)
+    )
+    if ent is None:
+        raise VesselPromotionError(f"canonical_entities row {canonical_id!r} not found")
+    if is_individual_entity(ent.type, ent.canonical_name) or not is_owner_capable(ent.type):
+        # Type only — the name is what we are refusing to disclose.
+        raise VesselPromotionError(
+            f"refusing to publish canonical {canonical_id!r}: type={ent.type!r} "
+            "is not an owner-capable organisation"
+        )
+
+
 async def promote(
     session: AsyncSession,
     *,
@@ -97,6 +139,8 @@ async def promote(
         raise VesselPromotionError(
             "promote() to surface_mode='suppress' is a no-op by definition; use demote()"
         )
+    if target_table == "canonical_entities":
+        await _refuse_unless_owner_capable(session, target_id)
     return await _apply(
         session, target_table=target_table, target_id=target_id, action="promote",
         to_surface_mode=surface_mode,

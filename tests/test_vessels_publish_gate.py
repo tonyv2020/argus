@@ -75,22 +75,71 @@ def test_promotion_requires_attribution_and_is_reversible() -> None:
     assert "is a no-op by definition" in inspect.getsource(vessel_publish.promote)
 
 
-def test_nobody_invokes_vessel_promotion_yet() -> None:
-    """THE phase invariant: the mechanism exists, nothing uses it."""
+def test_promotion_callers_are_an_explicit_allowlist() -> None:
+    """The mechanism phase asserted NOBODY invoked promotion. The
+    all-135 publish (Tony, 2026-08-31) is the first approved caller, so
+    the invariant NARROWS to an allowlist rather than disappearing: only
+    the named publish scripts may promote. Anything else acquiring the
+    ability is what this test catches."""
     app_dir = pathlib.Path(inspect.getfile(vessel_publish)).resolve().parents[1]
     markers = (
         "from app.services.vessel_publish import",
         "from app.services import vessel_publish",
+        "import app.services.vessel_publish",
         "vessel_publish.promote(",
         "vessel_publish.demote(",
     )
+    allowed = {
+        "vessel_publish.py",       # the op itself
+        "vessels_p4_publish.py",   # all-135 publish (Tony, 2026-08-31)
+    }
     offenders = [
         str(p.relative_to(app_dir))
         for p in app_dir.rglob("*.py")
-        if p.name != "vessel_publish.py"
+        if p.name not in allowed
         and any(m in p.read_text(encoding="utf-8", errors="ignore") for m in markers)
     ]
-    assert offenders == [], f"nothing may promote a vessel yet: {offenders}"
+    assert offenders == [], f"only the approved publish scripts may promote: {offenders}"
+
+
+def test_publish_can_never_promote_an_individual() -> None:
+    """Two independent refusals, because one predicate is one bug away.
+
+    The cohort filter drops a non-org owner, AND the op itself refuses
+    the canonical even if a caller hand-picks the id.
+    """
+    from app.services.ingest import vessels_p4_publish as p4
+
+    src = inspect.getsource(p4.select_cohort)
+    assert "is_individual_entity(" in src and "is_owner_capable(" in src
+
+    guard = inspect.getsource(vessel_publish._refuse_unless_owner_capable)
+    assert "is_individual_entity(" in guard and "is_owner_capable(" in guard
+    # promote() must actually call it; demote() must NOT be gated —
+    # withdrawing is always allowed.
+    assert "_refuse_unless_owner_capable(" in inspect.getsource(vessel_publish.promote)
+    assert "_refuse_unless_owner_capable(" not in inspect.getsource(vessel_publish.demote)
+
+
+def test_owner_canonical_is_promoted_through_the_audited_op() -> None:
+    """The owner canonical moves via promote(), not a raw UPDATE — else
+    demote() would not be a complete unwind of the publish."""
+    from app.models import CanonicalEntity
+    from app.services.ingest import vessels_p4_publish as p4
+
+    assert vessel_publish._TABLES["canonical_entities"] is CanonicalEntity
+    src = inspect.getsource(p4.run)
+    assert 'target_table="canonical_entities"' in src
+    for table in ("vessels", "vessel_ownership_edges"):
+        assert f'target_table="{table}"' in src
+    # No hand-rolled gate writes anywhere in the publish script. Match
+    # ASSIGNMENT only: `row.surface_mode ==` is a read, and a naive
+    # `"surface_mode =" not in` check fails on it.
+    import re
+
+    body = inspect.getsource(p4)
+    for col in ("surface_mode", "publication_state"):
+        assert not re.search(rf"\.{col}\s*=(?!=)", body), f"p4 writes .{col} directly"
 
 
 # ── the read gate ────────────────────────────────────────────────
