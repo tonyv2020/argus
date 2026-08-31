@@ -278,6 +278,24 @@ function renderPanel(entity) {
   // The payload carries no street, city or registrant name by
   // construction — see _AIRCRAFT_PUBLIC_COLUMNS in app/main.py.
   const aircraft = Array.isArray(entity.aircraft) ? entity.aircraft : [];
+
+  // Assets → Vessels. Server-gated to published, non-suppressed rows;
+  // the payload carries no owner name or address. Empty until a
+  // Tony-approved publish.
+  const vessels = Array.isArray(entity.vessels) ? entity.vessels : [];
+  const vesselBlock = vessels.length === 0 ? '' : `
+    <h2>Assets — Vessels</h2>
+    <div class="disclosure-note">OFAC Specially Designated Nationals list; each row links to the sanctions snapshot it was read from.</div>
+    <ul>${vessels.map(v => {
+      const cite = v.citation || {};
+      const imo = v.imo_number ? ` · IMO ${esc(v.imo_number)}` : '';
+      const flag = v.flag ? ` · ${esc(v.flag)}` : '';
+      const rel = v.ofac_relation ? ` <span class="muted">[${esc(v.ofac_relation)}]</span>` : '';
+      return `<li class="neighbor" style="cursor:default;">
+        <strong>${esc(v.vessel_name || '')}</strong>${imo}${flag}${rel}
+        ${cite.url ? `<a class="receipt-chip" href="${esc(cite.url)}" target="_blank" rel="noopener">OFAC SDN</a>` : ''}
+      </li>`;
+    }).join('')}</ul>`;
   const aircraftBlock = aircraft.length === 0 ? '' : `
     <h2>Assets — Aircraft</h2>
     <div class="disclosure-note">FAA Releasable Aircraft Database; each row links to the registry snapshot it was read from.</div>
@@ -426,6 +444,7 @@ function renderPanel(entity) {
       `}
     ${disclosureBlocks ? `<h2>Financial disclosure</h2><div class="disclosure-note">Cited to OGE 278e/278-T public filings; each row links to the source PDF page.</div>${disclosureBlocks}` : ''}
     ${aircraftBlock}
+    ${vesselBlock}
     <h2>Connections</h2>
     ${otherRelKeys.length === 0 && !disclosureBlocks ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No connections surfaced yet.</div>' : (otherRelKeys.length === 0 ? '<div class="empty" style="padding:.5rem 0;font-size:.8rem;">No non-disclosure connections.</div>' : relBlocks)}
   `;

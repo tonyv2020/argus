@@ -38,9 +38,16 @@ from app.models import (
     CanonicalEntity,
     PublicationState,
     SurfaceMode,
+    Vessel,
+    VesselOwnershipEdge,
 )
 from app.services.graph.neo4j_projection import Neo4jProjection
-from app.services.read_gate import published_aircraft, published_registration_edge
+from app.services.read_gate import (
+    published_aircraft,
+    published_registration_edge,
+    published_vessel,
+    published_vessel_edge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +73,10 @@ class ProjectionStats:
     aircraft_projected: int = 0
     aircraft_failed: int = 0
     stale_aircraft_pruned: int = 0
+    #: Vessel counters. Zero until a Tony-approved publish.
+    vessels_projected: int = 0
+    vessels_failed: int = 0
+    stale_vessels_pruned: int = 0
 
 
 def _ensure_pg_id_index(projection: Neo4jProjection) -> None:
@@ -187,6 +198,26 @@ async def project_all(session: AsyncSession, projection: Neo4jProjection) -> Pro
     # has to remove the node, or the reversal in the audit trail would
     # be a lie about what Cypher can still see.
     stats.stale_aircraft_pruned, _ = projection.prune_unpublished_aircraft(live_aircraft_ids)
+
+    # Published vessels. The SELECT is the gate: both rows must be
+    # published and non-suppressed, so an unpublished vessel is never
+    # even fetched. Returns 0 rows until a Tony-approved publish.
+    vessel_rows = (
+        await session.execute(
+            select(VesselOwnershipEdge, Vessel)
+            .join(Vessel, Vessel.id == VesselOwnershipEdge.vessel_id)
+            .where(published_vessel_edge())
+            .where(published_vessel())
+        )
+    ).all()
+    live_vessel_ids: set[str] = set()
+    for edge, vessel in vessel_rows:
+        if await projection.project_vessel(session, edge, vessel):
+            stats.vessels_projected += 1
+            live_vessel_ids.add(vessel.id)
+        else:
+            stats.vessels_failed += 1
+    stats.stale_vessels_pruned = projection.prune_unpublished_vessels(live_vessel_ids)
     await session.commit()
 
     return stats
